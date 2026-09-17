@@ -1,0 +1,3 @@
+fumogemini
+fumoglm
+fumogpt
