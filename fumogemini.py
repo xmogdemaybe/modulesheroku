@@ -3,10 +3,12 @@
 
 import asyncio
 import io
+import json
 import logging
 import random
 import re
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -27,13 +29,11 @@ class SafeDict(dict):
 
 @loader.tds
 class FumoPosterMod(loader.Module):
-    """Automatically fetches Touhou Fumo plushie photos from boorus and posts them on a schedule."""
+    """Automated Touhou Fumo plushie poster with multi-booru cascade and live network diagnostics."""
 
     strings = {
         "name": "FumoPoster",
-        "fetching": "ᗜˬᗜ <i>Fetching random Fumo...</i>",
-        "fetch_error": "❌ <b>Error:</b> <i>Failed to retrieve Fumo image from all available booru providers.</i>",
-        "send_error": "❌ <b>Error sending media:</b> <code>{error}</code>",
+        "fetching": "ᗜˬᗜ <i>Fetching random Fumo from providers...</i>",
         "toggled_on": "🟢 <b>Fumo Auto-Poster enabled.</b>\n⏱ <b>Interval:</b> <code>{interval}</code>\n🎯 <b>Target:</b> <code>{target}</code>",
         "toggled_off": "🔴 <b>Fumo Auto-Poster disabled.</b>",
         "target_set": "🎯 <b>Target chat updated:</b> <b>{title}</b> (<code>{chat_id}</code>)",
@@ -48,7 +48,8 @@ class FumoPosterMod(loader.Module):
             "• <b>Target Chat:</b> <code>{target}</code>\n"
             "• <b>Interval:</b> <code>{interval}</code>\n"
             "• <b>Next Post:</b> <code>{next_post}</code>\n"
-            "• <b>Cached Post IDs:</b> <code>{cached_count}</code>\n\n"
+            "• <b>Cached Post IDs:</b> <code>{cached_count}</code>\n"
+            "• <b>Last Known Error:</b> <code>{last_error}</code>\n\n"
             "<b>Caption Template:</b>\n<blockquote>{caption}</blockquote>"
         ),
     }
@@ -57,6 +58,8 @@ class FumoPosterMod(loader.Module):
         self.config = loader.ModuleConfig()
         self._task: Optional[asyncio.Task] = None
         self._session: Optional[aiohttp.ClientSession] = None
+        self._last_diagnostics: List[Dict[str, Any]] = []
+        self._last_error_str: str = "None"
         self.client = None
         self.db = None
 
@@ -64,27 +67,28 @@ class FumoPosterMod(loader.Module):
         self.client = client
         self.db = db
 
-        # Browser headers to avoid 403 Forbidden on CDNs & Boorus
+        # Bypass strict SSL certificate checks common on minimal Docker/Heroku dynos
+        connector = aiohttp.TCPConnector(ssl=False)
+
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept": "application/json,image/*,*/*;q=0.8",
+            "Accept": "application/json,text/xml,text/html,image/*,*/*;q=0.8",
         }
         self._session = aiohttp.ClientSession(
+            connector=connector,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=30)
+            timeout=aiohttp.ClientTimeout(total=25)
         )
 
-        # Cancel any previous task instances and launch background scheduler
         if self._task and not self._task.done():
             self._task.cancel()
         self._task = asyncio.create_task(self._poster_loop())
 
     async def on_unload(self):
-        """Lifecycle hook: gracefully shuts down background task and HTTP session."""
         if self._task and not self._task.done():
             self._task.cancel()
             try:
@@ -96,45 +100,136 @@ class FumoPosterMod(loader.Module):
             await self._session.close()
 
     # -------------------------------------------------------------------------
-    # Booru Scraping & Image Fetching Core
+    # Provider Implementations (Safe + Booru + Fallbacks)
     # -------------------------------------------------------------------------
 
-    async def _fetch_safebooru(self) -> List[Dict[str, Any]]:
-        """Fetch post entries from Safebooru."""
-        page = random.randint(0, 8)
+    async def _fetch_reddit_fumo(self) -> Tuple[str, List[Dict[str, Any]], str]:
+        """Fetch photos from r/FUMOFUMO (Very high reliability on VPS/Datacenters)."""
+        url = "https://www.reddit.com/r/FUMOFUMO/hot.json?limit=50"
+        async with self._session.get(url) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                snippet = text[:150].replace("\n", " ")
+                raise RuntimeError(f"HTTP {resp.status}: {snippet}")
+
+            data = json.loads(text)
+            children = data.get("data", {}).get("children", [])
+            posts = []
+            for child in children:
+                pdata = child.get("data", {})
+                img_url = pdata.get("url", "")
+                if any(img_url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]) or "i.redd.it" in img_url:
+                    posts.append({
+                        "id": f"reddit_{pdata.get('id')}",
+                        "file_url": img_url,
+                        "post_url": f"https://reddit.com{pdata.get('permalink')}",
+                        "tags": pdata.get("title", "Touhou Fumo"),
+                    })
+
+            return url, posts, f"Parsed {len(posts)} images from Reddit JSON"
+
+    async def _fetch_safebooru(self) -> Tuple[str, List[Dict[str, Any]], str]:
+        """Fetch posts from Safebooru (handles both JSON and XML responses)."""
+        page = random.randint(0, 6)
         url = f"https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1&tags=fumo&limit=40&pid={page}"
         async with self._session.get(url) as resp:
+            text = await resp.text()
             if resp.status != 200:
-                return []
-            data = await resp.json(content_type=None)
+                snippet = text[:150].replace("\n", " ")
+                raise RuntimeError(f"HTTP {resp.status}: {snippet}")
+
             posts = []
+            stripped = text.strip()
+
+            # Handle XML fallback if Safebooru ignores json=1
+            if stripped.startswith("<?xml") or stripped.startswith("<posts"):
+                root = ET.fromstring(stripped)
+                for item in root.findall("post"):
+                    img_file = item.attrib.get("image", "")
+                    dir_path = str(item.attrib.get("directory", "")).strip("/")
+                    if not img_file:
+                        continue
+                    prefix = "" if dir_path.startswith("images") else "images/"
+                    posts.append({
+                        "id": f"safebooru_{item.attrib.get('id')}",
+                        "file_url": f"https://safebooru.org/{prefix}{dir_path}/{img_file}",
+                        "post_url": f"https://safebooru.org/index.php?page=post&s=view&id={item.attrib.get('id')}",
+                        "tags": item.attrib.get("tags", ""),
+                    })
+                return url, posts, f"Parsed {len(posts)} posts via XML fallback"
+
+            # Parse JSON
+            data = json.loads(stripped)
             for item in data:
                 img_file = item.get("image", "")
                 dir_path = str(item.get("directory", "")).strip("/")
-                if not img_file or not dir_path:
+                if not img_file:
                     continue
-                
-                # Check directory format variance
-                if dir_path.startswith("images"):
-                    img_url = f"https://safebooru.org/{dir_path}/{img_file}"
-                else:
-                    img_url = f"https://safebooru.org/images/{dir_path}/{img_file}"
-
+                prefix = "" if dir_path.startswith("images") else "images/"
                 posts.append({
                     "id": f"safebooru_{item.get('id')}",
-                    "file_url": img_url,
+                    "file_url": f"https://safebooru.org/{prefix}{dir_path}/{img_file}",
                     "post_url": f"https://safebooru.org/index.php?page=post&s=view&id={item.get('id')}",
                     "tags": item.get("tags", ""),
                 })
-            return posts
 
-    async def _fetch_danbooru(self) -> List[Dict[str, Any]]:
-        """Fetch post entries from Danbooru."""
-        url = "https://danbooru.donmai.us/posts.json?tags=fumo+order:random&limit=30"
+            return url, posts, f"Parsed {len(posts)} posts via JSON"
+
+    async def _fetch_tbib(self) -> Tuple[str, List[Dict[str, Any]], str]:
+        """Fetch posts from TBIB (The Big ImageBoard)."""
+        page = random.randint(0, 4)
+        url = f"https://tbib.org/index.php?page=dapi&s=post&q=index&json=1&tags=fumo&limit=40&pid={page}"
         async with self._session.get(url) as resp:
+            text = await resp.text()
             if resp.status != 200:
-                return []
-            data = await resp.json(content_type=None)
+                snippet = text[:150].replace("\n", " ")
+                raise RuntimeError(f"HTTP {resp.status}: {snippet}")
+
+            stripped = text.strip()
+            posts = []
+
+            if stripped.startswith("<?xml") or stripped.startswith("<posts"):
+                root = ET.fromstring(stripped)
+                for item in root.findall("post"):
+                    img_file = item.attrib.get("image", "")
+                    dir_path = str(item.attrib.get("directory", "")).strip("/")
+                    if not img_file:
+                        continue
+                    prefix = "" if dir_path.startswith("images") else "images/"
+                    posts.append({
+                        "id": f"tbib_{item.attrib.get('id')}",
+                        "file_url": f"https://tbib.org/{prefix}{dir_path}/{img_file}",
+                        "post_url": f"https://tbib.org/index.php?page=post&s=view&id={item.attrib.get('id')}",
+                        "tags": item.attrib.get("tags", ""),
+                    })
+                return url, posts, f"Parsed {len(posts)} posts via XML"
+
+            data = json.loads(stripped)
+            for item in data:
+                img_file = item.get("image", "")
+                dir_path = str(item.get("directory", "")).strip("/")
+                if not img_file:
+                    continue
+                prefix = "" if dir_path.startswith("images") else "images/"
+                posts.append({
+                    "id": f"tbib_{item.get('id')}",
+                    "file_url": f"https://tbib.org/{prefix}{dir_path}/{img_file}",
+                    "post_url": f"https://tbib.org/index.php?page=post&s=view&id={item.get('id')}",
+                    "tags": item.get("tags", ""),
+                })
+
+            return url, posts, f"Parsed {len(posts)} posts via JSON"
+
+    async def _fetch_danbooru(self) -> Tuple[str, List[Dict[str, Any]], str]:
+        """Fetch posts from Danbooru."""
+        url = "https://danbooru.donmai.us/posts.json?tags=fumo+order:random&limit=25"
+        async with self._session.get(url) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                snippet = text[:150].replace("\n", " ")
+                raise RuntimeError(f"HTTP {resp.status}: {snippet}")
+
+            data = json.loads(text)
             posts = []
             for item in data:
                 file_url = item.get("file_url") or item.get("large_file_url")
@@ -146,15 +241,19 @@ class FumoPosterMod(loader.Module):
                     "post_url": f"https://danbooru.donmai.us/posts/{item.get('id')}",
                     "tags": item.get("tag_string", ""),
                 })
-            return posts
 
-    async def _fetch_gelbooru(self) -> List[Dict[str, Any]]:
-        """Fetch post entries from Gelbooru."""
-        url = "https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1&tags=fumo+sort:random&limit=30"
+            return url, posts, f"Parsed {len(posts)} posts via JSON"
+
+    async def _fetch_gelbooru(self) -> Tuple[str, List[Dict[str, Any]], str]:
+        """Fetch posts from Gelbooru."""
+        url = "https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1&tags=fumo+sort:random&limit=25"
         async with self._session.get(url) as resp:
+            text = await resp.text()
             if resp.status != 200:
-                return []
-            data = await resp.json(content_type=None)
+                snippet = text[:150].replace("\n", " ")
+                raise RuntimeError(f"HTTP {resp.status}: {snippet}")
+
+            data = json.loads(text)
             items = data.get("post", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
             posts = []
             for item in items:
@@ -167,98 +266,118 @@ class FumoPosterMod(loader.Module):
                     "post_url": f"https://gelbooru.com/index.php?page=post&s=view&id={item.get('id')}",
                     "tags": item.get("tags", ""),
                 })
-            return posts
 
-    async def _fetch_yandere(self) -> List[Dict[str, Any]]:
-        """Fetch post entries from Yande.re."""
-        url = "https://yande.re/post.json?tags=fumo&limit=35"
-        async with self._session.get(url) as resp:
-            if resp.status != 200:
-                return []
-            data = await resp.json(content_type=None)
-            posts = []
-            for item in data:
-                file_url = item.get("file_url") or item.get("jpeg_url") or item.get("sample_url")
-                if not file_url:
-                    continue
-                posts.append({
-                    "id": f"yandere_{item.get('id')}",
-                    "file_url": file_url,
-                    "post_url": f"https://yande.re/post/show/{item.get('id')}",
-                    "tags": item.get("tags", ""),
-                })
-            return posts
+            return url, posts, f"Parsed {len(posts)} posts via JSON"
 
-    async def _download_image(self, file_url: str) -> Optional[io.BytesIO]:
-        """Download raw bytes of an image and wrap them in a named io.BytesIO."""
+    # -------------------------------------------------------------------------
+    # Image Binary Downloader
+    # -------------------------------------------------------------------------
+
+    async def _download_image(self, file_url: str) -> Tuple[Optional[io.BytesIO], str]:
+        """Download raw image bytes, verifying HTTP status and size."""
         try:
             headers = {"Referer": file_url}
             async with self._session.get(file_url, headers=headers) as resp:
                 if resp.status != 200:
-                    return None
+                    body = await resp.text()
+                    return None, f"CDN HTTP {resp.status}: {body[:100]}"
+
                 data = await resp.read()
                 if len(data) < 512:
-                    return None
+                    return None, f"Received corrupt payload ({len(data)} bytes)"
 
                 buf = io.BytesIO(data)
-                # Resolve extension
                 ext = "jpg"
-                if "." in file_url.split("?")[0]:
-                    ext = file_url.split("?")[0].split(".")[-1].lower()
-                    if ext not in ["jpg", "jpeg", "png", "webp", "gif"]:
-                        ext = "jpg"
+                clean_url = file_url.split("?")[0]
+                if "." in clean_url:
+                    candidate = clean_url.split(".")[-1].lower()
+                    if candidate in ["jpg", "jpeg", "png", "webp", "gif"]:
+                        ext = candidate
 
                 buf.name = f"fumo_{int(time.time())}.{ext}"
                 buf.seek(0)
-                return buf
+                return buf, f"OK ({len(data) / 1024:.1f} KB)"
         except Exception as e:
-            logger.debug("Failed to download image %s: %s", file_url, e)
-            return None
+            return None, f"{type(e).__name__}: {e}"
 
-    async def _get_random_fumo(self) -> Optional[Tuple[io.BytesIO, str, str, str]]:
+    # -------------------------------------------------------------------------
+    # Core Aggregator & Diagnostic Collector
+    # -------------------------------------------------------------------------
+
+    async def _get_random_fumo(self) -> Tuple[Optional[Tuple[io.BytesIO, str, str, str]], List[Dict[str, Any]]]:
         """
-        Queries booru providers with fallback mechanism.
-        Returns: (BytesIO_buffer, post_url, tags, post_id) or None.
+        Runs query across all providers while tracking exact status diagnostics.
+        Returns: ((buffer, post_url, tags, post_id), diagnostics_report)
         """
         providers = [
-            self._fetch_safebooru,
-            self._fetch_danbooru,
-            self._fetch_gelbooru,
-            self._fetch_yandere,
+            ("Reddit r/FUMOFUMO", self._fetch_reddit_fumo),
+            ("Safebooru", self._fetch_safebooru),
+            ("TBIB", self._fetch_tbib),
+            ("Danbooru", self._fetch_danbooru),
+            ("Gelbooru", self._fetch_gelbooru),
         ]
         random.shuffle(providers)
 
         seen_ids: List[str] = self.db.get(self.strings["name"], "seen_ids", [])
+        diagnostics = []
 
-        for provider in providers:
+        for name, fetcher in providers:
+            record: Dict[str, Any] = {
+                "name": name,
+                "url": "N/A",
+                "status": "Unknown",
+                "posts_count": 0,
+                "detail": "None",
+                "download_status": "Not attempted",
+            }
             try:
-                posts = await provider()
+                endpoint_url, posts, info_str = await fetcher()
+                record["url"] = endpoint_url
+                record["status"] = "HTTP 200 OK"
+                record["posts_count"] = len(posts)
+                record["detail"] = info_str
+
                 if not posts:
+                    record["status"] = "Warning"
+                    record["detail"] = "API responded with 200 OK but returned 0 posts matching 'fumo'."
+                    diagnostics.append(record)
                     continue
 
-                # Filter out previously posted images to avoid duplicates
+                # Filter seen IDs
                 candidates = [p for p in posts if p["id"] not in seen_ids]
                 if not candidates:
-                    candidates = posts  # Fallback to full list if all cached
+                    candidates = posts
 
                 random.shuffle(candidates)
 
-                for post in candidates:
-                    buf = await self._download_image(post["file_url"])
+                downloaded = False
+                for post in candidates[:3]:
+                    buf, dl_info = await self._download_image(post["file_url"])
+                    record["download_status"] = dl_info
                     if buf:
-                        return buf, post["post_url"], post["tags"], post["id"]
-            except Exception as err:
-                logger.debug("Provider %s failed: %s", provider.__name__, err)
-                continue
+                        downloaded = True
+                        diagnostics.append(record)
+                        self._last_diagnostics = diagnostics
+                        return (buf, post["post_url"], post["tags"], post["id"]), diagnostics
 
-        return None
+                if not downloaded:
+                    record["status"] = "Download Failed"
+                    record["detail"] = f"Failed to download image media from candidate CDN links: {record['download_status']}"
+
+            except Exception as exc:
+                record["status"] = "Failed"
+                record["detail"] = f"{type(exc).__name__}: {exc}"
+
+            diagnostics.append(record)
+
+        self._last_diagnostics = diagnostics
+        return None, diagnostics
 
     # -------------------------------------------------------------------------
-    # Background Scheduler Loop
+    # Scheduler Loop
     # -------------------------------------------------------------------------
 
     async def _poster_loop(self):
-        """Asynchronous scheduler running in the background."""
         while True:
             try:
                 enabled = self.db.get(self.strings["name"], "enabled", False)
@@ -270,21 +389,21 @@ class FumoPosterMod(loader.Module):
                     await self._execute_autopost()
                     self.db.set(self.strings["name"], "last_post_time", time.time())
 
-                # Responsive tick-rate allows instantaneous updates when toggled or reconfigured
                 await asyncio.sleep(15)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.exception("Unexpected error in Fumo background loop: %s", e)
+                self._last_error_str = f"Loop error: {type(e).__name__}: {e}"
+                logger.exception("Error in Fumo background loop: %s", e)
                 await asyncio.sleep(30)
 
     async def _execute_autopost(self):
-        """Dispatches an automated post to the configured target chat."""
         target_chat = self.db.get(self.strings["name"], "target_chat", "me")
-        result = await self._get_random_fumo()
+        result, diags = await self._get_random_fumo()
 
         if not result:
-            logger.warning("Fumo auto-post skipped: All providers failed to return an image.")
+            self._last_error_str = "All providers failed during auto-post schedule."
+            logger.warning("Fumo auto-post skipped. All providers failed.")
             return
 
         buf, post_url, tags, post_id = result
@@ -297,35 +416,35 @@ class FumoPosterMod(loader.Module):
                 caption=caption,
                 parse_mode="html",
             )
-            # Update cache of sent IDs
+            self._last_error_str = "None"
             seen_ids = self.db.get(self.strings["name"], "seen_ids", [])
             seen_ids.append(post_id)
             self.db.set(self.strings["name"], "seen_ids", seen_ids[-100:])
         except errors.FloodWaitError as flood:
-            logger.warning("Fumo auto-poster hit FloodWait: sleeping for %d seconds", flood.seconds)
+            self._last_error_str = f"FloodWait ({flood.seconds}s)"
+            logger.warning("Fumo auto-poster hit FloodWait: %ds", flood.seconds)
             await asyncio.sleep(flood.seconds)
-        except (errors.ChatWriteForbiddenError, errors.ChannelPrivateError) as perm_err:
-            logger.error("Auto-post permissions error in target chat: %s. Disabling.", perm_err)
+        except (errors.ChatWriteForbiddenError, errors.ChannelPrivateError) as perm:
+            self._last_error_str = f"Permission error: {perm}"
             self.db.set(self.strings["name"], "enabled", False)
         except Exception as exc:
-            logger.exception("Failed to dispatch Fumo auto-post: %s", exc)
+            self._last_error_str = f"{type(exc).__name__}: {exc}"
+            logger.exception("Auto-post dispatch exception: %s", exc)
 
     def _build_caption(self, source_url: str, tags: str) -> str:
-        """Applies configured caption template with formatting parameters."""
         default_caption = 'ᗜˬᗜ <b>Fumo Fumo!</b>\n<a href="{source}">Image Source</a>'
         template = self.db.get(self.strings["name"], "caption", default_caption)
         if not template.strip():
             return ""
 
         now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        formatted = template.format_map(
+        return template.format_map(
             SafeDict(
                 source=source_url,
                 date=now_str,
                 tags=tags[:120] + ("..." if len(tags) > 120 else ""),
             )
         )
-        return formatted
 
     # -------------------------------------------------------------------------
     # Utility Helpers
@@ -333,7 +452,6 @@ class FumoPosterMod(loader.Module):
 
     @staticmethod
     def _parse_time(time_str: str) -> Optional[int]:
-        """Parses human intervals like '30m', '2h', '1d', or numeric minutes."""
         time_str = time_str.strip().lower()
         if time_str.isdigit():
             return int(time_str) * 60
@@ -348,7 +466,6 @@ class FumoPosterMod(loader.Module):
 
     @staticmethod
     def _format_time(seconds: int) -> str:
-        """Converts seconds into a clean human-readable duration."""
         if seconds < 60:
             return f"{seconds}s"
         if seconds < 3600:
@@ -363,12 +480,23 @@ class FumoPosterMod(loader.Module):
     # -------------------------------------------------------------------------
 
     async def fumocmd(self, message: Message):
-        """Fetch and send a random Fumo photo to the current chat immediately."""
+        """Fetch and send a random Fumo photo immediately (includes inline debug on failure)."""
         status_msg = await utils.answer(message, self.strings["fetching"])
 
-        result = await self._get_random_fumo()
+        result, diags = await self._get_random_fumo()
         if not result:
-            await utils.answer(status_msg, self.strings["fetch_error"])
+            lines = [
+                "❌ <b>Failed to retrieve Fumo image from all providers!</b>\n",
+                "<b>Diagnostic Breakdown:</b>",
+            ]
+            for d in diags:
+                icon = "🟢" if "200" in d["status"] else "🔴"
+                lines.append(
+                    f"• <b>{d['name']}:</b> {icon} <code>{d['status']}</code>\n"
+                    f"  └ <i>{utils.escape_html(d['detail'])}</i>"
+                )
+            lines.append("\n💡 <i>Run <code>.fumodebug</code> for a full active probe test.</i>")
+            await utils.answer(status_msg, "\n".join(lines))
             return
 
         buf, post_url, tags, post_id = result
@@ -384,12 +512,68 @@ class FumoPosterMod(loader.Module):
             )
             await status_msg.delete()
 
-            # Track in deduplication history
             seen = self.db.get(self.strings["name"], "seen_ids", [])
             seen.append(post_id)
             self.db.set(self.strings["name"], "seen_ids", seen[-100:])
         except Exception as e:
-            await utils.answer(status_msg, self.strings["send_error"].format(error=str(e)))
+            await utils.answer(status_msg, f"❌ <b>Error sending media:</b> <code>{e}</code>")
+
+    async def fumodebugcmd(self, message: Message):
+        """Active live diagnostic probe: tests endpoints, latency, and CDN downloads."""
+        status_msg = await utils.answer(message, "🔍 <b>Running active Fumo provider diagnostic probe...</b>")
+
+        providers = [
+            ("Reddit r/FUMOFUMO", self._fetch_reddit_fumo),
+            ("Safebooru", self._fetch_safebooru),
+            ("TBIB", self._fetch_tbib),
+            ("Danbooru", self._fetch_danbooru),
+            ("Gelbooru", self._fetch_gelbooru),
+        ]
+
+        report = ["🛠 <b><u>Fumo Providers Diagnostic Probe</u></b>\n"]
+
+        for name, fetcher in providers:
+            t0 = time.time()
+            try:
+                url, posts, info = await fetcher()
+                latency = int((time.time() - t0) * 1000)
+
+                dl_status = "⚪ <i>No posts</i>"
+                if posts:
+                    # Test-download the first post
+                    test_post = posts[0]
+                    buf, dl_info = await self._download_image(test_post["file_url"])
+                    dl_status = f"🟢 <code>{dl_info}</code>" if buf else f"🔴 <code>{dl_info}</code>"
+
+                report.append(
+                    f"<b>{name}</b>\n"
+                    f"• <b>Status:</b> 🟢 <code>200 OK</code> ({latency}ms)\n"
+                    f"• <b>Posts Parsed:</b> <code>{len(posts)}</code>\n"
+                    f"• <b>CDN Test:</b> {dl_status}\n"
+                    f"• <b>Endpoint:</b> <code>{url[:60]}...</code>\n"
+                )
+            except Exception as e:
+                latency = int((time.time() - t0) * 1000)
+                report.append(
+                    f"<b>{name}</b>\n"
+                    f"• <b>Status:</b> 🔴 <code>Failed</code> ({latency}ms)\n"
+                    f"• <b>Error:</b> <code>{type(e).__name__}: {utils.escape_html(str(e))}</code>\n"
+                )
+
+        report.append("🏁 <i>Diagnostic test complete.</i>")
+        await utils.answer(status_msg, "\n".join(report))
+
+    async def fumologcmd(self, message: Message):
+        """Print the raw diagnostic dump of the last attempted fetch."""
+        if not self._last_diagnostics:
+            await utils.answer(message, "ℹ️ <i>No diagnostics recorded yet. Run <code>.fumo</code> or <code>.fumodebug</code> first.</i>")
+            return
+
+        formatted_dump = json.dumps(self._last_diagnostics, indent=2, ensure_ascii=False)
+        if len(formatted_dump) > 3800:
+            formatted_dump = formatted_dump[:3800] + "\n... (truncated)"
+
+        await utils.answer(message, f"📋 <b><u>Last Raw Diagnostics:</u></b>\n<pre><code class=\"language-json\">{utils.escape_html(formatted_dump)}</code></pre>")
 
     async def fumotogglecmd(self, message: Message):
         """Toggle automated Fumo posting on/off."""
@@ -409,7 +593,7 @@ class FumoPosterMod(loader.Module):
         await utils.answer(message, text)
 
     async def fumochatcmd(self, message: Message):
-        """Configure auto-post destination chat: .fumochat [chat_id|@username|me] (defaults to current chat)"""
+        """Configure auto-post target chat: .fumochat [chat_id|@username|me]"""
         args = utils.get_args_raw(message).strip()
 
         try:
@@ -435,7 +619,7 @@ class FumoPosterMod(loader.Module):
             await utils.answer(message, self.strings["invalid_chat"].format(error=str(e)))
 
     async def fumointervalcmd(self, message: Message):
-        """Configure posting interval: .fumointerval <value> (e.g. 30m, 2h, 1d, 45)"""
+        """Configure posting interval: .fumointerval <value> (e.g. 30m, 2h, 1d)"""
         args = utils.get_args_raw(message).strip()
         if not args:
             await utils.answer(message, self.strings["interval_invalid"])
@@ -443,10 +627,7 @@ class FumoPosterMod(loader.Module):
 
         seconds = self._parse_time(args)
         if not seconds or seconds < 60:
-            await utils.answer(
-                message,
-                "❌ <b>Interval must be at least 60 seconds (1m) to avoid Telegram rate-limits.</b>",
-            )
+            await utils.answer(message, "❌ <b>Interval must be at least 60 seconds (1m).</b>")
             return
 
         self.db.set(self.strings["name"], "interval", seconds)
@@ -459,7 +640,7 @@ class FumoPosterMod(loader.Module):
         )
 
     async def fumocaptioncmd(self, message: Message):
-        """Set caption template (supports {source}, {date}, {tags}). Pass 'clear' or 'none' to remove."""
+        """Set custom caption template (supports {source}, {date}, {tags}). Pass 'clear' to disable."""
         args = utils.get_args_raw(message).strip()
 
         if not args:
@@ -467,7 +648,7 @@ class FumoPosterMod(loader.Module):
                 message,
                 "ℹ️ <b>Usage:</b> <code>.fumocaption <template></code>\n"
                 "• Placeholders: <code>{source}</code>, <code>{date}</code>, <code>{tags}</code>\n"
-                "• Send <code>.fumocaption clear</code> to remove captions completely.",
+                "• Send <code>.fumocaption clear</code> to remove caption completely.",
             )
             return
 
@@ -479,7 +660,7 @@ class FumoPosterMod(loader.Module):
             await utils.answer(message, self.strings["caption_set"].format(caption=utils.escape_html(args)))
 
     async def fumostatuscmd(self, message: Message):
-        """Display the current configuration and operational status of FumoPoster."""
+        """Display current operational configuration, next post timer, and last error."""
         enabled = self.db.get(self.strings["name"], "enabled", False)
         interval = self.db.get(self.strings["name"], "interval", 3600)
         target = self.db.get(self.strings["name"], "target_chat", "me")
@@ -487,10 +668,9 @@ class FumoPosterMod(loader.Module):
         caption = self.db.get(self.strings["name"], "caption", 'ᗜˬᗜ <b>Fumo Fumo!</b>\n<a href="{source}">Image Source</a>')
         seen_count = len(self.db.get(self.strings["name"], "seen_ids", []))
 
-        # Calculate time until next execution
         if enabled:
             remaining = max(0, int(interval - (time.time() - last_post)))
-            next_post = f"in {self._format_time(remaining)}" if remaining > 0 else "Pending loop tick..."
+            next_post = f"in {self._format_time(remaining)}" if remaining > 0 else "Pending loop execution..."
         else:
             next_post = "Disabled"
 
@@ -501,6 +681,7 @@ class FumoPosterMod(loader.Module):
             interval=self._format_time(interval),
             next_post=next_post,
             cached_count=seen_count,
+            last_error=self._last_error_str,
             caption=utils.escape_html(caption) if caption.strip() else "<i>(None)</i>",
         )
         await utils.answer(message, text)
