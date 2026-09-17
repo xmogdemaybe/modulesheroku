@@ -1,26 +1,21 @@
 # -*- coding: utf-8 -*-
-#
-# Fumo AutoPoster for Hikka / Heroku Userbot
+# Fumo AutoPoster — Hikka / Heroku Userbot
 #
 # Commands:
 #   .fumo on/off
-#   .fumotarget <chat_id/@username>
+#   .fumotarget <@username|chat_id>
 #   .fumointerval <minutes|hours>
 #   .fumocaption <text>
 #   .fumotest
 #   .fumostatus
 #
-# Examples:
-#   .fumo on
-#   .fumotarget @my_channel
-#   .fumointerval 30m
-#   .fumointerval 2h
-#   .fumocaption Random Fumo! {source} {date}
-#   .fumocaption
-#   .fumotest
+# Caption placeholders:
+#   {source}  - API source
+#   {date}    - UTC date
+#   {time}    - UTC time
 #
-# Empty .fumocaption clears the caption.
-#
+# No external database/files are used.
+# Settings are stored in self.db.
 
 import asyncio
 import random
@@ -30,151 +25,81 @@ from typing import Any, Optional
 
 import aiohttp
 
+from telethon.errors import (
+    FloodWaitError,
+    ChatAdminRequiredError,
+    ChatWriteForbiddenError,
+)
+
 from .. import loader, utils
 
 
 @loader.tds
 class Fumo(loader.Module):
-    """Automatically posts random Touhou Fumo images."""
+    """Random Touhou Fumo image auto-poster."""
 
     strings = {
         "name": "Fumo",
-
-        "enabled": (
-            "<emoji document_id=5210952533914471191>✅</emoji> "
-            "<b>Fumo autoposting enabled.</b>"
-        ),
-
-        "disabled": (
-            "<emoji document_id=5210952533914471191>❌</emoji> "
-            "<b>Fumo autoposting disabled.</b>"
-        ),
-
-        "interval_set": (
-            "<emoji document_id=5210952533914471191>⏱</emoji> "
-            "<b>Interval:</b> <code>{}</code>"
-        ),
-
-        "target_set": (
-            "<emoji document_id=5210952533914471191>🎯</emoji> "
-            "<b>Target:</b> <code>{}</code>"
-        ),
-
-        "caption_set": (
-            "<emoji document_id=5210952533914471191>📝</emoji> "
-            "<b>Caption template updated.</b>"
-        ),
-
-        "caption_cleared": (
-            "<emoji document_id=5210952533914471191>📝</emoji> "
-            "<b>Caption cleared.</b>"
-        ),
-
-        "invalid_interval": (
-            "<emoji document_id=5210952533914471191>⚠️</emoji> "
-            "<b>Invalid interval.</b>\n\n"
-            "Examples: <code>30m</code>, <code>2h</code>, "
-            "<code>90</code>"
-        ),
-
-        "fetching": (
-            "<emoji document_id=5210952533914471191>🔎</emoji> "
-            "<b>Looking for a Fumo...</b>"
-        ),
-
-        "fetch_failed": (
-            "<emoji document_id=5210952533914471191>❌</emoji> "
-            "<b>Couldn't find a suitable Fumo image.</b>\n"
-            "<code>{}</code>"
-        ),
-
-        "send_failed": (
-            "<emoji document_id=5210952533914471191>❌</emoji> "
-            "<b>Couldn't send the Fumo.</b>\n"
-            "<code>{}</code>"
-        ),
-
-        "test_done": (
-            "<emoji document_id=5210952533914471191>✅</emoji> "
-            "<b>Fumo sent.</b>\n"
-            "<i>Source:</i> <code>{}</code>"
-        ),
-
-        "status": (
-            "<emoji document_id=5210952533914471191>🌸</emoji> "
-            "<b>Fumo AutoPoster</b>\n\n"
-            "<b>Status:</b> {}\n"
-            "<b>Target:</b> <code>{}</code>\n"
-            "<b>Interval:</b> <code>{}</code>\n"
-            "<b>Caption:</b> <code>{}</code>\n"
-            "<b>Last source:</b> <code>{}</code>"
-        ),
-
-        "permission_error": (
-            "<emoji document_id=5210952533914471191>🚫</emoji> "
-            "<b>No permission to send media to the target chat.</b>"
-        ),
-
-        "flood_wait": (
-            "<emoji document_id=5210952533914471191>🐌</emoji> "
-            "<b>Telegram requested a flood wait of {} seconds.</b>"
-        ),
     }
 
-    # ------------------------------------------------------------------
+    # -----------------------------
     # Configuration
-    # ------------------------------------------------------------------
+    # -----------------------------
 
-    DEFAULT_INTERVAL = 60 * 60  # 1 hour
-    MIN_INTERVAL = 60           # 1 minute
+    DEFAULT_INTERVAL = 60 * 60
+    MIN_INTERVAL = 60
     MAX_INTERVAL = 7 * 24 * 60 * 60
 
-    REQUEST_TIMEOUT = 20
+    HTTP_TIMEOUT = 25
     MAX_IMAGE_SIZE = 25 * 1024 * 1024
 
     USER_AGENT = (
-        "Mozilla/5.0 (compatible; Hikka-Fumo-Module/1.0)"
+        "Mozilla/5.0 (compatible; Hikka-Fumo/1.0)"
     )
 
-    # APIs are intentionally independent. If one dies, the next is tried.
-    API_ENDPOINTS = (
-        (
-            "Safebooru",
-            "https://safebooru.org/index.php",
-            {
+    # Safebooru's DAPI is documented and supports JSON.
+    # Danbooru exposes posts.json publicly.
+    #
+    # We try several tag combinations because "fumo" and
+    # "fumo touhou" do not necessarily return identical sets.
+    PROVIDERS = (
+        {
+            "name": "Safebooru",
+            "url": "https://safebooru.org/index.php",
+            "base_params": {
                 "page": "dapi",
                 "s": "post",
                 "q": "index",
                 "json": "1",
                 "limit": "100",
-                "tags": "fumo",
             },
-        ),
-        (
-            "Danbooru",
-            "https://danbooru.donmai.us/posts.json",
-            {
+            "tags": (
+                "fumo rating:safe",
+                "fumo touhou rating:safe",
+                "touhou fumo rating:safe",
+            ),
+        },
+        {
+            "name": "Danbooru",
+            "url": "https://danbooru.donmai.us/posts.json",
+            "base_params": {
                 "limit": "100",
-                "tags": "fumo rating:safe",
+                "only": (
+                    "id,file_url,large_file_url,"
+                    "preview_file_url,rating,source"
+                ),
             },
-        ),
-        (
-            "Gelbooru",
-            "https://gelbooru.com/index.php",
-            {
-                "page": "dapi",
-                "s": "post",
-                "q": "index",
-                "json": "1",
-                "limit": "100",
-                "tags": "fumo rating:safe",
-            },
-        ),
+            "tags": (
+                "fumo rating:safe",
+                "fumo touhou rating:safe",
+                "touhou fumo rating:safe",
+            ),
+        },
     )
 
-    # ------------------------------------------------------------------
+    # -----------------------------
     # Lifecycle
-    # ------------------------------------------------------------------
+    # -----------------------------
 
     async def client_ready(self, client, db):
         self.client = client
@@ -184,61 +109,41 @@ class Fumo(loader.Module):
         self._session: Optional[aiohttp.ClientSession] = None
         self._stopping = False
 
-        # Initialize defaults in the native Hikka DB.
-        if self.db.get(self.strings["name"], "enabled", None) is None:
-            self.db.set(self.strings["name"], "enabled", False)
+        if self._get("enabled", None) is None:
+            self._set("enabled", False)
 
-        if self.db.get(self.strings["name"], "interval", None) is None:
-            self.db.set(
-                self.strings["name"],
-                "interval",
-                self.DEFAULT_INTERVAL,
-            )
+        if self._get("interval", None) is None:
+            self._set("interval", self.DEFAULT_INTERVAL)
 
-        if self.db.get(self.strings["name"], "target", None) is None:
-            self.db.set(
-                self.strings["name"],
-                "target",
-                None,
-            )
+        if self._get("target", None) is None:
+            self._set("target", None)
 
-        if self.db.get(self.strings["name"], "caption", None) is None:
-            self.db.set(
-                self.strings["name"],
-                "caption",
-                "",
-            )
+        if self._get("caption", None) is None:
+            self._set("caption", "")
 
-        if self.db.get(self.strings["name"], "last_source", None) is None:
-            self.db.set(
-                self.strings["name"],
-                "last_source",
-                "",
-            )
+        if self._get("last_source", None) is None:
+            self._set("last_source", "")
 
-        # Start scheduler immediately.
+        if self._get("last_url", None) is None:
+            self._set("last_url", "")
+
+        if self._get("last_time", None) is None:
+            self._set("last_time", "")
+
         self._stopping = False
         self._start_scheduler()
 
     async def on_unload(self):
-        """
-        Explicitly stop the scheduler and HTTP session.
-
-        This is important because otherwise a module reload could leave
-        an orphaned asyncio task running in the background.
-        """
         self._stopping = True
 
         if self._task is not None:
             self._task.cancel()
-
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
             except Exception:
                 pass
-
             self._task = None
 
         if self._session is not None:
@@ -246,21 +151,17 @@ class Fumo(loader.Module):
                 await self._session.close()
             except Exception:
                 pass
-
             self._session = None
 
     def _start_scheduler(self):
-        """Start exactly one scheduler task."""
-        if self._task is not None and not self._task.done():
-            return
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(
+                self._scheduler_loop()
+            )
 
-        self._task = asyncio.create_task(
-            self._scheduler_loop()
-        )
-
-    # ------------------------------------------------------------------
-    # Database helpers
-    # ------------------------------------------------------------------
+    # -----------------------------
+    # Database
+    # -----------------------------
 
     def _get(self, key: str, default: Any = None):
         return self.db.get(
@@ -276,17 +177,14 @@ class Fumo(loader.Module):
             value,
         )
 
-    # ------------------------------------------------------------------
+    # -----------------------------
     # HTTP
-    # ------------------------------------------------------------------
+    # -----------------------------
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if (
-            self._session is None
-            or self._session.closed
-        ):
+        if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(
-                total=self.REQUEST_TIMEOUT
+                total=self.HTTP_TIMEOUT
             )
 
             self._session = aiohttp.ClientSession(
@@ -299,11 +197,11 @@ class Fumo(loader.Module):
 
         return self._session
 
-    async def _request_json(
+    async def _get_json(
         self,
         url: str,
         params: dict,
-    ) -> Any:
+    ):
         session = await self._get_session()
 
         async with session.get(
@@ -315,97 +213,82 @@ class Fumo(loader.Module):
                 content_type=None
             )
 
-    # ------------------------------------------------------------------
-    # Image fetching
-    # ------------------------------------------------------------------
+    # -----------------------------
+    # API parsing
+    # -----------------------------
 
     @staticmethod
-    def _extract_url(post: dict) -> Optional[str]:
-        """
-        Extract an image URL from different booru response formats.
-        """
+    def _posts_from_payload(payload: Any) -> list[dict]:
+        if isinstance(payload, list):
+            return [
+                item for item in payload
+                if isinstance(item, dict)
+            ]
 
-        # Most common.
+        if isinstance(payload, dict):
+            posts = payload.get("posts")
+            if isinstance(posts, list):
+                return [
+                    item for item in posts
+                    if isinstance(item, dict)
+                ]
+
+            if (
+                "file_url" in payload
+                or "large_file_url" in payload
+            ):
+                return [payload]
+
+        return []
+
+    @staticmethod
+    def _image_url(post: dict) -> Optional[str]:
+        # Prefer original/large files.
         for key in (
             "file_url",
             "large_file_url",
             "original",
-            "source",
         ):
             value = post.get(key)
-
             if (
                 isinstance(value, str)
                 and value.startswith(("http://", "https://"))
             ):
-                # "source" can be the artist's webpage rather than
-                # the actual image, so don't blindly use it unless
-                # it looks like an image.
-                if key == "source":
-                    lowered = value.lower()
-
-                    if not lowered.endswith(
-                        (
-                            ".jpg",
-                            ".jpeg",
-                            ".png",
-                            ".gif",
-                            ".webp",
-                        )
-                    ):
-                        continue
-
                 return value
 
         return None
 
     @staticmethod
-    def _normalise_posts(payload: Any) -> list[dict]:
-        """
-        Convert different booru API response structures into
-        a list of dictionaries.
-        """
+    def _image_extension(url: str) -> Optional[str]:
+        clean = url.lower().split("?", 1)[0]
 
-        if isinstance(payload, list):
-            return [
-                item
-                for item in payload
-                if isinstance(item, dict)
-            ]
+        if clean.endswith((".jpg", ".jpeg")):
+            return ".jpg"
 
-        if isinstance(payload, dict):
-            # Some APIs return {"posts": [...]}
-            posts = payload.get("posts")
+        if clean.endswith(".png"):
+            return ".png"
 
-            if isinstance(posts, list):
-                return [
-                    item
-                    for item in posts
-                    if isinstance(item, dict)
-                ]
+        if clean.endswith(".webp"):
+            return ".webp"
 
-            # Or a single post.
-            if "file_url" in payload:
-                return [payload]
+        if clean.endswith(".gif"):
+            return ".gif"
 
-        return []
+        return None
 
-    async def _fetch_from_api(
+    async def _query_provider(
         self,
-        name: str,
-        url: str,
-        params: dict,
+        provider: dict,
+        tags: str,
     ) -> Optional[dict]:
-        """
-        Query one API and return a random usable post.
-        """
+        params = dict(provider["base_params"])
+        params["tags"] = tags
 
         try:
-            payload = await self._request_json(
-                url,
+            payload = await self._get_json(
+                provider["url"],
                 params,
             )
-
         except (
             aiohttp.ClientError,
             asyncio.TimeoutError,
@@ -413,86 +296,92 @@ class Fumo(loader.Module):
         ):
             return None
 
-        posts = self._normalise_posts(payload)
+        posts = self._posts_from_payload(payload)
 
         if not posts:
             return None
 
-        # Randomise locally instead of relying on every API having
-        # a random=true parameter.
         random.shuffle(posts)
 
         for post in posts:
-            image_url = self._extract_url(post)
-
-            if not image_url:
+            # Safebooru/Gelbooru can expose rating in responses.
+            # Do not use anything explicitly non-safe if the API
+            # returns a rating field.
+            rating = str(post.get("rating", "")).lower()
+            if rating in ("explicit", "questionable"):
                 continue
 
-            # Skip obviously non-image links.
-            lowered = image_url.lower()
+            url = self._image_url(post)
+            if not url:
+                continue
 
-            if not lowered.split("?")[0].endswith(
-                (
-                    ".jpg",
-                    ".jpeg",
-                    ".png",
-                    ".gif",
-                    ".webp",
-                )
-            ):
+            extension = self._image_extension(url)
+
+            # Telegram/Telethon should receive a real image filename.
+            # We deliberately skip unknown extensions instead of
+            # sending them as generic documents.
+            if extension is None:
                 continue
 
             return {
-                "url": image_url,
-                "source": name,
+                "url": url,
+                "source": provider["name"],
+                "extension": extension,
                 "post": post,
             }
 
         return None
 
     async def _fetch_fumo(self) -> dict:
-        """
-        Try every configured booru in order.
-
-        Raises RuntimeError when all providers fail.
-        """
-
-        # Randomise provider order too, so the same provider isn't
-        # always hammered first.
-        providers = list(self.API_ENDPOINTS)
+        providers = list(self.PROVIDERS)
         random.shuffle(providers)
 
         errors = []
 
-        for name, url, params in providers:
-            try:
-                result = await self._fetch_from_api(
-                    name,
-                    url,
-                    params,
-                )
+        for provider in providers:
+            tags = list(provider["tags"])
+            random.shuffle(tags)
 
-                if result:
-                    return result
+            for tag_query in tags:
+                try:
+                    result = await self._query_provider(
+                        provider,
+                        tag_query,
+                    )
 
-                errors.append(f"{name}: empty")
+                    if result:
+                        return result
 
-            except Exception as exc:
-                errors.append(
-                    f"{name}: {type(exc).__name__}"
-                )
+                    errors.append(
+                        f'{provider["name"]}: empty'
+                    )
+
+                except Exception as exc:
+                    errors.append(
+                        f'{provider["name"]}: '
+                        f'{type(exc).__name__}'
+                    )
 
         raise RuntimeError(
-            "; ".join(errors) or "all APIs failed"
+            "All image APIs failed: "
+            + ", ".join(errors)
         )
+
+    # -----------------------------
+    # Image download
+    # -----------------------------
 
     async def _download_image(
         self,
         image_url: str,
+        extension: str,
     ) -> tuple[bytes, str]:
         """
-        Download image asynchronously.
-        Returns (image bytes, MIME type).
+        Download the image and return (bytes, mime_type).
+
+        The returned filename extension is used later when creating
+        the BytesIO object. This is important: Telethon can otherwise
+        treat an in-memory file as a generic document.
         """
 
         session = await self._get_session()
@@ -502,26 +391,25 @@ class Fumo(loader.Module):
             headers={
                 "User-Agent": self.USER_AGENT,
                 "Accept": "image/avif,image/webp,image/apng,"
-                          "image/svg+xml,image/*,*/*;q=0.8",
+                "image/svg+xml,image/*,*/*;q=0.8",
             },
         ) as response:
-
             response.raise_for_status()
 
             content_type = response.headers.get(
                 "Content-Type",
                 "",
-            ).split(";")[0].strip().lower()
+            ).split(";", 1)[0].strip().lower()
 
             content_length = response.headers.get(
-                "Content-Length",
+                "Content-Length"
             )
 
             if content_length:
                 try:
                     if int(content_length) > self.MAX_IMAGE_SIZE:
                         raise RuntimeError(
-                            "image is too large"
+                            "Image is larger than 25 MB"
                         )
                 except ValueError:
                     pass
@@ -535,221 +423,154 @@ class Fumo(loader.Module):
 
                 if len(data) > self.MAX_IMAGE_SIZE:
                     raise RuntimeError(
-                        "image is too large"
+                        "Image is larger than 25 MB"
                     )
 
             if not data:
                 raise RuntimeError(
-                    "empty image response"
+                    "Image response was empty"
                 )
 
-            mime_map = {
-                "image/jpg": "image/jpeg",
-                "image/pjpeg": "image/jpeg",
+            mime_by_extension = {
+                ".jpg": "image/jpeg",
+                ".png": "image/png",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
             }
 
-            content_type = mime_map.get(
-                content_type,
+            # Prefer the extension from the API URL because some
+            # CDN endpoints return a generic Content-Type.
+            mime_type = mime_by_extension.get(
+                extension,
                 content_type,
             )
 
-            if content_type not in (
+            if mime_type not in (
                 "image/jpeg",
                 "image/png",
-                "image/gif",
                 "image/webp",
+                "image/gif",
             ):
-                lowered = image_url.lower().split("?")[0]
+                mime_type = "image/jpeg"
 
-                if lowered.endswith((".jpg", ".jpeg")):
-                    content_type = "image/jpeg"
+            return bytes(data), mime_type
 
-                elif lowered.endswith(".png"):
-                    content_type = "image/png"
+    # -----------------------------
+    # Caption
+    # -----------------------------
 
-                elif lowered.endswith(".gif"):
-                    content_type = "image/gif"
-
-                elif lowered.endswith(".webp"):
-                    content_type = "image/webp"
-
-                else:
-                    content_type = "image/jpeg"
-
-            return bytes(data), content_type
-    # ------------------------------------------------------------------
-    # Caption handling
-    # ------------------------------------------------------------------
-
-    def _make_caption(
-        self,
-        source: str,
-    ) -> str:
-        template = self._get(
-            "caption",
-            "",
-        )
+    def _make_caption(self, source: str) -> str:
+        template = self._get("caption", "")
 
         if not template:
             return ""
 
-        now = datetime.now(
-            timezone.utc
-        )
+        now = datetime.now(timezone.utc)
 
         replacements = {
             "{source}": source,
-            "{date}": now.strftime(
-                "%Y-%m-%d"
-            ),
-            "{time}": now.strftime(
-                "%H:%M:%S UTC"
-            ),
+            "{date}": now.strftime("%Y-%m-%d"),
+            "{time}": now.strftime("%H:%M:%S UTC"),
         }
 
         result = template
 
         for key, value in replacements.items():
-            result = result.replace(
-                key,
-                value,
-            )
+            result = result.replace(key, value)
 
         return result
 
-    # ------------------------------------------------------------------
-    # Target handling
-    # ------------------------------------------------------------------
+    # -----------------------------
+    # Target
+    # -----------------------------
 
-    async def _resolve_target(
-        self,
-        message=None,
-    ):
-        """
-        Resolve configured target.
+    async def _resolve_target(self, message=None):
+        target = self._get("target", None)
 
-        If no target is configured:
-          1. use current chat when a message is available;
-          2. otherwise use Saved Messages ("me").
-        """
+        if target not in (None, ""):
+            return await self.client.get_entity(target)
 
-        target = self._get(
-            "target",
-            None,
-        )
+        if message is not None:
+            try:
+                return await message.get_chat()
+            except Exception:
+                pass
 
-        if target is None or target == "":
-            if message is not None:
-                try:
-                    return await message.get_chat()
-                except Exception:
-                    pass
+        # No current message exists during background operation,
+        # so Saved Messages is the safe fallback.
+        return await self.client.get_entity("me")
 
-            return await self.client.get_entity("me")
-
-        return await self.client.get_entity(
-            target
-        )
-
-    # ------------------------------------------------------------------
-    # Sending
-    # ------------------------------------------------------------------
+    # -----------------------------
+    # Send
+    # -----------------------------
 
     async def _send_fumo(
-    self,
-    target=None,
-    reply_message=None,
-) -> dict:
-    """
-    Fetch, download and send one Fumo as a Telegram photo.
-    """
+        self,
+        target=None,
+        reply_message=None,
+    ) -> dict:
+        if target is None:
+            target = await self._resolve_target(
+                reply_message
+            )
 
-    if target is None:
-        target = await self._resolve_target(
-            reply_message
+        fumo = await self._fetch_fumo()
+
+        image, mime_type = await self._download_image(
+            fumo["url"],
+            fumo["extension"],
         )
 
-    fumo = await self._fetch_fumo()
-
-    image, mime_type = await self._download_image(
-        fumo["url"]
-    )
-
-    extension = {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/gif": ".gif",
-        "image/webp": ".webp",
-    }.get(
-        mime_type,
-        ".jpg",
-    )
-
-    filename = (
-        "fumo_"
-        + datetime.now().strftime(
-            "%Y%m%d_%H%M%S"
+        filename = (
+            "fumo_"
+            + datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+            + fumo["extension"]
         )
-        + extension
-    )
 
-    # Give BytesIO an actual filename.
-    # Telethon uses this when determining the file type.
-    file = BytesIO(image)
-    file.name = filename
+        # Critical part:
+        # give the in-memory file a real image filename.
+        file = BytesIO(image)
+        file.name = filename
 
-    await self.client.send_file(
-        target,
-        file,
-        caption=self._make_caption(
-            fumo["source"]
-        ),
-        force_document=False,
-        mime_type=mime_type,
-    )
+        await self.client.send_file(
+            target,
+            file,
+            caption=self._make_caption(
+                fumo["source"]
+            ),
+            force_document=False,
+            mime_type=mime_type,
+        )
 
-    self._set(
-        "last_source",
-        fumo["source"],
-    )
+        self._set(
+            "last_source",
+            fumo["source"],
+        )
+        self._set(
+            "last_url",
+            fumo["url"],
+        )
+        self._set(
+            "last_time",
+            datetime.now(timezone.utc).isoformat(),
+        )
 
-    self._set(
-        "last_post_url",
-        fumo["url"],
-    )
+        return fumo
 
-    self._set(
-        "last_post_time",
-        datetime.now(
-            timezone.utc
-        ).isoformat()
-    )
-
-    return fumo
-    # ------------------------------------------------------------------
+    # -----------------------------
     # Scheduler
-    # ------------------------------------------------------------------
+    # -----------------------------
 
     async def _scheduler_loop(self):
-        """
-        Main background loop.
-
-        The loop sleeps for the configured interval and then
-        posts one Fumo.
-        """
-
-        # Small initial delay prevents an immediate post directly
-        # after module loading.
         try:
             await asyncio.sleep(5)
 
             while not self._stopping:
-                enabled = bool(
-                    self._get(
-                        "enabled",
-                        False,
-                    )
-                )
+                if not self._get("enabled", False):
+                    await asyncio.sleep(30)
+                    continue
 
                 interval = int(
                     self._get(
@@ -758,113 +579,87 @@ class Fumo(loader.Module):
                     )
                 )
 
-                if not enabled:
-                    # Don't spin at 100% CPU while disabled.
-                    await asyncio.sleep(30)
-                    continue
-
-                # Wait before each automatic post.
                 await asyncio.sleep(
-                    max(
-                        self.MIN_INTERVAL,
-                        interval,
-                    )
+                    max(self.MIN_INTERVAL, interval)
                 )
 
                 if self._stopping:
                     break
 
-                # Re-check state after sleeping.
-                if not self._get(
-                    "enabled",
-                    False,
-                ):
+                if not self._get("enabled", False):
                     continue
 
                 try:
                     target = await self._resolve_target()
+                    await self._send_fumo(target=target)
 
-                    await self._send_fumo(
-                        target=target
+                except FloodWaitError as exc:
+                    # Do not kill the scheduler on a Telegram flood wait.
+                    await asyncio.sleep(
+                        max(1, int(exc.seconds))
                     )
+
+                except (
+                    ChatWriteForbiddenError,
+                    ChatAdminRequiredError,
+                    PermissionError,
+                ):
+                    # Target cannot currently receive messages.
+                    # Keep the module alive; the next cycle can retry.
+                    continue
+
+                except (
+                    aiohttp.ClientError,
+                    asyncio.TimeoutError,
+                    RuntimeError,
+                ):
+                    # API/CDN failure. Retry on the next interval.
+                    continue
 
                 except asyncio.CancelledError:
                     raise
 
                 except Exception:
-                    # Automatic operation must not kill the scheduler.
-                    #
-                    # Errors are intentionally swallowed here because
-                    # there may be nowhere sensible to send an error
-                    # message if the target itself is unavailable.
+                    # A bad target/entity or an unexpected Telethon
+                    # error must not permanently kill the scheduler.
                     continue
 
         except asyncio.CancelledError:
             raise
-
         except Exception:
-            # Last-resort protection: the module itself must remain
-            # unloadable even if the scheduler encounters something
-            # unexpected.
             return
 
-    # ------------------------------------------------------------------
+    # -----------------------------
     # Commands
-    # ------------------------------------------------------------------
+    # -----------------------------
 
     @loader.command(
-        ru_doc="Включить/выключить автоматическую отправку Fumo.",
-        en_doc="Enable/disable automatic Fumo posting.",
+        ru_doc="Включить/выключить автопостинг: .fumo on/off",
+        en_doc="Enable/disable autoposting: .fumo on/off",
     )
     async def fumo(self, message):
-        """Enable/disable automatic Fumo posting."""
-
         args = utils.get_args_raw(message).strip().lower()
 
-        if args in (
-            "on",
-            "enable",
-            "1",
-            "true",
-        ):
-            self._set(
-                "enabled",
-                True,
-            )
-
+        if args in ("on", "enable", "1", "true"):
+            self._set("enabled", True)
             self._start_scheduler()
 
             await utils.answer(
                 message,
-                self.strings["enabled"],
+                "✅ <b>Fumo autoposting enabled.</b>",
             )
             return
 
-        if args in (
-            "off",
-            "disable",
-            "0",
-            "false",
-        ):
-            self._set(
-                "enabled",
-                False,
-            )
+        if args in ("off", "disable", "0", "false"):
+            self._set("enabled", False)
 
             await utils.answer(
                 message,
-                self.strings["disabled"],
+                "❌ <b>Fumo autoposting disabled.</b>",
             )
             return
 
-        status = (
-            "enabled"
-            if self._get(
-                "enabled",
-                False,
-            )
-            else "disabled"
-        )
+        enabled = self._get("enabled", False)
 
         await utils.answer(
             message,
@@ -872,141 +667,97 @@ class Fumo(loader.Module):
                 "<b>Usage:</b>\n"
                 "<code>.fumo on</code>\n"
                 "<code>.fumo off</code>\n\n"
-                f"<b>Current:</b> {status}"
+                "<b>Current:</b> "
+                + ("enabled" if enabled else "disabled")
             ),
         )
 
     @loader.command(
-        ru_doc="Установить чат/канал назначения.",
-        en_doc="Set the destination chat/channel.",
+        ru_doc="Установить чат/канал: .fumotarget @username или ID",
+        en_doc="Set target chat/channel.",
     )
     async def fumotarget(self, message):
-        """Set target chat/channel."""
-
         args = utils.get_args_raw(message).strip()
 
         if not args:
-            self._set(
-                "target",
-                None,
-            )
+            self._set("target", None)
 
             await utils.answer(
                 message,
                 (
-                    "<emoji document_id=5210952533914471191>"
-                    "🎯</emoji> "
-                    "<b>Target reset.</b>\n\n"
-                    "Automatic posts will use the current "
-                    "chat when possible, otherwise Saved Messages."
+                    "🎯 <b>Target reset.</b>\n"
+                    "Automatic posts will use Saved Messages "
+                    "when no current chat is available."
                 ),
             )
             return
 
-        # Try to resolve now, so a typo doesn't get persisted.
         try:
-            entity = await self.client.get_entity(
-                args
-            )
-
+            entity = await self.client.get_entity(args)
         except Exception as exc:
             await utils.answer(
                 message,
                 (
-                    "<emoji document_id=5210952533914471191>"
-                    "❌</emoji> "
-                    "<b>Couldn't resolve target.</b>\n"
+                    "❌ <b>Couldn't resolve target.</b>\n"
                     f"<code>{utils.escape_html(str(exc))}</code>"
                 ),
             )
             return
 
-        # Store the user's original ID/username.
-        #
-        # Numeric IDs are stored as integers where possible.
         stored_target: Any = args
 
-        try:
-            if args.lstrip("-").isdigit():
-                stored_target = int(args)
-        except Exception:
-            pass
+        if args.lstrip("-").isdigit():
+            stored_target = int(args)
 
-        self._set(
-            "target",
-            stored_target,
+        self._set("target", stored_target)
+
+        display = (
+            getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or str(args)
         )
-
-        display = getattr(
-            entity,
-            "title",
-            None,
-        ) or getattr(
-            entity,
-            "username",
-            None,
-        ) or str(args)
 
         await utils.answer(
             message,
-            self.strings["target_set"].format(
-                display
-            ),
+            f"🎯 <b>Target:</b> <code>{utils.escape_html(str(display))}</code>",
         )
 
     @loader.command(
-        ru_doc="Установить интервал: 30m, 2h или просто минуты.",
-        en_doc="Set interval: 30m, 2h or plain minutes.",
+        ru_doc="Интервал: .fumointerval 30m / 2h / 90",
+        en_doc="Set interval: 30m / 2h / 90.",
     )
     async def fumointerval(self, message):
-        """Set automatic posting interval."""
-
         args = utils.get_args_raw(message).strip().lower()
 
         if not args:
             await utils.answer(
                 message,
-                self.strings["invalid_interval"],
+                "⚠️ <b>Example:</b> <code>.fumointerval 30m</code>",
             )
             return
 
         try:
             if args.endswith("h"):
-                hours = float(
-                    args[:-1]
-                )
-
                 seconds = int(
-                    hours * 60 * 60
+                    float(args[:-1]) * 3600
                 )
-
             elif args.endswith("m"):
-                minutes = float(
-                    args[:-1]
-                )
-
                 seconds = int(
-                    minutes * 60
+                    float(args[:-1]) * 60
                 )
-
             elif args.endswith("s"):
                 seconds = int(
                     float(args[:-1])
                 )
-
             else:
-                # Bare number = minutes.
+                # Plain number = minutes.
                 seconds = int(
                     float(args) * 60
                 )
-
-        except (
-            ValueError,
-            TypeError,
-        ):
+        except (ValueError, TypeError):
             await utils.answer(
                 message,
-                self.strings["invalid_interval"],
+                "⚠️ <b>Invalid interval.</b>",
             )
             return
 
@@ -1018,77 +769,77 @@ class Fumo(loader.Module):
             await utils.answer(
                 message,
                 (
-                    "<emoji document_id=5210952533914471191>"
-                    "⚠️</emoji> "
-                    "<b>Interval must be between "
+                    "⚠️ <b>Interval must be between "
                     "1 minute and 7 days.</b>"
                 ),
             )
             return
 
-        self._set(
-            "interval",
-            seconds,
-        )
+        self._set("interval", seconds)
 
         await utils.answer(
             message,
-            self.strings["interval_set"].format(
-                self._format_interval(seconds)
+            (
+                "⏱ <b>Interval:</b> "
+                f"<code>{self._format_interval(seconds)}</code>"
             ),
         )
 
     @loader.command(
-        ru_doc="Установить подпись. Без аргументов — очистить.",
-        en_doc="Set caption. No arguments clears it.",
+        ru_doc="Установить подпись. Пустая команда очищает её.",
+        en_doc="Set caption. Empty command clears it.",
     )
     async def fumocaption(self, message):
-        """Set custom caption."""
+        caption = utils.get_args_raw(message)
 
-        caption = utils.get_args_raw(
-            message
-        )
+        self._set("caption", caption)
 
-        if caption == "":
-            self._set(
-                "caption",
-                "",
-            )
-
+        if caption:
             await utils.answer(
                 message,
-                self.strings["caption_cleared"],
+                "📝 <b>Caption updated.</b>",
             )
-            return
-
-        self._set(
-            "caption",
-            caption,
-        )
-
-        await utils.answer(
-            message,
-            self.strings["caption_set"],
-        )
+        else:
+            await utils.answer(
+                message,
+                "📝 <b>Caption cleared.</b>",
+            )
 
     @loader.command(
-        ru_doc="Отправить один случайный Fumo прямо сейчас.",
-        en_doc="Send one random Fumo immediately.",
+        ru_doc="Скачать и отправить один Fumo в текущий чат.",
+        en_doc="Fetch and send one Fumo to the current chat.",
     )
     async def fumotest(self, message):
-        """Fetch and send one Fumo immediately."""
-
-        status_message = await utils.answer(
+        status = await utils.answer(
             message,
-            self.strings["fetching"],
+            "🔎 <b>Fetching Fumo...</b>",
         )
 
         try:
-            # Manual trigger always sends to the current chat.
             fumo = await self._send_fumo(
-                target=await message.get_chat(),
-                reply_message=message,
+                target=await message.get_chat()
             )
+
+        except FloodWaitError as exc:
+            await utils.answer(
+                status,
+                (
+                    "🐌 <b>Telegram flood wait:</b> "
+                    f"<code>{exc.seconds}s</code>"
+                ),
+            )
+            return
+
+        except (
+            ChatWriteForbiddenError,
+            ChatAdminRequiredError,
+            PermissionError,
+        ):
+            await utils.answer(
+                status,
+                "🚫 <b>No permission to send media here.</b>",
+            )
+            return
 
         except (
             aiohttp.ClientError,
@@ -1096,164 +847,106 @@ class Fumo(loader.Module):
             RuntimeError,
         ) as exc:
             await utils.answer(
-                status_message,
-                self.strings["fetch_failed"].format(
-                    utils.escape_html(
-                        str(exc)
-                    )
+                status,
+                (
+                    "❌ <b>Fumo fetch failed.</b>\n"
+                    f"<code>{utils.escape_html(str(exc))}</code>"
                 ),
             )
             return
 
         except Exception as exc:
-            # FloodWaitError and other Telethon exceptions are
-            # handled explicitly below where available, while
-            # keeping this module compatible with different forks.
-            error_name = type(exc).__name__
-
-            if error_name == "FloodWaitError":
-                seconds = getattr(
-                    exc,
-                    "seconds",
-                    0,
-                )
-
-                await utils.answer(
-                    status_message,
-                    self.strings["flood_wait"].format(
-                        seconds
-                    ),
-                )
-                return
-
-            if (
-                "ChatWriteForbidden" in error_name
-                or "ChatAdminRequired" in error_name
-                or "Forbidden" in error_name
-            ):
-                await utils.answer(
-                    status_message,
-                    self.strings["permission_error"],
-                )
-                return
-
             await utils.answer(
-                status_message,
-                self.strings["send_failed"].format(
-                    utils.escape_html(
-                        f"{error_name}: {exc}"
-                    )
+                status,
+                (
+                    "❌ <b>Send failed.</b>\n"
+                    f"<code>{utils.escape_html(str(exc))}</code>"
                 ),
             )
             return
 
         await utils.answer(
-            status_message,
-            self.strings["test_done"].format(
-                fumo["source"]
+            status,
+            (
+                "✅ <b>Fumo sent.</b>\n"
+                f"<i>Source:</i> {fumo['source']}"
             ),
         )
 
     @loader.command(
-        ru_doc="Показать состояние Fumo AutoPoster.",
-        en_doc="Show Fumo AutoPoster status.",
+        ru_doc="Показать состояние автопостера.",
+        en_doc="Show autoposter status.",
     )
     async def fumostatus(self, message):
-        """Show module status."""
-
-        enabled = self._get(
-            "enabled",
-            False,
-        )
-
-        target = self._get(
-            "target",
-            None,
-        )
-
-        if target is None:
-            target_display = (
-                "current chat / Saved Messages"
-            )
-        else:
-            target_display = str(target)
-
+        enabled = self._get("enabled", False)
+        target = self._get("target", None)
         interval = int(
             self._get(
                 "interval",
                 self.DEFAULT_INTERVAL,
             )
         )
-
-        caption = self._get(
-            "caption",
-            "",
-        )
-
-        if not caption:
-            caption = "<empty>"
-
+        caption = self._get("caption", "")
         last_source = self._get(
             "last_source",
             "",
-        ) or "<none>"
+        )
+        last_time = self._get(
+            "last_time",
+            "",
+        )
+
+        if target in (None, ""):
+            target_display = "Saved Messages / fallback"
+        else:
+            target_display = str(target)
+
+        caption_display = caption or "<empty>"
 
         await utils.answer(
             message,
-            self.strings["status"].format(
-                "🟢 enabled"
-                if enabled
-                else "🔴 disabled",
-                target_display,
-                self._format_interval(interval),
-                caption,
-                last_source,
+            (
+                "🌸 <b>Fumo AutoPoster</b>\n\n"
+                "<b>Status:</b> "
+                + ("🟢 enabled" if enabled else "🔴 disabled")
+                + "\n"
+                f"<b>Target:</b> <code>"
+                f"{utils.escape_html(target_display)}</code>\n"
+                f"<b>Interval:</b> <code>"
+                f"{self._format_interval(interval)}</code>\n"
+                f"<b>Caption:</b> <code>"
+                f"{utils.escape_html(caption_display)}</code>\n"
+                f"<b>Last source:</b> <code>"
+                f"{utils.escape_html(last_source or '<none>')}</code>\n"
+                f"<b>Last time:</b> <code>"
+                f"{utils.escape_html(last_time or '<none>')}</code>"
             ),
         )
 
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
+    # -----------------------------
+    # Utilities
+    # -----------------------------
 
     @staticmethod
     def _format_interval(seconds: int) -> str:
         seconds = int(seconds)
 
-        days, seconds = divmod(
-            seconds,
-            86400,
-        )
-
-        hours, seconds = divmod(
-            seconds,
-            3600,
-        )
-
-        minutes, seconds = divmod(
-            seconds,
-            60,
-        )
+        days, seconds = divmod(seconds, 86400)
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
 
         parts = []
 
         if days:
-            parts.append(
-                f"{days}d"
-            )
+            parts.append(f"{days}d")
 
         if hours:
-            parts.append(
-                f"{hours}h"
-            )
+            parts.append(f"{hours}h")
 
         if minutes:
-            parts.append(
-                f"{minutes}m"
-            )
+            parts.append(f"{minutes}m")
 
         if seconds and not parts:
-            parts.append(
-                f"{seconds}s"
-            )
+            parts.append(f"{seconds}s")
 
         return " ".join(parts) or "0s"
