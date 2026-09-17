@@ -1,5 +1,4 @@
-# meta developer: @your_username
-# meta banner: https://i.imgur.com/8Qp4w0E.jpeg
+# meta developer: @xmogde
 # requires: aiohttp
 
 import asyncio
