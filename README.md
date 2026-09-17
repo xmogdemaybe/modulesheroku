@@ -9,7 +9,7 @@
 
 **Установка репозитория:**
 
-.addrepo https://github.com/xmogdemaybe/modulesheroku
+.addrepo https://github.com/xmogdemaybe/modulesheroku/raw/main
 
 
 **Установка конкретного модуля:**
