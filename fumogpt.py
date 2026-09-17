@@ -487,60 +487,102 @@ class Fumo(loader.Module):
         )
 
     async def _download_image(
-        self,
-        image_url: str,
-    ) -> bytes:
-        """
-        Download an image asynchronously.
+    self,
+    image_url: str,
+) -> tuple[bytes, str]:
+    """
+    Download an image asynchronously and return:
+        (image bytes, MIME type)
+    """
 
-        A size limit prevents an accidentally huge file from
-        being loaded into memory.
-        """
+    session = await self._get_session()
 
-        session = await self._get_session()
+    async with session.get(
+        image_url,
+        headers={
+            "User-Agent": self.USER_AGENT,
+            "Accept": "image/avif,image/webp,image/apng,"
+                      "image/svg+xml,image/*,*/*;q=0.8",
+        },
+    ) as response:
 
-        async with session.get(
-            image_url,
-            headers={
-                "User-Agent": self.USER_AGENT,
-                "Accept": "image/avif,image/webp,image/apng,"
-                "image/svg+xml,image/*,*/*;q=0.8",
-            },
-        ) as response:
+        response.raise_for_status()
 
-            response.raise_for_status()
+        content_type = response.headers.get(
+            "Content-Type",
+            ""
+        ).split(";")[0].strip().lower()
 
-            content_length = response.headers.get(
-                "Content-Length"
-            )
+        content_length = response.headers.get(
+            "Content-Length"
+        )
 
-            if content_length:
-                try:
-                    if int(content_length) > self.MAX_IMAGE_SIZE:
-                        raise RuntimeError(
-                            "image is too large"
-                        )
-                except ValueError:
-                    pass
-
-            data = bytearray()
-
-            async for chunk in response.content.iter_chunked(
-                64 * 1024
-            ):
-                data.extend(chunk)
-
-                if len(data) > self.MAX_IMAGE_SIZE:
+        if content_length:
+            try:
+                if int(content_length) > self.MAX_IMAGE_SIZE:
                     raise RuntimeError(
                         "image is too large"
                     )
+            except ValueError:
+                pass
 
-            if not data:
+        data = bytearray()
+
+        async for chunk in response.content.iter_chunked(
+            64 * 1024
+        ):
+            data.extend(chunk)
+
+            if len(data) > self.MAX_IMAGE_SIZE:
                 raise RuntimeError(
-                    "empty image response"
+                    "image is too large"
                 )
 
-            return bytes(data)
+        if not data:
+            raise RuntimeError(
+                "empty image response"
+            )
+
+        # Normalize MIME type.
+        mime_map = {
+            "image/jpg": "image/jpeg",
+            "image/pjpeg": "image/jpeg",
+        }
+
+        content_type = mime_map.get(
+            content_type,
+            content_type,
+        )
+
+        # Some boorus/CDNs don't send a useful Content-Type.
+        if content_type not in (
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
+        ):
+            lowered = image_url.lower().split("?")[0]
+
+            if lowered.endswith(
+                (".jpg", ".jpeg")
+            ):
+                content_type = "image/jpeg"
+
+            elif lowered.endswith(".png"):
+                content_type = "image/png"
+
+            elif lowered.endswith(".gif"):
+                content_type = "image/gif"
+
+            elif lowered.endswith(".webp"):
+                content_type = "image/webp"
+
+            else:
+                # Most booru posts are JPEG/PNG.
+                content_type = "image/jpeg"
+
+        return bytes(data), content_type
+
 
     # ------------------------------------------------------------------
     # Caption handling
@@ -621,64 +663,76 @@ class Fumo(loader.Module):
     # ------------------------------------------------------------------
 
     async def _send_fumo(
-        self,
-        target=None,
-        reply_message=None,
-    ) -> dict:
-        """
-        Fetch, download and send one Fumo.
-        """
+    self,
+    target=None,
+    reply_message=None,
+) -> dict:
+    """
+    Fetch, download and send one Fumo as a Telegram photo.
+    """
 
-        if target is None:
-            target = await self._resolve_target(
-                reply_message
-            )
-
-        fumo = await self._fetch_fumo()
-
-        image = await self._download_image(
-            fumo["url"]
+    if target is None:
+        target = await self._resolve_target(
+            reply_message
         )
 
-        caption = self._make_caption(
+    fumo = await self._fetch_fumo()
+
+    image, mime_type = await self._download_image(
+        fumo["url"]
+    )
+
+    extension = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+    }.get(
+        mime_type,
+        ".jpg",
+    )
+
+    filename = (
+        "fumo_"
+        + datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+        + extension
+    )
+
+    # Give BytesIO an actual filename.
+    # Telethon uses this when determining the file type.
+    file = BytesIO(image)
+    file.name = filename
+
+    await self.client.send_file(
+        target,
+        file,
+        caption=self._make_caption(
             fumo["source"]
-        )
+        ),
+        force_document=False,
+        mime_type=mime_type,
+    )
 
-        filename = (
-            "fumo_"
-            + datetime.now().strftime(
-                "%Y%m%d_%H%M%S"
-            )
-            + ".jpg"
-        )
+    self._set(
+        "last_source",
+        fumo["source"],
+    )
 
-        await self.client.send_file(
-            target,
-            BytesIO(image),
-            caption=caption,
-            file_name=filename,
-            force_document=False,
-        )
+    self._set(
+        "last_post_url",
+        fumo["url"],
+    )
 
-        self._set(
-            "last_source",
-            fumo["source"],
-        )
+    self._set(
+        "last_post_time",
+        datetime.now(
+            timezone.utc
+        ).isoformat()
+    )
 
-        self._set(
-            "last_post_url",
-            fumo["url"],
-        )
-
-        self._set(
-            "last_post_time",
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-        )
-
-        return fumo
-
+    return fumo
     # ------------------------------------------------------------------
     # Scheduler
     # ------------------------------------------------------------------
