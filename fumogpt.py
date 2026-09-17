@@ -487,103 +487,96 @@ class Fumo(loader.Module):
         )
 
     async def _download_image(
-    self,
-    image_url: str,
-) -> tuple[bytes, str]:
-    """
-    Download an image asynchronously and return:
-        (image bytes, MIME type)
-    """
+        self,
+        image_url: str,
+    ) -> tuple[bytes, str]:
+        """
+        Download image asynchronously.
+        Returns (image bytes, MIME type).
+        """
 
-    session = await self._get_session()
+        session = await self._get_session()
 
-    async with session.get(
-        image_url,
-        headers={
-            "User-Agent": self.USER_AGENT,
-            "Accept": "image/avif,image/webp,image/apng,"
-                      "image/svg+xml,image/*,*/*;q=0.8",
-        },
-    ) as response:
+        async with session.get(
+            image_url,
+            headers={
+                "User-Agent": self.USER_AGENT,
+                "Accept": "image/avif,image/webp,image/apng,"
+                          "image/svg+xml,image/*,*/*;q=0.8",
+            },
+        ) as response:
 
-        response.raise_for_status()
+            response.raise_for_status()
 
-        content_type = response.headers.get(
-            "Content-Type",
-            ""
-        ).split(";")[0].strip().lower()
+            content_type = response.headers.get(
+                "Content-Type",
+                "",
+            ).split(";")[0].strip().lower()
 
-        content_length = response.headers.get(
-            "Content-Length"
-        )
+            content_length = response.headers.get(
+                "Content-Length",
+            )
 
-        if content_length:
-            try:
-                if int(content_length) > self.MAX_IMAGE_SIZE:
+            if content_length:
+                try:
+                    if int(content_length) > self.MAX_IMAGE_SIZE:
+                        raise RuntimeError(
+                            "image is too large"
+                        )
+                except ValueError:
+                    pass
+
+            data = bytearray()
+
+            async for chunk in response.content.iter_chunked(
+                64 * 1024
+            ):
+                data.extend(chunk)
+
+                if len(data) > self.MAX_IMAGE_SIZE:
                     raise RuntimeError(
                         "image is too large"
                     )
-            except ValueError:
-                pass
 
-        data = bytearray()
-
-        async for chunk in response.content.iter_chunked(
-            64 * 1024
-        ):
-            data.extend(chunk)
-
-            if len(data) > self.MAX_IMAGE_SIZE:
+            if not data:
                 raise RuntimeError(
-                    "image is too large"
+                    "empty image response"
                 )
 
-        if not data:
-            raise RuntimeError(
-                "empty image response"
+            mime_map = {
+                "image/jpg": "image/jpeg",
+                "image/pjpeg": "image/jpeg",
+            }
+
+            content_type = mime_map.get(
+                content_type,
+                content_type,
             )
 
-        # Normalize MIME type.
-        mime_map = {
-            "image/jpg": "image/jpeg",
-            "image/pjpeg": "image/jpeg",
-        }
-
-        content_type = mime_map.get(
-            content_type,
-            content_type,
-        )
-
-        # Some boorus/CDNs don't send a useful Content-Type.
-        if content_type not in (
-            "image/jpeg",
-            "image/png",
-            "image/gif",
-            "image/webp",
-        ):
-            lowered = image_url.lower().split("?")[0]
-
-            if lowered.endswith(
-                (".jpg", ".jpeg")
+            if content_type not in (
+                "image/jpeg",
+                "image/png",
+                "image/gif",
+                "image/webp",
             ):
-                content_type = "image/jpeg"
+                lowered = image_url.lower().split("?")[0]
 
-            elif lowered.endswith(".png"):
-                content_type = "image/png"
+                if lowered.endswith((".jpg", ".jpeg")):
+                    content_type = "image/jpeg"
 
-            elif lowered.endswith(".gif"):
-                content_type = "image/gif"
+                elif lowered.endswith(".png"):
+                    content_type = "image/png"
 
-            elif lowered.endswith(".webp"):
-                content_type = "image/webp"
+                elif lowered.endswith(".gif"):
+                    content_type = "image/gif"
 
-            else:
-                # Most booru posts are JPEG/PNG.
-                content_type = "image/jpeg"
+                elif lowered.endswith(".webp"):
+                    content_type = "image/webp"
 
-        return bytes(data), content_type
+                else:
+                    content_type = "image/jpeg"
 
-
+            return bytes(data), content_type
     # ------------------------------------------------------------------
     # Caption handling
     # ------------------------------------------------------------------
