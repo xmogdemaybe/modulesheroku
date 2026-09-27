@@ -3,8 +3,8 @@
 # FumoQoder — random Touhou fumo autoposter for Hikka / Heroku.
 #
 # Sources (tried in random order, then fallbacks):
-#   Safebooru / Gelbooru / Konachan  -> boorus (safe-only)
-#   Reddit (r/FUMOFUMO)              -> fallback, no API key (needs system VPN in RU)
+#   Safebooru / Konachan             -> boorus (safe-only)
+#   Reddit (r/Fumofumo)              -> fallback, no API key (needs system VPN in RU)
 #   Flickr                           -> optional, only if API key is set (safe_search=1)
 #
 # Commands:
@@ -16,8 +16,10 @@
 #   .fumotags [source] [tags]    per-source search tags (show if no args)
 #   .fumoexclude <tags>          global minus-tag blacklist for boorus
 #   .fumoreddit on|off           toggle Reddit fallback source
-#   .fumosub <subreddit>         set subreddit (default FUMOFUMO)
+#   .fumosub <subreddit>         set subreddit (default Fumofumo)
 #   .fumoflickrkey <key>         set Flickr API key (empty disables Flickr)
+#   .fumoproxy <url>             HTTP/SOCKS5 proxy for all module traffic
+#                                (e.g. local WARP: socks5://127.0.0.1:40000)
 #   .fumotest                    post one fumo into current chat right now
 #   .fumostatus                  show all settings + enabled sources
 #
@@ -48,7 +50,9 @@ MAX_IMAGE_SIZE = 20 * 1024 * 1024
 MIN_INTERVAL = 60
 MAX_INTERVAL = 7 * 24 * 3600
 DEFAULT_INTERVAL = 3600
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FumoQoder/1.1"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FumoQoder/1.2"
+# Reddit blocks browser-like UAs; it requires a distinct bot-style one.
+REDDIT_USER_AGENT = "linux:FumoQoder:1.2 (by /u/xmogdemaybe)"
 
 SAFE_EXTS = {
     ".jpg": "image/jpeg",
@@ -58,21 +62,20 @@ SAFE_EXTS = {
     ".gif": "image/gif",
 }
 
-# Sensible per-source defaults (Safebooru/Gelbooru use fumo_(doll); Konachan needs a
+# Sensible per-source defaults (Safebooru uses fumo_(doll); Konachan needs a
 # broader tag). Override any of them with: .fumotags <source> <tags>
 DEFAULT_TAGS = {
     "safebooru": "fumo_(doll)",
-    "gelbooru": "fumo_(doll)",
     "konachan": "touhou doll",
     "flickr": "fumo",
 }
-BOORU_SOURCES = ("safebooru", "gelbooru", "konachan")
-DEFAULT_SUBREDDIT = "FUMOFUMO"
+BOORU_SOURCES = ("safebooru", "konachan")
+DEFAULT_SUBREDDIT = "Fumofumo"
 
 
 @loader.tds
 class FumoQoder(loader.Module):
-    """Random Touhou fumo autoposter (Safebooru / Gelbooru / Konachan + Reddit/Flickr fallbacks)"""
+    """Random Touhou fumo autoposter (Safebooru / Konachan + Reddit/Flickr fallbacks)"""
 
     strings = {"name": "FumoQoder"}
 
@@ -113,9 +116,9 @@ class FumoQoder(loader.Module):
             )
         return self._session
 
-    async def _json(self, url: str, params: dict) -> Any:
+    async def _json(self, url: str, params: dict, headers: Optional[dict] = None) -> Any:
         session = await self._http()
-        async with session.get(url, params=params) as resp:
+        async with session.get(url, params=params, headers=headers, proxy=self._proxy()) as resp:
             resp.raise_for_status()
             return await resp.json(content_type=None)
 
@@ -127,12 +130,13 @@ class FumoQoder(loader.Module):
     def _exclude(self) -> str:
         return (self._get("exclude", "") or "").strip()
 
+    def _proxy(self) -> Optional[str]:
+        return (self._get("proxy", "") or "").strip() or None
+
     def _booru_tags(self, source: str) -> str:
         """Search tags + site rating filter + global minus-tag blacklist."""
         parts = [self._tags_for(source)]
-        if source == "gelbooru":
-            parts.append("rating:general")
-        elif source == "konachan":
+        if source == "konachan":
             parts.append("rating:safe")
         for t in self._exclude().split():
             parts.append(t if t.startswith("-") else f"-{t}")
@@ -184,24 +188,6 @@ class FumoQoder(loader.Module):
                 return posts
         return []
 
-    async def _src_gelbooru(self) -> list:
-        tags = self._booru_tags("gelbooru")
-        for pid in self._page_candidates(5, 0):
-            posts = []
-            for p in self._dapi_parse(await self._dapi("https://gelbooru.com/index.php", tags, pid)):
-                url = p.get("file_url") or ""
-                if url.startswith("//"):
-                    url = "https:" + url
-                if url:
-                    posts.append({
-                        "id": f"gb_{p.get('id')}", "url": url, "src": "Gelbooru",
-                        "post_url": f"https://gelbooru.com/index.php?page=post&s=view&id={p.get('id')}",
-                        "tags": tags,
-                    })
-            if posts:
-                return posts
-        return []
-
     async def _src_konachan(self) -> list:
         tags = self._booru_tags("konachan")
         for page in self._page_candidates(3, 1):
@@ -221,7 +207,8 @@ class FumoQoder(loader.Module):
     async def _src_reddit(self) -> list:
         sub = self._get("subreddit", DEFAULT_SUBREDDIT) or DEFAULT_SUBREDDIT
         payload = await self._json(
-            f"https://www.reddit.com/r/{sub}/hot.json", {"limit": "50", "raw_json": "1"}
+            f"https://www.reddit.com/r/{sub}/hot.json", {"limit": "50", "raw_json": "1"},
+            headers={"User-Agent": REDDIT_USER_AGENT},
         )
         children = (payload or {}).get("data", {}).get("children", []) if isinstance(payload, dict) else []
         posts = []
@@ -281,7 +268,7 @@ class FumoQoder(loader.Module):
 
     def _active_sources(self) -> list:
         """Boorus (shuffled) first, then optional fallbacks: Flickr, Reddit."""
-        boorus = [self._src_safebooru, self._src_gelbooru, self._src_konachan]
+        boorus = [self._src_safebooru, self._src_konachan]
         random.shuffle(boorus)
         sources = list(boorus)
         if self._get("flickr_key", ""):
@@ -323,7 +310,7 @@ class FumoQoder(loader.Module):
         async with session.get(url, headers={
             "User-Agent": USER_AGENT,
             "Referer": "/".join(url.split("/")[:3]) + "/",
-        }) as resp:
+        }, proxy=self._proxy()) as resp:
             resp.raise_for_status()
             data = bytearray()
             async for chunk in resp.content.iter_chunked(64 * 1024):
@@ -370,12 +357,15 @@ class FumoQoder(loader.Module):
 
     def _caption(self, post: dict) -> str:
         now = datetime.now(timezone.utc)
+        # Telegram parses captions as HTML, so every dynamic value must be escaped:
+        # booru post URLs contain bare '&' (?page=post&s=view&id=..), which Telegram
+        # rejects with "Failed to parse message" unless it is '&amp;'.
         vals = {
-            "{source}": post["src"],
-            "{post}": post.get("post_url", ""),
-            "{url}": post["url"],
-            "{tags}": post.get("tags", ""),
-            "{id}": post["id"],
+            "{source}": utils.escape_html(post["src"]),
+            "{post}": utils.escape_html(post.get("post_url", "")),
+            "{url}": utils.escape_html(post["url"]),
+            "{tags}": utils.escape_html(post.get("tags", "")),
+            "{id}": utils.escape_html(post["id"]),
             "{date}": now.strftime("%Y-%m-%d"),
             "{time}": now.strftime("%H:%M:%S"),
         }
@@ -391,8 +381,8 @@ class FumoQoder(loader.Module):
             parts.append(custom)
         if self._get("meta", True):
             parts.append(
-                f"\U0001F338 {post['src']} \u2022 \U0001F3F7 {post.get('tags','')}\n"
-                f"\U0001F517 {post.get('post_url','')}"
+                f"\U0001F338 {vals['{source}']} \u2022 \U0001F3F7 {vals['{tags}']}\n"
+                f"\U0001F517 {vals['{post}']}"
             )
         return "\n\n".join(parts)
 
@@ -538,7 +528,7 @@ class FumoQoder(loader.Module):
         await utils.answer(message, f"\U0001F4DD <b>Meta footer:</b> {state}")
 
     @loader.command(
-        ru_doc="Теги по источникам: .fumotags <safebooru|gelbooru|konachan|flickr> <теги>; без аргументов — показать",
+        ru_doc="Теги по источникам: .fumotags <safebooru|konachan|flickr> <теги>; без аргументов — показать",
         en_doc="Per-source tags: .fumotags <source> <tags>; no args shows current",
     )
     async def fumotags(self, message):
@@ -596,11 +586,11 @@ class FumoQoder(loader.Module):
         await utils.answer(message, f"\U0001F4E1 <b>Reddit fallback:</b> {state}")
 
     @loader.command(
-        ru_doc="Сабреддит: .fumosub FUMOFUMO (пусто — сброс)",
-        en_doc="Set subreddit: .fumosub FUMOFUMO (empty resets)",
+        ru_doc="Сабреддит: .fumosub Fumofumo (пусто — сброс)",
+        en_doc="Set subreddit: .fumosub Fumofumo (empty resets)",
     )
     async def fumosub(self, message):
-        """Set the subreddit for the Reddit source (default FUMOFUMO)"""
+        """Set the subreddit for the Reddit source (default Fumofumo)"""
         sub = utils.get_args_raw(message).strip().replace("r/", "").replace("/", "")
         self._set("subreddit", sub or DEFAULT_SUBREDDIT)
         await utils.answer(
@@ -618,6 +608,24 @@ class FumoQoder(loader.Module):
         await utils.answer(
             message, "\U0001F4F7 <b>Flickr enabled.</b>" if key
             else "\U0001F4F7 <b>Flickr disabled (no key).</b>"
+        )
+
+    @loader.command(
+        ru_doc="Прокси для трафика модуля: .fumoproxy socks5://127.0.0.1:40000 (пусто — выключить)",
+        en_doc="Proxy for module traffic: .fumoproxy socks5://127.0.0.1:40000 (empty disables)",
+    )
+    async def fumoproxy(self, message):
+        """HTTP/SOCKS5 proxy for all module requests (e.g. local WARP socks5)"""
+        proxy = utils.get_args_raw(message).strip()
+        if proxy and not proxy.startswith(("http://", "https://", "socks5://", "socks5h://", "socks4://")):
+            await utils.answer(
+                message, "\u26A0\uFE0F <b>Proxy URL must start with http://, https:// or socks5://</b>"
+            )
+            return
+        self._set("proxy", proxy)
+        await utils.answer(
+            message, f"\U0001F310 <b>Proxy:</b> <code>{utils.escape_html(proxy)}</code>" if proxy
+            else "\U0001F310 <b>Proxy disabled.</b>"
         )
 
     @loader.command(
@@ -659,7 +667,7 @@ class FumoQoder(loader.Module):
         else:
             state = "\U0001F534 disabled"
 
-        active = ["safebooru", "gelbooru", "konachan"]
+        active = ["safebooru", "konachan"]
         if self._get("flickr_key", ""):
             active.append("flickr")
         if self._get("reddit", True):
@@ -675,6 +683,7 @@ class FumoQoder(loader.Module):
             f"<b>Meta footer:</b> {'on' if self._get('meta', True) else 'off'}\n"
             f"<b>Caption:</b> <code>{utils.escape_html(self._get('caption', '') or '—')}</code>\n"
             f"<b>Exclude:</b> <code>{utils.escape_html(self._exclude() or '—')}</code>\n"
+            f"<b>Proxy:</b> <code>{utils.escape_html(self._get('proxy', '') or '—')}</code>\n"
             f"<b>Last post:</b> <code>{last_str}</code> "
             f"({utils.escape_html(self._get('last_source', '') or '—')})",
         )
