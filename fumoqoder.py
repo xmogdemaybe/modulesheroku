@@ -2,16 +2,29 @@
 # requires: aiohttp
 # FumoQoder — random Touhou fumo autoposter for Hikka / Heroku.
 #
+# Sources (tried in random order, then fallbacks):
+#   Safebooru / Gelbooru / Konachan  -> boorus (safe-only)
+#   Reddit (r/FUMOFUMO)              -> fallback, no API key (needs system VPN in RU)
+#   Flickr                           -> optional, only if API key is set (safe_search=1)
+#
 # Commands:
-#   .fumo on|off          — toggle autoposting
-#   .fumotarget [chat]    — set target (arg / reply / current chat)
-#   .fumointerval 30m|2h  — set interval (1m .. 7d)
-#   .fumocaption <text>   — caption template ({source} {date} {time} {url})
-#   .fumotags <tags>      — custom booru tags (default: fumo)
-#   .fumotest             — post one fumo into current chat right now
-#   .fumostatus           — show current state
+#   .fumo on|off                 toggle autoposting
+#   .fumotarget [chat]           set target (arg / reply / current chat)
+#   .fumointerval 30m|2h|90      set interval (minutes by default), 1m..7d
+#   .fumocaption <text>          custom caption text (placeholders allowed)
+#   .fumometa on|off             toggle auto metadata footer in caption
+#   .fumotags [source] [tags]    per-source search tags (show if no args)
+#   .fumoexclude <tags>          global minus-tag blacklist for boorus
+#   .fumoreddit on|off           toggle Reddit fallback source
+#   .fumosub <subreddit>         set subreddit (default FUMOFUMO)
+#   .fumoflickrkey <key>         set Flickr API key (empty disables Flickr)
+#   .fumotest                    post one fumo into current chat right now
+#   .fumostatus                  show all settings + enabled sources
+#
+# Caption placeholders: {source} {post} {url} {tags} {id} {date} {time}
 
 import asyncio
+import logging
 import random
 import time
 from datetime import datetime, timezone
@@ -28,12 +41,14 @@ from telethon.errors import (
 
 from .. import loader, utils
 
+logger = logging.getLogger(__name__)
+
 MAX_HISTORY = 400
 MAX_IMAGE_SIZE = 20 * 1024 * 1024
 MIN_INTERVAL = 60
 MAX_INTERVAL = 7 * 24 * 3600
 DEFAULT_INTERVAL = 3600
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FumoQoder/1.0"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FumoQoder/1.1"
 
 SAFE_EXTS = {
     ".jpg": "image/jpeg",
@@ -43,10 +58,21 @@ SAFE_EXTS = {
     ".gif": "image/gif",
 }
 
+# Sensible per-source defaults (Safebooru/Gelbooru use fumo_(doll); Konachan needs a
+# broader tag). Override any of them with: .fumotags <source> <tags>
+DEFAULT_TAGS = {
+    "safebooru": "fumo_(doll)",
+    "gelbooru": "fumo_(doll)",
+    "konachan": "touhou doll",
+    "flickr": "fumo",
+}
+BOORU_SOURCES = ("safebooru", "gelbooru", "konachan")
+DEFAULT_SUBREDDIT = "FUMOFUMO"
+
 
 @loader.tds
 class FumoQoder(loader.Module):
-    """Random Touhou fumo autoposter (Safebooru / Gelbooru / Konachan / yande.re)"""
+    """Random Touhou fumo autoposter (Safebooru / Gelbooru / Konachan + Reddit/Flickr fallbacks)"""
 
     strings = {"name": "FumoQoder"}
 
@@ -93,10 +119,26 @@ class FumoQoder(loader.Module):
             resp.raise_for_status()
             return await resp.json(content_type=None)
 
-    # ---------- providers ----------
+    # ---------- tag config ----------
 
-    def _tags(self) -> str:
-        return self._get("tags", "fumo").strip() or "fumo"
+    def _tags_for(self, source: str) -> str:
+        return (self._get(f"tags_{source}", DEFAULT_TAGS.get(source, "fumo")) or "").strip()
+
+    def _exclude(self) -> str:
+        return (self._get("exclude", "") or "").strip()
+
+    def _booru_tags(self, source: str) -> str:
+        """Search tags + site rating filter + global minus-tag blacklist."""
+        parts = [self._tags_for(source)]
+        if source == "gelbooru":
+            parts.append("rating:general")
+        elif source == "konachan":
+            parts.append("rating:safe")
+        for t in self._exclude().split():
+            parts.append(t if t.startswith("-") else f"-{t}")
+        return " ".join(p for p in parts if p)
+
+    # ---------- pagination helpers ----------
 
     @staticmethod
     def _page_candidates(rand_max: int, first: int) -> list:
@@ -114,10 +156,17 @@ class FumoQoder(loader.Module):
             payload = payload.get("post", [])
         return payload if isinstance(payload, list) else []
 
+    async def _moebooru(self, url: str, tags: str, page: int) -> list:
+        payload = await self._json(url, {"limit": "100", "tags": tags, "page": str(page)})
+        return payload if isinstance(payload, list) else []
+
+    # ---------- sources (each returns canonical post dicts) ----------
+
     async def _src_safebooru(self) -> list:
+        tags = self._booru_tags("safebooru")
         for pid in self._page_candidates(5, 0):
             posts = []
-            for p in await self._dapi("https://safebooru.org/index.php", self._tags(), pid):
+            for p in self._dapi_parse(await self._dapi("https://safebooru.org/index.php", tags, pid)):
                 url = p.get("file_url") or ""
                 if url.startswith("//"):
                     url = "https:" + url
@@ -126,100 +175,148 @@ class FumoQoder(loader.Module):
                 if not url and p.get("directory") and p.get("image"):
                     url = f"https://safebooru.org/images/{p['directory']}/{p['image']}"
                 if url:
-                    posts.append({"id": f"sb_{p.get('id')}", "url": url, "src": "Safebooru"})
+                    posts.append({
+                        "id": f"sb_{p.get('id')}", "url": url, "src": "Safebooru",
+                        "post_url": f"https://safebooru.org/index.php?page=post&s=view&id={p.get('id')}",
+                        "tags": tags,
+                    })
             if posts:
                 return posts
         return []
 
     async def _src_gelbooru(self) -> list:
-        tags = f"{self._tags()} rating:general"
+        tags = self._booru_tags("gelbooru")
         for pid in self._page_candidates(5, 0):
             posts = []
-            for p in await self._dapi("https://gelbooru.com/index.php", tags, pid):
+            for p in self._dapi_parse(await self._dapi("https://gelbooru.com/index.php", tags, pid)):
                 url = p.get("file_url") or ""
                 if url.startswith("//"):
                     url = "https:" + url
                 if url:
-                    posts.append({"id": f"gb_{p.get('id')}", "url": url, "src": "Gelbooru"})
+                    posts.append({
+                        "id": f"gb_{p.get('id')}", "url": url, "src": "Gelbooru",
+                        "post_url": f"https://gelbooru.com/index.php?page=post&s=view&id={p.get('id')}",
+                        "tags": tags,
+                    })
             if posts:
                 return posts
         return []
-
-    async def _json_posts(self, url: str, tags: str, page: int) -> list:
-        payload = await self._json(url, {"limit": "100", "tags": tags, "page": str(page)})
-        return payload if isinstance(payload, list) else []
 
     async def _src_konachan(self) -> list:
-        tags = f"{self._tags()} rating:safe"
+        tags = self._booru_tags("konachan")
         for page in self._page_candidates(3, 1):
             posts = [
-                {"id": f"kn_{p.get('id')}", "url": p["file_url"], "src": "Konachan"}
-                for p in await self._json_posts("https://konachan.com/post.json", tags, page)
+                {
+                    "id": f"kn_{p.get('id')}", "url": p["file_url"], "src": "Konachan",
+                    "post_url": f"https://konachan.com/post/show/{p.get('id')}",
+                    "tags": tags,
+                }
+                for p in await self._moebooru("https://konachan.com/post.json", tags, page)
                 if isinstance(p, dict) and p.get("file_url") and p.get("rating") == "s"
             ]
             if posts:
                 return posts
         return []
 
-    async def _src_yandere(self) -> list:
-        for page in self._page_candidates(3, 1):
-            posts = [
-                {"id": f"yd_{p.get('id')}", "url": p["file_url"], "src": "yande.re"}
-                for p in await self._json_posts("https://yande.re/post.json", self._tags(), page)
-                if isinstance(p, dict) and p.get("file_url") and p.get("rating") == "s"
-            ]
-            if posts:
-                return posts
-        return []
+    async def _src_reddit(self) -> list:
+        sub = self._get("subreddit", DEFAULT_SUBREDDIT) or DEFAULT_SUBREDDIT
+        payload = await self._json(
+            f"https://www.reddit.com/r/{sub}/hot.json", {"limit": "50", "raw_json": "1"}
+        )
+        children = (payload or {}).get("data", {}).get("children", []) if isinstance(payload, dict) else []
+        posts = []
+        for c in children:
+            d = c.get("data", {}) if isinstance(c, dict) else {}
+            img = d.get("url_overridden_by_dest") or d.get("url") or ""
+            if not self._ext(img):
+                continue
+            posts.append({
+                "id": f"rd_{d.get('id')}", "url": img, "src": "Reddit",
+                "post_url": "https://reddit.com" + (d.get("permalink") or ""),
+                "tags": f"r/{sub}",
+            })
+        return posts
 
+    async def _src_flickr(self) -> list:
+        key = self._get("flickr_key", "")
+        if not key:
+            return []
+        params = {
+            "method": "flickr.photos.search", "api_key": key,
+            "text": self._tags_for("flickr"), "safe_search": "1", "content_type": "1",
+            "media": "photos", "per_page": "100", "format": "json", "nojsoncallback": "1",
+            "extras": "url_o,url_l,url_m,owner_name,tags",
+        }
+        payload = await self._json("https://www.flickr.com/services/rest/", params)
+        photos = (payload or {}).get("photos", {}).get("photo", []) if isinstance(payload, dict) else []
+        posts = []
+        for p in photos:
+            if not isinstance(p, dict):
+                continue
+            img = p.get("url_o") or p.get("url_l") or p.get("url_m")
+            if not img or not self._ext(img):
+                continue
+            posts.append({
+                "id": f"fl_{p.get('id')}", "url": img, "src": "Flickr",
+                "post_url": f"https://www.flickr.com/photos/{p.get('owner')}/{p.get('id')}",
+                "tags": (p.get("tags") or "")[:120],
+            })
+        return posts
+
+    @staticmethod
+    def _dapi_parse(payload: Any) -> list:
+        if isinstance(payload, dict):
+            payload = payload.get("post", [])
+        return payload if isinstance(payload, list) else []
 
     # ---------- fetch ----------
 
     @staticmethod
     def _ext(url: str) -> Optional[str]:
-        clean = url.lower().split("?", 1)[0]
+        clean = (url or "").lower().split("?", 1)[0]
         for ext in SAFE_EXTS:
             if clean.endswith(ext):
                 return ".jpg" if ext == ".jpeg" else ext
         return None
 
-    async def _pick_post(self) -> dict:
-        """Return {id, url, ext, src} — a fresh, unseen, safe post."""
-        sources = [self._src_safebooru, self._src_gelbooru,
-                   self._src_konachan, self._src_yandere]
-        random.shuffle(sources)
-        history = self._get("history", []) or []
-        history_set = set(history)
-        errors = []
+    def _active_sources(self) -> list:
+        """Boorus (shuffled) first, then optional fallbacks: Flickr, Reddit."""
+        boorus = [self._src_safebooru, self._src_gelbooru, self._src_konachan]
+        random.shuffle(boorus)
+        sources = list(boorus)
+        if self._get("flickr_key", ""):
+            sources.append(self._src_flickr)
+        if self._get("reddit", True):
+            sources.append(self._src_reddit)
+        return sources
 
-        for src in sources:
+    async def _pick_post(self) -> dict:
+        """Return a fresh, unseen, safe canonical post with an added 'ext' field."""
+        history = set(self._get("history", []) or [])
+        errors = []
+        for src in self._active_sources():
+            name = src.__name__
             try:
                 posts = await src()
             except Exception as exc:
-                errors.append(f"{type(exc).__name__}")
+                errors.append(f"{name}:{type(exc).__name__}")
+                logger.warning("[FumoQoder] source %s failed: %r", name, exc)
                 continue
-
             random.shuffle(posts)
             for p in posts:
                 ext = self._ext(p["url"])
-                if not ext or p["id"] in history_set:
+                if not ext or p["id"] in history:
                     continue
                 p["ext"] = ext
                 self._push_history(p["id"])
                 return p
-
-            errors.append("no fresh posts")
-
-        raise RuntimeError(
-            ("all sources failed: " + ", ".join(errors)) if errors else "no fumo found"
-        )
+            errors.append(f"{name}:no-fresh")
+        raise RuntimeError("all sources failed: " + ", ".join(errors) if errors else "no fumo found")
 
     def _push_history(self, post_id: str):
         history = self._get("history", []) or []
         history.append(post_id)
-        if len(history) > MAX_HISTORY:
-            history = history[-MAX_HISTORY:]
-        self._set("history", history)
+        self._set("history", history[-MAX_HISTORY:])
 
     async def _download(self, url: str) -> bytes:
         session = await self._http()
@@ -238,6 +335,7 @@ class FumoQoder(loader.Module):
         return bytes(data)
 
     async def _send(self, entity) -> dict:
+        post = None
         last_err = None
         for _ in range(3):
             post = await self._pick_post()
@@ -246,36 +344,57 @@ class FumoQoder(loader.Module):
                 break
             except Exception as exc:
                 last_err = exc
+                logger.warning("[FumoQoder] download failed for %s: %r", post["url"], exc)
         else:
             raise RuntimeError(f"download failed: {last_err}")
 
+        logger.info("[FumoQoder] RAW POST %r", post)
+
         file = BytesIO(data)
         file.name = f"fumo_{post['id']}{post['ext']}"
-
-        await self.client.send_file(
-            entity,
-            file,
-            caption=self._caption(post),
-            mime_type=SAFE_EXTS[post["ext"]],
+        msg = await self.client.send_file(
+            entity, file, caption=self._caption(post), mime_type=SAFE_EXTS[post["ext"]],
         )
+
         now = time.time()
         self._set("last_post_ts", now)
         self._set("last_source", post["src"])
         self._set("last_url", post["url"])
         self._next_post = now + self._get("interval", DEFAULT_INTERVAL)
+        logger.info(
+            "[FumoQoder] SENT src=%s id=%s bytes=%d target=%s msg_id=%s",
+            post["src"], post["id"], len(data),
+            getattr(entity, "id", entity), getattr(msg, "id", "?"),
+        )
         return post
 
     def _caption(self, post: dict) -> str:
-        template = self._get("caption", "")
-        if not template:
-            return ""
         now = datetime.now(timezone.utc)
-        return (
-            template.replace("{source}", post["src"])
-            .replace("{date}", now.strftime("%Y-%m-%d"))
-            .replace("{time}", now.strftime("%H:%M:%S"))
-            .replace("{url}", post["url"])
-        )
+        vals = {
+            "{source}": post["src"],
+            "{post}": post.get("post_url", ""),
+            "{url}": post["url"],
+            "{tags}": post.get("tags", ""),
+            "{id}": post["id"],
+            "{date}": now.strftime("%Y-%m-%d"),
+            "{time}": now.strftime("%H:%M:%S"),
+        }
+
+        def render(t: str) -> str:
+            for k, v in vals.items():
+                t = t.replace(k, str(v))
+            return t
+
+        parts = []
+        custom = render(self._get("caption", "") or "")
+        if custom:
+            parts.append(custom)
+        if self._get("meta", True):
+            parts.append(
+                f"\U0001F338 {post['src']} \u2022 \U0001F3F7 {post.get('tags','')}\n"
+                f"\U0001F517 {post.get('post_url','')}"
+            )
+        return "\n\n".join(parts)
 
     # ---------- target ----------
 
@@ -294,14 +413,16 @@ class FumoQoder(loader.Module):
                 if not self._get("enabled", False) or time.time() < self._next_post:
                     await asyncio.sleep(15)
                     continue
-
                 try:
                     await self._send(await self._target())
                 except FloodWaitError as exc:
+                    logger.warning("[FumoQoder] FloodWait %ss", exc.seconds)
                     self._next_post = time.time() + exc.seconds + 30
-                except (ChatWriteForbiddenError, ChatAdminRequiredError):
+                except (ChatWriteForbiddenError, ChatAdminRequiredError) as exc:
+                    logger.warning("[FumoQoder] cannot write to target: %r", exc)
                     self._next_post = time.time() + 300
-                except Exception:
+                except Exception as exc:
+                    logger.error("[FumoQoder] autopost failed: %r", exc)
                     self._next_post = time.time() + 60
             except asyncio.CancelledError:
                 raise
@@ -320,20 +441,18 @@ class FumoQoder(loader.Module):
         args = utils.get_args_raw(message).lower()
         if args in ("on", "1", "enable"):
             self._set("enabled", True)
-            await utils.answer(message, "🟢 <b>Autoposting enabled.</b>")
+            await utils.answer(message, "\U0001F7E2 <b>Autoposting enabled.</b>")
         elif args in ("off", "0", "disable"):
             self._set("enabled", False)
-            await utils.answer(message, "🔴 <b>Autoposting disabled.</b>")
+            await utils.answer(message, "\U0001F534 <b>Autoposting disabled.</b>")
         else:
             state = "enabled" if self._get("enabled", False) else "disabled"
             await utils.answer(
-                message,
-                "<b>Usage:</b> <code>.fumo on|off</code>\n"
-                f"<b>Current:</b> {state}",
+                message, f"<b>Usage:</b> <code>.fumo on|off</code>\n<b>Current:</b> {state}"
             )
 
     @loader.command(
-        ru_doc="Установить чат: .fumotarget @name|id, ответ на сообщение, или пусто для текущего",
+        ru_doc="Установить чат: .fumotarget @name|id, ответ, или пусто для текущего",
         en_doc="Set target chat: .fumotarget @name|id, reply, or empty for current chat",
     )
     async def fumotarget(self, message):
@@ -345,8 +464,7 @@ class FumoQoder(loader.Module):
                 entity = await self.client.get_entity(raw)
             except Exception as exc:
                 await utils.answer(
-                    message,
-                    f"❌ <b>Cannot resolve target:</b>\n"
+                    message, f"\u274C <b>Cannot resolve target:</b>\n"
                     f"<code>{utils.escape_html(str(exc))}</code>",
                 )
                 return
@@ -356,15 +474,14 @@ class FumoQoder(loader.Module):
             entity, stored = reply.chat, reply.chat_id
         else:
             entity, stored = await message.get_chat(), message.chat_id
-
         self._set("target", stored)
         title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(stored)
         await utils.answer(
-            message, f"🎯 <b>Target:</b> <code>{utils.escape_html(str(title))}</code>"
+            message, f"\U0001F3AF <b>Target:</b> <code>{utils.escape_html(str(title))}</code>"
         )
 
     @loader.command(
-        ru_doc="Интервал постинга: .fumointerval 30m / 2h / 90 (=минуты)",
+        ru_doc="Интервал: .fumointerval 30m / 2h / 90 (=минуты)",
         en_doc="Set interval: .fumointerval 30m / 2h / 90 (=minutes)",
     )
     async def fumointerval(self, message):
@@ -380,38 +497,128 @@ class FumoQoder(loader.Module):
             else:
                 seconds = int(float(args) * 60)
         except (ValueError, TypeError):
-            await utils.answer(message, "⚠️ <b>Example:</b> <code>.fumointerval 30m</code>")
+            await utils.answer(message, "\u26A0\uFE0F <b>Example:</b> <code>.fumointerval 30m</code>")
             return
-
         if not MIN_INTERVAL <= seconds <= MAX_INTERVAL:
-            await utils.answer(message, "⚠️ <b>Interval: 1 minute .. 7 days.</b>")
+            await utils.answer(message, "\u26A0\uFE0F <b>Interval: 1 minute .. 7 days.</b>")
             return
-
         self._set("interval", seconds)
         self._next_post = self._get("last_post_ts", 0.0) + seconds
-        await utils.answer(message, f"⏱ <b>Interval:</b> <code>{fmt_interval(seconds)}</code>")
+        await utils.answer(message, f"\u23F1 <b>Interval:</b> <code>{fmt_interval(seconds)}</code>")
 
     @loader.command(
-        ru_doc="Шаблон подписи ({source} {date} {time} {url}); пусто — очистить",
-        en_doc="Set caption template ({source} {date} {time} {url}); empty clears it",
+        ru_doc="Свой текст подписи (плейсхолдеры {source}{post}{url}{tags}{date}{time}); пусто — очистить",
+        en_doc="Custom caption text (placeholders allowed); empty clears it",
     )
     async def fumocaption(self, message):
-        """Set caption template ({source} {date} {time} {url}); empty clears it"""
+        """Custom caption text; placeholders {source}{post}{url}{tags}{id}{date}{time}"""
         caption = utils.get_args_raw(message)
         self._set("caption", caption)
         await utils.answer(
-            message, "📝 <b>Caption updated.</b>" if caption else "📝 <b>Caption cleared.</b>"
+            message, "\U0001F4DD <b>Caption updated.</b>" if caption
+            else "\U0001F4DD <b>Caption cleared.</b>"
         )
 
     @loader.command(
-        ru_doc="Свои теги booru: .fumotags fumo cirno (пусто — сброс на 'fumo')",
-        en_doc="Set custom booru tags: .fumotags fumo cirno (empty resets to 'fumo')",
+        ru_doc="Вкл/выкл авто-футер (источник, теги, ссылка) под картинкой",
+        en_doc="Toggle auto metadata footer under the image",
+    )
+    async def fumometa(self, message):
+        """Toggle the auto metadata footer (source, tags, post link)"""
+        args = utils.get_args_raw(message).lower()
+        if args in ("on", "1", "enable"):
+            self._set("meta", True)
+        elif args in ("off", "0", "disable"):
+            self._set("meta", False)
+        else:
+            state = "on" if self._get("meta", True) else "off"
+            await utils.answer(message, f"<b>Meta footer:</b> {state}\n<code>.fumometa on|off</code>")
+            return
+        state = "on" if self._get("meta", True) else "off"
+        await utils.answer(message, f"\U0001F4DD <b>Meta footer:</b> {state}")
+
+    @loader.command(
+        ru_doc="Теги по источникам: .fumotags <safebooru|gelbooru|konachan|flickr> <теги>; без аргументов — показать",
+        en_doc="Per-source tags: .fumotags <source> <tags>; no args shows current",
     )
     async def fumotags(self, message):
-        """Set custom booru tags: .fumotags fumo cirno (empty resets to 'fumo')"""
-        tags = utils.get_args_raw(message).strip()
-        self._set("tags", tags or "fumo")
-        await utils.answer(message, f"🏷 <b>Tags:</b> <code>{utils.escape_html(tags or 'fumo')}</code>")
+        """Per-source tags: .fumotags <source> <tags>; no args shows all"""
+        raw = utils.get_args_raw(message).strip()
+        parts = raw.split(None, 1)
+        all_src = BOORU_SOURCES + ("flickr",)
+        if not parts:
+            lines = [f"<code>{s}</code>: {utils.escape_html(self._tags_for(s))}" for s in all_src]
+            await utils.answer(message, "\U0001F3F7 <b>Tags per source:</b>\n" + "\n".join(lines))
+            return
+        source = parts[0].lower()
+        if source not in all_src:
+            await utils.answer(
+                message, f"\u26A0\uFE0F <b>Unknown source.</b> Use: <code>{', '.join(all_src)}</code>"
+            )
+            return
+        if len(parts) == 1:
+            await utils.answer(
+                message, f"\U0001F3F7 <b>{source}:</b> <code>{utils.escape_html(self._tags_for(source))}</code>"
+            )
+            return
+        self._set(f"tags_{source}", parts[1])
+        await utils.answer(
+            message, f"\U0001F3F7 <b>{source} tags:</b> <code>{utils.escape_html(parts[1])}</code>"
+        )
+
+    @loader.command(
+        ru_doc="Блэклист минус-тегов для booru: .fumoexclude nude gore (пусто — очистить)",
+        en_doc="Global minus-tag blacklist for boorus: .fumoexclude nude gore",
+    )
+    async def fumoexclude(self, message):
+        """Global minus-tag blacklist for boorus: .fumoexclude nude gore (empty clears)"""
+        raw = utils.get_args_raw(message).strip()
+        self._set("exclude", raw)
+        shown = utils.escape_html(raw) if raw else "\u2014"
+        await utils.answer(message, f"\U0001F6AB <b>Exclude:</b> <code>{shown}</code>")
+
+    @loader.command(
+        ru_doc="Вкл/выкл Reddit как страховочный источник: .fumoreddit on/off",
+        en_doc="Toggle Reddit fallback source: .fumoreddit on/off",
+    )
+    async def fumoreddit(self, message):
+        """Toggle the Reddit fallback source"""
+        args = utils.get_args_raw(message).lower()
+        if args in ("on", "1", "enable"):
+            self._set("reddit", True)
+        elif args in ("off", "0", "disable"):
+            self._set("reddit", False)
+        else:
+            state = "on" if self._get("reddit", True) else "off"
+            await utils.answer(message, f"<b>Reddit:</b> {state}\n<code>.fumoreddit on|off</code>")
+            return
+        state = "on" if self._get("reddit", True) else "off"
+        await utils.answer(message, f"\U0001F4E1 <b>Reddit fallback:</b> {state}")
+
+    @loader.command(
+        ru_doc="Сабреддит: .fumosub FUMOFUMO (пусто — сброс)",
+        en_doc="Set subreddit: .fumosub FUMOFUMO (empty resets)",
+    )
+    async def fumosub(self, message):
+        """Set the subreddit for the Reddit source (default FUMOFUMO)"""
+        sub = utils.get_args_raw(message).strip().replace("r/", "").replace("/", "")
+        self._set("subreddit", sub or DEFAULT_SUBREDDIT)
+        await utils.answer(
+            message, f"\U0001F4E1 <b>Subreddit:</b> <code>r/{utils.escape_html(sub or DEFAULT_SUBREDDIT)}</code>"
+        )
+
+    @loader.command(
+        ru_doc="Flickr API-ключ: .fumoflickrkey <key> (пусто — выключить Flickr)",
+        en_doc="Set Flickr API key: .fumoflickrkey <key> (empty disables Flickr)",
+    )
+    async def fumoflickrkey(self, message):
+        """Set the Flickr API key (Flickr stays off until a key is set)"""
+        key = utils.get_args_raw(message).strip()
+        self._set("flickr_key", key)
+        await utils.answer(
+            message, "\U0001F4F7 <b>Flickr enabled.</b>" if key
+            else "\U0001F4F7 <b>Flickr disabled (no key).</b>"
+        )
 
     @loader.command(
         ru_doc="Отправить одно фумо в текущий чат прямо сейчас",
@@ -419,26 +626,26 @@ class FumoQoder(loader.Module):
     )
     async def fumotest(self, message):
         """Post one fumo into the current chat right now"""
-        status = await utils.answer(message, "🔎 <b>Fetching fumo...</b>")
+        status = await utils.answer(message, "\U0001F50E <b>Fetching fumo...</b>")
         try:
             post = await self._send(await message.get_chat())
         except FloodWaitError as exc:
-            await utils.answer(status, f"🐌 <b>FloodWait:</b> <code>{exc.seconds}s</code>")
+            await utils.answer(status, f"\U0001F40C <b>FloodWait:</b> <code>{exc.seconds}s</code>")
             return
         except Exception as exc:
+            logger.error("[FumoQoder] fumotest failed: %r", exc)
             await utils.answer(
-                status,
-                f"❌ <b>Failed:</b>\n<code>{utils.escape_html(str(exc))}</code>",
+                status, f"\u274C <b>Failed:</b>\n<code>{utils.escape_html(str(exc))}</code>"
             )
             return
-        await utils.answer(status, f"✅ <b>Sent.</b> <i>Source:</i> {post['src']}")
+        await utils.answer(status, f"\u2705 <b>Sent.</b> <i>Source:</i> {post['src']}")
 
     @loader.command(
-        ru_doc="Показать состояние автопостера",
-        en_doc="Show autoposter status",
+        ru_doc="Показать все настройки и активные источники",
+        en_doc="Show all settings and enabled sources",
     )
     async def fumostatus(self, message):
-        """Show autoposter status"""
+        """Show all settings and which sources are active"""
         target = self._get("target", None)
         target_str = str(target) if target else "Saved Messages"
         last_time = self._get("last_post_ts", 0)
@@ -448,19 +655,28 @@ class FumoQoder(loader.Module):
         )
         if self._get("enabled", False):
             remain = max(0, int(self._next_post - time.time()))
-            state = f"🟢 enabled, next post in <code>{fmt_interval(remain)}</code>"
+            state = f"\U0001F7E2 enabled, next post in <code>{fmt_interval(remain)}</code>"
         else:
-            state = "🔴 disabled"
+            state = "\U0001F534 disabled"
+
+        active = ["safebooru", "gelbooru", "konachan"]
+        if self._get("flickr_key", ""):
+            active.append("flickr")
+        if self._get("reddit", True):
+            active.append(f"reddit(r/{self._get('subreddit', DEFAULT_SUBREDDIT)})")
+
         await utils.answer(
             message,
-            "🌸 <b>FumoQoder</b>\n\n"
+            "\U0001F338 <b>FumoQoder</b>\n\n"
             f"<b>Status:</b> {state}\n"
             f"<b>Target:</b> <code>{utils.escape_html(target_str)}</code>\n"
             f"<b>Interval:</b> <code>{fmt_interval(self._get('interval', DEFAULT_INTERVAL))}</code>\n"
-            f"<b>Tags:</b> <code>{utils.escape_html(self._tags())}</code>\n"
+            f"<b>Sources:</b> <code>{utils.escape_html(', '.join(active))}</code>\n"
+            f"<b>Meta footer:</b> {'on' if self._get('meta', True) else 'off'}\n"
             f"<b>Caption:</b> <code>{utils.escape_html(self._get('caption', '') or '—')}</code>\n"
-            f"<b>Last post:</b> <code>{last_str}</code>\n"
-            f"<b>Last source:</b> <code>{utils.escape_html(self._get('last_source', '') or '—')}</code>",
+            f"<b>Exclude:</b> <code>{utils.escape_html(self._exclude() or '—')}</code>\n"
+            f"<b>Last post:</b> <code>{last_str}</code> "
+            f"({utils.escape_html(self._get('last_source', '') or '—')})",
         )
 
 
