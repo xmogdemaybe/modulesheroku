@@ -62,10 +62,12 @@ class FumoQoder(loader.Module):
 
     async def on_unload(self):
         self._stopping = True
-        if self._task:
-            self._task.cancel()
-        if self._session:
-            await self._session.close()
+        task = getattr(self, "_task", None)
+        if task:
+            task.cancel()
+        session = getattr(self, "_session", None)
+        if session:
+            await session.close()
 
     # ---------- db ----------
 
@@ -96,73 +98,80 @@ class FumoQoder(loader.Module):
     def _tags(self) -> str:
         return self._get("tags", "fumo").strip() or "fumo"
 
-    async def _src_safebooru(self) -> list:
+    @staticmethod
+    def _page_candidates(rand_max: int, first: int) -> list:
+        """Random page for variety, then the first page as a guaranteed fallback."""
+        rnd = random.randint(first, rand_max)
+        return [rnd, first] if rnd != first else [first]
+
+    async def _dapi(self, url: str, tags: str, pid: int) -> list:
         params = {
-            "page": "dapi",
-            "s": "post",
-            "q": "index",
-            "json": "1",
-            "limit": "100",
-            "tags": self._tags(),
-            "pid": str(random.randint(0, 5)),
+            "page": "dapi", "s": "post", "q": "index", "json": "1",
+            "limit": "100", "tags": tags, "pid": str(pid),
         }
-        payload = await self._json("https://safebooru.org/index.php", params)
+        payload = await self._json(url, params)
         if isinstance(payload, dict):
             payload = payload.get("post", [])
-        posts = []
-        for p in payload if isinstance(payload, list) else []:
-            url = p.get("file_url") or ""
-            if url.startswith("//"):
-                url = "https:" + url
-            elif url.startswith("/"):
-                url = "https://safebooru.org" + url
-            if not url and p.get("directory") and p.get("image"):
-                url = f"https://safebooru.org/images/{p['directory']}/{p['image']}"
-            if url:
-                posts.append({"id": f"sb_{p.get('id')}", "url": url, "src": "Safebooru"})
-        return posts
+        return payload if isinstance(payload, list) else []
+
+    async def _src_safebooru(self) -> list:
+        for pid in self._page_candidates(5, 0):
+            posts = []
+            for p in await self._dapi("https://safebooru.org/index.php", self._tags(), pid):
+                url = p.get("file_url") or ""
+                if url.startswith("//"):
+                    url = "https:" + url
+                elif url.startswith("/"):
+                    url = "https://safebooru.org" + url
+                if not url and p.get("directory") and p.get("image"):
+                    url = f"https://safebooru.org/images/{p['directory']}/{p['image']}"
+                if url:
+                    posts.append({"id": f"sb_{p.get('id')}", "url": url, "src": "Safebooru"})
+            if posts:
+                return posts
+        return []
 
     async def _src_gelbooru(self) -> list:
-        params = {
-            "page": "dapi",
-            "s": "post",
-            "q": "index",
-            "json": "1",
-            "limit": "100",
-            "tags": f"{self._tags()} rating:general",
-            "pid": str(random.randint(0, 5)),
-        }
-        payload = await self._json("https://gelbooru.com/index.php", params)
-        if isinstance(payload, dict):
-            payload = payload.get("post", [])
-        posts = []
-        for p in payload if isinstance(payload, list) else []:
-            url = p.get("file_url") or ""
-            if url.startswith("//"):
-                url = "https:" + url
-            if url:
-                posts.append({"id": f"gb_{p.get('id')}", "url": url, "src": "Gelbooru"})
-        return posts
+        tags = f"{self._tags()} rating:general"
+        for pid in self._page_candidates(5, 0):
+            posts = []
+            for p in await self._dapi("https://gelbooru.com/index.php", tags, pid):
+                url = p.get("file_url") or ""
+                if url.startswith("//"):
+                    url = "https:" + url
+                if url:
+                    posts.append({"id": f"gb_{p.get('id')}", "url": url, "src": "Gelbooru"})
+            if posts:
+                return posts
+        return []
+
+    async def _json_posts(self, url: str, tags: str, page: int) -> list:
+        payload = await self._json(url, {"limit": "100", "tags": tags, "page": str(page)})
+        return payload if isinstance(payload, list) else []
 
     async def _src_konachan(self) -> list:
-        params = {"limit": "100", "tags": f"{self._tags()} rating:safe",
-                  "page": str(random.randint(1, 3))}
-        payload = await self._json("https://konachan.com/post.json", params)
-        return [
-            {"id": f"kn_{p.get('id')}", "url": p["file_url"], "src": "Konachan"}
-            for p in payload
-            if isinstance(p, dict) and p.get("file_url") and p.get("rating") == "s"
-        ]
+        tags = f"{self._tags()} rating:safe"
+        for page in self._page_candidates(3, 1):
+            posts = [
+                {"id": f"kn_{p.get('id')}", "url": p["file_url"], "src": "Konachan"}
+                for p in await self._json_posts("https://konachan.com/post.json", tags, page)
+                if isinstance(p, dict) and p.get("file_url") and p.get("rating") == "s"
+            ]
+            if posts:
+                return posts
+        return []
 
     async def _src_yandere(self) -> list:
-        params = {"limit": "100", "tags": self._tags(),
-                  "page": str(random.randint(1, 3))}
-        payload = await self._json("https://yande.re/post.json", params)
-        return [
-            {"id": f"yd_{p.get('id')}", "url": p["file_url"], "src": "yande.re"}
-            for p in payload
-            if isinstance(p, dict) and p.get("file_url") and p.get("rating") == "s"
-        ]
+        for page in self._page_candidates(3, 1):
+            posts = [
+                {"id": f"yd_{p.get('id')}", "url": p["file_url"], "src": "yande.re"}
+                for p in await self._json_posts("https://yande.re/post.json", self._tags(), page)
+                if isinstance(p, dict) and p.get("file_url") and p.get("rating") == "s"
+            ]
+            if posts:
+                return posts
+        return []
+
 
     # ---------- fetch ----------
 
@@ -302,6 +311,10 @@ class FumoQoder(loader.Module):
 
     # ---------- commands ----------
 
+    @loader.command(
+        ru_doc="Включить/выключить автопостинг: .fumo on/off",
+        en_doc="Toggle autoposting: .fumo on / .fumo off",
+    )
     async def fumo(self, message):
         """Toggle autoposting: .fumo on / .fumo off"""
         args = utils.get_args_raw(message).lower()
@@ -319,6 +332,10 @@ class FumoQoder(loader.Module):
                 f"<b>Current:</b> {state}",
             )
 
+    @loader.command(
+        ru_doc="Установить чат: .fumotarget @name|id, ответ на сообщение, или пусто для текущего",
+        en_doc="Set target chat: .fumotarget @name|id, reply, or empty for current chat",
+    )
     async def fumotarget(self, message):
         """Set target chat: .fumotarget @name|id, reply to a message, or empty for current chat"""
         args = utils.get_args_raw(message).strip()
@@ -346,6 +363,10 @@ class FumoQoder(loader.Module):
             message, f"🎯 <b>Target:</b> <code>{utils.escape_html(str(title))}</code>"
         )
 
+    @loader.command(
+        ru_doc="Интервал постинга: .fumointerval 30m / 2h / 90 (=минуты)",
+        en_doc="Set interval: .fumointerval 30m / 2h / 90 (=minutes)",
+    )
     async def fumointerval(self, message):
         """Set interval: .fumointerval 30m / 2h / 90 (=minutes)"""
         args = utils.get_args_raw(message).strip().lower()
@@ -370,6 +391,10 @@ class FumoQoder(loader.Module):
         self._next_post = self._get("last_post_ts", 0.0) + seconds
         await utils.answer(message, f"⏱ <b>Interval:</b> <code>{fmt_interval(seconds)}</code>")
 
+    @loader.command(
+        ru_doc="Шаблон подписи ({source} {date} {time} {url}); пусто — очистить",
+        en_doc="Set caption template ({source} {date} {time} {url}); empty clears it",
+    )
     async def fumocaption(self, message):
         """Set caption template ({source} {date} {time} {url}); empty clears it"""
         caption = utils.get_args_raw(message)
@@ -378,12 +403,20 @@ class FumoQoder(loader.Module):
             message, "📝 <b>Caption updated.</b>" if caption else "📝 <b>Caption cleared.</b>"
         )
 
+    @loader.command(
+        ru_doc="Свои теги booru: .fumotags fumo cirno (пусто — сброс на 'fumo')",
+        en_doc="Set custom booru tags: .fumotags fumo cirno (empty resets to 'fumo')",
+    )
     async def fumotags(self, message):
         """Set custom booru tags: .fumotags fumo cirno (empty resets to 'fumo')"""
         tags = utils.get_args_raw(message).strip()
         self._set("tags", tags or "fumo")
         await utils.answer(message, f"🏷 <b>Tags:</b> <code>{utils.escape_html(tags or 'fumo')}</code>")
 
+    @loader.command(
+        ru_doc="Отправить одно фумо в текущий чат прямо сейчас",
+        en_doc="Post one fumo into the current chat right now",
+    )
     async def fumotest(self, message):
         """Post one fumo into the current chat right now"""
         status = await utils.answer(message, "🔎 <b>Fetching fumo...</b>")
@@ -400,6 +433,10 @@ class FumoQoder(loader.Module):
             return
         await utils.answer(status, f"✅ <b>Sent.</b> <i>Source:</i> {post['src']}")
 
+    @loader.command(
+        ru_doc="Показать состояние автопостера",
+        en_doc="Show autoposter status",
+    )
     async def fumostatus(self, message):
         """Show autoposter status"""
         target = self._get("target", None)
