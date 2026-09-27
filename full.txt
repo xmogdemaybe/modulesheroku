@@ -1,3 +1,4 @@
 fumogemini
 fumoglm
 fumogpt
+fumoqoder
