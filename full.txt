@@ -2,3 +2,4 @@ fumogemini
 fumoglm
 fumogpt
 fumoqoder
+triggerchanger
