@@ -24,6 +24,7 @@
 #   .fumosub <subreddit>         set subreddit (default Fumofumo)
 #   .fumoflickrkey <key>         set Flickr API key (empty disables Flickr)
 #   .fumotest [source] [count]   post fumo now (optionally from one source)
+#   .fumoreset                   clear sent-images history (settings are kept)
 #   .fumostatus                  show all settings + enabled sources
 #   .fumohelp                    command list with examples
 #
@@ -857,6 +858,19 @@ class FumoQoder(loader.Module):
         )
 
     @loader.command(
+        ru_doc="Очистить историю отправленных картинок: .fumoreset",
+        en_doc="Clear the sent-images history: .fumoreset",
+    )
+    async def fumoreset(self, message):
+        """Clear the seen-posts history so old pictures can be posted again (settings are kept)"""
+        count = len(self._get("history", []) or [])
+        self._set("history", [])
+        await utils.answer(
+            message, f"\U0001F9F9 <b>History cleared:</b> <code>{count}</code> ids. "
+            "Previously sent posts can appear again."
+        )
+
+    @loader.command(
         ru_doc="Показать все настройки и активные источники",
         en_doc="Show all settings and enabled sources",
     )
@@ -934,6 +948,7 @@ class FumoQoder(loader.Module):
             "<b>Misc</b>\n"
             "<code>.fumotest</code> — post now\n"
             "<code>.fumotest reddit 2</code> — post 2 from a specific source\n"
+            "<code>.fumoreset</code> — clear sent-images history (settings are kept)\n"
             "<code>.fumostatus</code> — all settings\n",
         )
 
