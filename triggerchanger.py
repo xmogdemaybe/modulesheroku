@@ -6,7 +6,7 @@
 # Правила хранятся в БД (json Heroku), картинки — в base64.
 #
 # Команды:
-#   .repadd <триггер> [-r|-w|-c]   добавить замену (визард: замена -> картинка?)
+#   .repadd <триггер> [-r|-w|-c|-n]   добавить замену (визард: замена -> картинка?)
 #   .replist [страница]            список правил
 #   .repdel <id|all>               удалить правило / всё
 #   .reptoggle [on|off]            вкл/выкл автозамену
@@ -18,6 +18,8 @@
 #   -r / --regex  regex-триггер: например "[?&]si=[^&\s]+" вырезает
 #                 трекинг si= из ссылок ютуба (в качестве замены укажи "-")
 #   -c / --case   учитывать регистр
+#   -n / --neg    не срабатывать после «не»/«ни» (подстрока/слово):
+#                 «удивлен -n» не тронет «не удивлен», а просто «удивлен» — да
 #
 # Визард .repadd:
 #   1) триггер из аргументов (или ответом, если не указан)
@@ -58,10 +60,14 @@ class TriggerChangerMod(loader.Module):
         self._edited = {}  # msg_id -> ts, страховка от повторной обработки
         if self._get("enabled") is None:
             self._set("enabled", True)
-        if not isinstance(self._get("entries"), list):
-            self._set("entries", [])
-        if not isinstance(self._get("next_id"), int):
-            self._set("next_id", 1)
+        entries = self._get("entries", [])
+        if not isinstance(entries, list):
+            entries = []
+            self._set("entries", entries)
+        # после старых удалений id могли остаться «с дырками» (напр. 3, 4, 5) —
+        # пересобираем нумерацию подряд: 1..N
+        if [e.get("id") for e in entries] != list(range(1, len(entries) + 1)):
+            self._store_entries(entries)
 
     # ---------- БД ----------
 
@@ -79,6 +85,12 @@ class TriggerChangerMod(loader.Module):
         except Exception as exc:
             logger.error("[TriggerChanger] db write %s: %r", key, exc)
 
+    def _store_entries(self, entries):
+        """Сохранить правила, пересобрав нумерацию подряд: 1..N (без дырок)."""
+        for index, entry in enumerate(entries, 1):
+            entry["id"] = index
+        self._set("entries", entries)
+
     # ---------- замена ----------
 
     def _compile(self, entry):
@@ -86,12 +98,18 @@ class TriggerChangerMod(loader.Module):
         if not trigger:
             return None
         flags = 0 if entry.get("case") else re.IGNORECASE
-        if entry.get("mode") == "regex":
+        mode = entry.get("mode", "sub")
+        if mode == "regex":
             pattern = trigger
-        elif entry.get("mode") == "word":
-            pattern = r"(?<!\w)" + re.escape(trigger) + r"(?!\w)"
         else:
-            pattern = re.escape(trigger)
+            core = re.escape(trigger)
+            if entry.get("neg"):
+                # группа 1 = «не»/«ни» перед совпадением; -n такие вхождения
+                # пропускает (см. _apply)
+                core = r"((?:[нН][еЕ]|[нН][иИ])\s+)?" + core
+            if mode == "word":
+                core = r"(?<!\w)" + core + r"(?!\w)"
+            pattern = core
         try:
             return re.compile(pattern, flags)
         except (re.error, ValueError):
@@ -113,14 +131,27 @@ class TriggerChangerMod(loader.Module):
         matched = []
         for entry in entries:
             rx = self._compile(entry)
-            if rx is None or not rx.search(text):
+            if rx is None:
+                continue
+            neg = bool(entry.get("neg")) and entry.get("mode", "sub") != "regex"
+            if neg:
+                # срабатываем, только если есть вхождение БЕЗ «не»/«ни» перед ним
+                applies = any(m.group(1) is None for m in rx.finditer(text))
+            else:
+                applies = rx.search(text) is not None
+            if not applies:
                 continue
             matched.append(entry)
             # repl=None — картинка без текста, сообщение не трогаем;
             # repl="" — явно вырезать триггер из текста
             repl = entry.get("repl")
             if repl is not None:
-                new_text = rx.sub(lambda _: repl, new_text)
+                if neg:
+                    new_text = rx.sub(
+                        lambda m: m.group(0) if m.group(1) else repl, new_text
+                    )
+                else:
+                    new_text = rx.sub(lambda _: repl, new_text)
         return new_text, matched
 
     def _find_dup(self, trigger, mode, case):
@@ -205,18 +236,16 @@ class TriggerChangerMod(loader.Module):
     async def _finish_wizard(self, message, state):
         uid = message.sender_id
         entries = self._get("entries", []) or []
-        next_id = self._get("next_id", 1)
         entry = {
-            "id": next_id,
             "trigger": state["trigger"],
             "repl": state.get("repl"),
             "mode": state.get("mode", "sub"),
             "case": bool(state.get("case", False)),
+            "neg": bool(state.get("neg", False)),
             "photo": state.get("photo"),
         }
         entries.append(entry)
-        self._set("entries", entries)
-        self._set("next_id", next_id + 1)
+        self._store_entries(entries)
         self._pending.pop(uid, None)
 
         flags = []
@@ -226,6 +255,8 @@ class TriggerChangerMod(loader.Module):
             flags.append("слово")
         if entry["case"]:
             flags.append("регистр")
+        if entry["neg"]:
+            flags.append("не после «не»/«ни»")
         flag_str = f" <i>({', '.join(flags)})</i>" if flags else ""
         photo_str = "\n🖼 Картинка: прикреплена" if entry["photo"] else ""
         if entry["repl"] is None:
@@ -345,25 +376,26 @@ class TriggerChangerMod(loader.Module):
             message,
             f"🔁 <b>TriggerChanger</b> — {state}, правил: <code>{len(entries)}</code> "
             f"(с картинками: <code>{photos}</code>)\n\n"
-            "<code>.repadd &lt;триггер&gt; [-r|-w|-c]</code> — добавить замену (дальше по подсказкам)\n"
+            "<code>.repadd &lt;триггер&gt; [-r|-w|-c|-n]</code> — добавить замену (дальше по подсказкам)\n"
             "<code>.replist</code> — список правил\n"
             "<code>.repdel &lt;id|all&gt;</code> — удалить правило / всё\n"
             "<code>.reptoggle [on|off]</code> — вкл/выкл\n"
             "<code>.reptest &lt;текст&gt;</code> — проверить без отправки\n\n"
-            "Флаги: <code>-r</code> regex, <code>-w</code> целое слово, <code>-c</code> регистр.\n"
+            "Флаги: <code>-r</code> regex, <code>-w</code> целое слово, "
+            "<code>-c</code> регистр, <code>-n</code> не после «не»/«ни».\n"
             "Пример: <code>.repadd да</code>, в ответ пишешь <code>da✅</code> — и каждое «да» "
             "в твоих сообщениях станет <code>da✅</code> сразу после отправки.",
         )
 
     @loader.command(
-        ru_doc="Добавить замену: .repadd <триггер> [-r|-w|-c]; дальше по подсказкам бота",
-        en_doc="Add a replacement rule: .repadd <trigger> [-r|-w|-c], then follow the prompts",
+        ru_doc="Добавить замену: .repadd <триггер> [-r|-w|-c|-n]; дальше по подсказкам бота",
+        en_doc="Add a replacement rule: .repadd <trigger> [-r|-w|-c|-n], then follow the prompts",
     )
     async def repadd(self, message):
         """Wizard: add a replacement rule"""
         uid = message.sender_id
         args = utils.get_args_raw(message)
-        mode, case = "sub", False
+        mode, case, neg = "sub", False, False
         rest = []
         for token in args.split():
             if token in ("-r", "--regex"):
@@ -372,11 +404,21 @@ class TriggerChangerMod(loader.Module):
                 mode = "word"
             elif token in ("-c", "--case"):
                 case = True
+            elif token in ("-n", "--neg"):
+                neg = True
             else:
                 rest.append(token)
         trigger = " ".join(rest).strip()
 
-        state = {"step": "trigger", "mode": mode, "case": case,
+        note = ""
+        if neg and mode == "regex":
+            neg = False
+            note = (
+                "⚠️ <code>-n</code> работает только для подстроки и слова; "
+                "в regex-режиме впиши lookbehind сам: <code>(?&lt;!не\\s)</code>.\n\n"
+            )
+
+        state = {"step": "trigger", "mode": mode, "case": case, "neg": neg,
                  "trigger": "", "repl": None, "photo": None}
 
         if trigger:
@@ -405,13 +447,15 @@ class TriggerChangerMod(loader.Module):
         if state["step"] == "trigger":
             await utils.answer(
                 message,
-                "✏️ Напиши <b>триггер</b> ответом на это сообщение "
+                note
+                + "✏️ Напиши <b>триггер</b> ответом на это сообщение "
                 "(что искать в твоих сообщениях). «Отмена» — выйти.",
             )
         else:
             await utils.answer(
                 message,
-                "📝 Теперь ответь на это сообщение текстом-заменой.\n"
+                note
+                + "📝 Теперь ответь на это сообщение текстом-заменой.\n"
                 "• <code>-</code> — пустая замена (вырезать триггер из текста)\n"
                 "• картинка — замена картинкой без текста",
             )
@@ -444,6 +488,8 @@ class TriggerChangerMod(loader.Module):
             flags = {"regex": "R", "word": "W"}.get(entry.get("mode", "sub"), "")
             if entry.get("case"):
                 flags += "C"
+            if entry.get("neg"):
+                flags += "N"
             flag_str = f" <code>[{flags}]</code>" if flags else ""
             photo = " 🖼" if entry.get("photo") else ""
             trig = utils.escape_html(entry.get("trigger", ""))
@@ -471,9 +517,10 @@ class TriggerChangerMod(loader.Module):
         raw = utils.get_args_raw(message).strip().lower()
         entries = self._get("entries", []) or []
         if raw in ("all", "все"):
-            self._set("entries", [])
+            count = len(entries)
+            self._store_entries([])
             await utils.answer(
-                message, f"🗑 Удалено всех правил: <code>{len(entries)}</code>"
+                message, f"🗑 Удалено всех правил: <code>{count}</code>"
             )
             return
         if not raw.isdigit():
@@ -486,7 +533,7 @@ class TriggerChangerMod(loader.Module):
         if len(remaining) == len(entries):
             await utils.answer(message, f"❌ Правило <code>#{rid}</code> не найдено.")
             return
-        self._set("entries", remaining)
+        self._store_entries(remaining)
         await utils.answer(
             message, f"🗑 Удалено <code>#{rid}</code>. Осталось: <code>{len(remaining)}</code>"
         )
