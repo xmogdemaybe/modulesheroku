@@ -119,6 +119,26 @@ class SleepMod(loader.Module):
         except Exception:
             return None
 
+    @loader.loop(interval=15, autostart=True)
+    async def _auto_off_loop(self):
+        """Автовыключение ручного режима по времени окончания расписания.
+
+        Вынесено из watcher'а в отдельный луп: иначе выключение и лог
+        срабатывали бы только при входящем сообщении.
+        """
+        manual_enabled = self._get_db("sleep_enabled", False)
+        if not manual_enabled:
+            return
+
+        auto_off = self._get_db("sleep_auto_off_time", None)
+        if auto_off is None:
+            return
+
+        if datetime.now().timestamp() >= float(auto_off):
+            self._set_db("sleep_enabled", False)
+            self._set_db("sleep_auto_off_time", None)
+            self.logger.info("[Sleep] Время сна окончено, ручной режим автовыключен")
+
     @loader.watcher()
     async def watcher(self, message):
         """Следить за входящими ПМ и отправлять автоответ"""
@@ -133,15 +153,8 @@ class SleepMod(loader.Module):
             if message.sender_id is None or message.sender_id == self._my_id:
                 return
 
-            # 2. Проверка автовыключения ручного режима по времени окончания расписания
+            # 2. Ручной режим (автовыключением занимается _auto_off_loop)
             manual_enabled = self._get_db("sleep_enabled", False)
-            if manual_enabled:
-                auto_off = self._get_db("sleep_auto_off_time", None)
-                if auto_off is not None and datetime.now().timestamp() >= float(auto_off):
-                    manual_enabled = False
-                    self._set_db("sleep_enabled", False)
-                    self._set_db("sleep_auto_off_time", None)
-                    self.logger.info("[Sleep] Время сна окончено, ручной режим автовыключен")
 
             # Если ручной режим НЕ включен И по расписанию не время — МОЛЧИМ
             if not manual_enabled and not self._is_in_schedule():
@@ -197,6 +210,7 @@ class SleepMod(loader.Module):
         try:
             enabled = not self._get_db("sleep_enabled", False)
             self._set_db("sleep_enabled", enabled)
+            in_schedule = self._is_in_schedule()
 
             if enabled:
                 # Автовыключение считаем только по включенному расписанию
@@ -207,14 +221,42 @@ class SleepMod(loader.Module):
                 if auto_off:
                     off_time_str = datetime.fromtimestamp(auto_off).strftime("%H:%M")
                     schedule_info = f"\n⏱️ <i>Автовыключение сработает в {off_time_str}</i>"
+                if in_schedule:
+                    schedule_info += "\nℹ️ <i>По расписанию сейчас время сна — автоответ и так уже работал</i>"
 
                 await utils.answer(message, f"✅ <b>Режим ВКЛЮЧЕН</b>{schedule_info}")
             else:
                 self._set_db("sleep_auto_off_time", None)
-                await utils.answer(message, "❌ <b>Режим ВЫКЛЮЧЕН</b>")
+                note = ""
+                if in_schedule:
+                    note = "\nℹ️ <i>Но по расписанию сейчас время сна — автоответ продолжит работать</i>"
+                await utils.answer(message, f"❌ <b>Режим ВЫКЛЮЧЕН</b>{note}")
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleepcmd: %s", e)
             await utils.answer(message, f"❌ Ошибка: {e}")
+
+    async def sleepfaqcmd(self, message):
+        """Справка по командам: .sleepfaq"""
+        text = (
+            "😴 <b>Sleep — справка</b>\n\n"
+            "<code>.sleep</code> — вкл/выкл вручную\n"
+            "<code>.sleeptext</code> — показать текущий текст ответа\n"
+            "<code>.sleeptext я сплю, отвечу утром</code> — задать текст (макс 1000 симв.)\n"
+            "<code>.sleepdelay</code> — показать задержку между ответами одному юзеру\n"
+            "<code>.sleepdelay 60</code> — задать задержку в секундах (0 — без задержки)\n"
+            "<code>.sleepschedule</code> — вкл/выкл расписание\n"
+            "<code>.sleepschedule 22:00 08:00</code> — диапазон (с 22:00 до 08:00)\n"
+            "<code>.sleepschedule 08:00</code> — одно время = ДО 08:00\n"
+            "<code>.sleepschedule on / off</code> — явно вкл/выкл\n"
+            "<code>.sleepexclude</code> — список исключённых (им вообще не отвечаем)\n"
+            "<code>.sleepexclude 123456 мой бро</code> — добавить/удалить по ID\n"
+            "<code>.sleepreply</code> — список персональных ответов\n"
+            "<code>.sleepreply 123456 спи давай</code> — личный текст ответа для ID\n"
+            "<code>.sleepreply 123456</code> — удалить личный текст\n\n"
+            "ℹ️ Ручной режим (<code>.sleep</code>) и расписание — два независимых "
+            "переключателя: автоответ идёт, если включено хотя бы одно из них."
+        )
+        await utils.answer(message, text)
 
     async def sleeptextcmd(self, message):
         """Установить текст ответа: .sleeptext Твой текст"""
