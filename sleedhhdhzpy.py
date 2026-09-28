@@ -1,12 +1,12 @@
-# Sleep.py (полная версия с исправленным fallback и watcher) XYINYAAAA
 import logging
 from datetime import datetime, timedelta
-import asyncio
+
 from .. import loader, utils
+
 
 class SleepMod(loader.Module):
     """Автоответ в личных сообщениях с БД, расписанием, задержкой и персональными ответами"""
-    
+
     strings = {
         "name": "Sleep",
     }
@@ -16,35 +16,32 @@ class SleepMod(loader.Module):
     DEFAULT_DELAY = 3600
     DEFAULT_SCHEDULE = {"enabled": False, "start": None, "end": None}
     DEFAULT_EXCLUDED = {}
-
-    def init(self):
-        self.logger = logging.getLogger("Sleep") # <-- ДОБАВЬ ЭТУ СТРОЧКУ
+    DEFAULT_PERSONAL = {}
 
     async def client_ready(self, client, db):
+        self.logger = logging.getLogger("Sleep")
         self.client = client
         self.db = db
         self.last_response_time = {}
-        
-        try:
-            self._init_db()
-        except Exception as e:
-            self.logger.error(f"[Sleep] Ошибка инициализации БД: {e}")
+        self._my_id = (await client.get_me()).id
+        self._init_db()
 
     def _init_db(self):
-        """Инициализировать БД если её нет"""
-        try:
-            if not self.db.get("Sleep", "sleep_enabled"):
-                self.db.set("Sleep", "sleep_enabled", False)
-            if not self.db.get("Sleep", "sleep_text"):
-                self.db.set("Sleep", "sleep_text", self.DEFAULT_TEXT)
-            if not self.db.get("Sleep", "sleep_delay"):
-                self.db.set("Sleep", "sleep_delay", self.DEFAULT_DELAY)
-            if not self.db.get("Sleep", "excluded_users"):
-                self.db.set("Sleep", "excluded_users", self.DEFAULT_EXCLUDED)
-            if not self.db.get("Sleep", "schedule"):
-                self.db.set("Sleep", "schedule", self.DEFAULT_SCHEDULE)
-        except Exception as e:
-            self.logger.error(f"[Sleep] Ошибка при инициализации БД: {e}")
+        """Инициализировать БД если её нет (без перезаписи уже заданных значений)"""
+        defaults = {
+            "sleep_enabled": False,
+            "sleep_text": self.DEFAULT_TEXT,
+            "sleep_delay": self.DEFAULT_DELAY,
+            "excluded_users": dict(self.DEFAULT_EXCLUDED),
+            "personal_replies": dict(self.DEFAULT_PERSONAL),
+            "schedule": dict(self.DEFAULT_SCHEDULE),
+        }
+        for key, value in defaults.items():
+            try:
+                if self.db.get("Sleep", key) is None:
+                    self.db.set("Sleep", key, value)
+            except Exception as e:
+                self.logger.error("[Sleep] Ошибка инициализации БД, ключ %s: %s", key, e)
 
     def _get_db(self, key, default=None):
         """Получить значение из БД с fallback"""
@@ -54,7 +51,7 @@ class SleepMod(loader.Module):
                 return default
             return value
         except Exception as e:
-            self.logger.error(f"[Sleep] Ошибка чтения БД ключ {key}: {e}")
+            self.logger.error("[Sleep] Ошибка чтения БД ключ %s: %s", key, e)
             return default
 
     def _set_db(self, key, value):
@@ -62,7 +59,7 @@ class SleepMod(loader.Module):
         try:
             self.db.set("Sleep", key, value)
         except Exception as e:
-            self.logger.error(f"[Sleep] Ошибка записи БД ключ {key}: {e}")
+            self.logger.error("[Sleep] Ошибка записи БД ключ %s: %s", key, e)
 
     def _is_in_schedule(self):
         """
@@ -89,20 +86,23 @@ class SleepMod(loader.Module):
             if start_time and end_time:
                 if start_time <= end_time:
                     return start_time <= now <= end_time
-                else:
-                    return now >= start_time or now <= end_time
-            elif end_time:
+                return now >= start_time or now <= end_time
+            if end_time:
                 return now <= end_time
-            elif start_time:
+            if start_time:
                 return now >= start_time
 
             return False
         except Exception as e:
-            try:
-                self.logger.error(f"[Sleep] Ошибка расписания: {e}")
-            except AttributeError:
-                pass
+            self.logger.error("[Sleep] Ошибка расписания: %s", e)
             return False
+
+    def _schedule_end_if_enabled(self):
+        """Время окончания из расписания, но только если расписание включено"""
+        schedule = self._get_db("schedule", self.DEFAULT_SCHEDULE)
+        if isinstance(schedule, dict) and schedule.get("enabled"):
+            return schedule.get("end")
+        return None
 
     def _calc_auto_off(self, end_str):
         """Вычислить timestamp ближайшего времени завершения сна (HH:MM)"""
@@ -124,36 +124,31 @@ class SleepMod(loader.Module):
         """Следить за входящими ПМ и отправлять автоответ"""
         try:
             # 1. Базовые проверки сообщения
-            if not hasattr(message, 'text') or not hasattr(message, 'sender_id'):
+            if getattr(message, "out", False):
+                return
+            if not hasattr(message, "text") or not hasattr(message, "sender_id"):
                 return
             if message.is_group or message.is_channel:
                 return
-
-            me = await self.client.get_me()
-            if message.sender_id == me.id:
+            if message.sender_id is None or message.sender_id == self._my_id:
                 return
 
             # 2. Проверка автовыключения ручного режима по времени окончания расписания
             manual_enabled = self._get_db("sleep_enabled", False)
             if manual_enabled:
                 auto_off = self._get_db("sleep_auto_off_time", None)
-                if auto_off and datetime.now().timestamp() >= float(auto_off):
+                if auto_off is not None and datetime.now().timestamp() >= float(auto_off):
                     manual_enabled = False
                     self._set_db("sleep_enabled", False)
                     self._set_db("sleep_auto_off_time", None)
-                    try:
-                        self.logger.info("[Sleep] Время сна окончено, ручной режим автовыключен")
-                    except Exception:
-                        pass
-
-            in_schedule = self._is_in_schedule()
+                    self.logger.info("[Sleep] Время сна окончено, ручной режим автовыключен")
 
             # Если ручной режим НЕ включен И по расписанию не время — МОЛЧИМ
-            if not manual_enabled and not in_schedule:
+            if not manual_enabled and not self._is_in_schedule():
                 return
 
             # 3. Проверка текста сообщения
-            msg_text = getattr(message, 'text', None)
+            msg_text = getattr(message, "text", None)
             if not msg_text or not isinstance(msg_text, str):
                 return
 
@@ -171,15 +166,19 @@ class SleepMod(loader.Module):
             except (ValueError, TypeError):
                 delay = self.DEFAULT_DELAY
 
+            now_ts = datetime.now().timestamp()
             if delay > 0:
                 last_time = self.last_response_time.get(sender_id)
-                if last_time and (datetime.now().timestamp() - last_time < delay):
+                if last_time and (now_ts - last_time < delay):
                     return
 
-            # 6. Формирование и отправка текста
+            # 6. Формирование текста: персональный ответ > общий текст
             response_text = None
-            if isinstance(excluded, dict) and isinstance(excluded.get(sender_id), dict):
-                response_text = excluded[sender_id].get("personal_text")
+            personal = self._get_db("personal_replies", self.DEFAULT_PERSONAL)
+            if isinstance(personal, dict):
+                candidate = personal.get(sender_id)
+                if isinstance(candidate, str) and candidate:
+                    response_text = candidate
 
             if not response_text:
                 response_text = self._get_db("sleep_text", self.DEFAULT_TEXT)
@@ -188,26 +187,20 @@ class SleepMod(loader.Module):
                 return
 
             await message.respond(response_text)
-            self.last_response_time[sender_id] = datetime.now().timestamp()
+            self.last_response_time[sender_id] = now_ts
 
         except Exception as e:
-            try:
-                self.logger.error(f"[Sleep] Ошибка в watcher: {e}")
-            except Exception:
-                pass
+            self.logger.error("[Sleep] Ошибка в watcher: %s", e)
 
     async def sleepcmd(self, message):
         """Включить/выключить вручную: .sleep"""
         try:
-            enabled = self._get_db("sleep_enabled", False)
-            enabled = not enabled
+            enabled = not self._get_db("sleep_enabled", False)
             self._set_db("sleep_enabled", enabled)
 
             if enabled:
-                # Рассчитываем автовыключение по времени расписания (если задано)
-                schedule = self._get_db("schedule", self.DEFAULT_SCHEDULE)
-                end_str = schedule.get("end") if isinstance(schedule, dict) else None
-                auto_off = self._calc_auto_off(end_str)
+                # Автовыключение считаем только по включенному расписанию
+                auto_off = self._calc_auto_off(self._schedule_end_if_enabled())
                 self._set_db("sleep_auto_off_time", auto_off)
 
                 schedule_info = ""
@@ -220,64 +213,61 @@ class SleepMod(loader.Module):
                 self._set_db("sleep_auto_off_time", None)
                 await utils.answer(message, "❌ <b>Режим ВЫКЛЮЧЕН</b>")
         except Exception as e:
-            try:
-                self.logger.error(f"[Sleep] Ошибка в sleepcmd: {e}")
-            except Exception:
-                pass
+            self.logger.error("[Sleep] Ошибка в sleepcmd: %s", e)
             await utils.answer(message, f"❌ Ошибка: {e}")
 
     async def sleeptextcmd(self, message):
         """Установить текст ответа: .sleeptext Твой текст"""
         try:
             text = utils.get_args_raw(message)
-            
+
             if not text:
                 current = self._get_db("sleep_text", self.DEFAULT_TEXT)
                 if not current:
                     current = self.DEFAULT_TEXT
                 await utils.answer(message, f"📝 Текущий текст:\n{current}")
                 return
-            
+
             if len(text) > 1000:
                 await utils.answer(message, "❌ Текст слишком длинный (макс 1000 символов)")
                 return
-            
+
             self._set_db("sleep_text", text)
             await utils.answer(message, f"✅ Текст установлен")
         except Exception as e:
-            self.logger.error(f"[Sleep] Ошибка в sleeptextcmd: {e}")
+            self.logger.error("[Sleep] Ошибка в sleeptextcmd: %s", e)
             await utils.answer(message, f"❌ Ошибка: {e}")
 
     async def sleepdelaycmd(self, message):
         """Установить задержку между ответами: .sleepdelay 60 (в секундах)"""
         try:
             args = utils.get_args(message)
-            
+
             if not args:
                 delay = self._get_db("sleep_delay", self.DEFAULT_DELAY)
                 if delay is None:
                     delay = self.DEFAULT_DELAY
                 await utils.answer(message, f"⏱️ Текущая задержка: {delay} сек")
                 return
-            
+
             try:
                 delay = int(args[0])
             except (ValueError, TypeError):
                 await utils.answer(message, "❌ Укажи число (секунды)")
                 return
-            
+
             if delay < 0:
                 await utils.answer(message, "❌ Задержка не может быть отрицательной")
                 return
-            
+
             if delay > 3600:
                 await utils.answer(message, "❌ Задержка не может быть больше часа")
                 return
-            
+
             self._set_db("sleep_delay", delay)
             await utils.answer(message, f"✅ Задержка установлена: {delay} сек")
         except Exception as e:
-            self.logger.error(f"[Sleep] Ошибка в sleepdelaycmd: {e}")
+            self.logger.error("[Sleep] Ошибка в sleepdelaycmd: %s", e)
             await utils.answer(message, f"❌ Ошибка: {e}")
 
     async def sleepschedulecmd(self, message):
@@ -292,7 +282,7 @@ class SleepMod(loader.Module):
             args = utils.get_args(message)
             schedule = self._get_db("schedule", self.DEFAULT_SCHEDULE)
             if not isinstance(schedule, dict):
-                schedule = self.DEFAULT_SCHEDULE.copy()
+                schedule = dict(self.DEFAULT_SCHEDULE)
 
             # Если без аргументов — переключаем статус ВКЛ/ВЫКЛ
             if not args:
@@ -328,8 +318,7 @@ class SleepMod(loader.Module):
 
             # Пересчитываем таймер автовыключения для ручного режима, если он сейчас активен
             if self._get_db("sleep_enabled", False):
-                auto_off = self._calc_auto_off(schedule.get("end"))
-                self._set_db("sleep_auto_off_time", auto_off)
+                self._set_db("sleep_auto_off_time", self._calc_auto_off(self._schedule_end_if_enabled()))
 
             # Красивый вывод статуса и диапазона
             is_enabled = schedule.get("enabled", False)
@@ -350,21 +339,18 @@ class SleepMod(loader.Module):
             await utils.answer(message, f"{status_str}\n⏱️ Диапазон: <b>{range_str}</b>")
 
         except Exception as e:
-            try:
-                self.logger.error(f"[Sleep] Ошибка в sleepschedulecmd: {e}")
-            except Exception:
-                pass
+            self.logger.error("[Sleep] Ошибка в sleepschedulecmd: %s", e)
             await utils.answer(message, f"❌ Ошибка: {e}")
 
     async def sleepexcludecmd(self, message):
         """Управление исключениями: .sleepexclude (список) или .sleepexclude ID [заметка] (добавить/удалить)"""
         try:
             args = utils.get_args_raw(message).split(maxsplit=1)
-            
+
             excluded = self._get_db("excluded_users", self.DEFAULT_EXCLUDED)
             if not isinstance(excluded, dict):
-                excluded = self.DEFAULT_EXCLUDED.copy()
-            
+                excluded = dict(self.DEFAULT_EXCLUDED)
+
             # Если вызвали без аргументов — выводим список
             if not args or not args[0]:
                 if excluded:
@@ -394,6 +380,61 @@ class SleepMod(loader.Module):
                 await utils.answer(message, f"✅ Юзер <code>{user_id}</code> добавлен в исключения (<i>{note}</i>)")
 
         except Exception as e:
-            self.logger.error(f"[Sleep] Ошибка в sleepexcludecmd: {e}")
+            self.logger.error("[Sleep] Ошибка в sleepexcludecmd: %s", e)
             await utils.answer(message, f"❌ Ошибка: {e}")
-            
+
+    async def sleepreplycmd(self, message):
+        """Персональный ответ: .sleepreply (список) | .sleepreply ID текст (задать) | .sleepreply ID (удалить)"""
+        try:
+            args = utils.get_args_raw(message).split(maxsplit=1)
+
+            replies = self._get_db("personal_replies", self.DEFAULT_PERSONAL)
+            if not isinstance(replies, dict):
+                replies = dict(self.DEFAULT_PERSONAL)
+
+            # Без аргументов — список
+            if not args or not args[0]:
+                if replies:
+                    text = "💬 <b>Персональные ответы:</b>\n"
+                    for uid_str, personal_text in replies.items():
+                        text += f"• <code>{uid_str}</code>: {personal_text}\n"
+                    await utils.answer(message, text)
+                else:
+                    await utils.answer(message, "💬 Персональных ответов нет")
+                return
+
+            user_id = args[0]
+            if not user_id.isdigit():
+                await utils.answer(message, "❌ ID должен быть числом")
+                return
+
+            # Только ID — удаляем
+            if len(args) == 1:
+                if user_id in replies:
+                    del replies[user_id]
+                    self._set_db("personal_replies", replies)
+                    await utils.answer(message, f"❌ Персональный ответ для <code>{user_id}</code> удален")
+                else:
+                    await utils.answer(
+                        message,
+                        "❌ Для этого ID персональный ответ не задан. Задать: <code>.sleepreply ID текст</code>",
+                    )
+                return
+
+            # ID + текст — устанавливаем
+            text = args[1].strip()
+            if not text:
+                await utils.answer(message, "❌ Текст не может быть пустым")
+                return
+
+            if len(text) > 1000:
+                await utils.answer(message, "❌ Текст слишком длинный (макс 1000 символов)")
+                return
+
+            replies[user_id] = text
+            self._set_db("personal_replies", replies)
+            await utils.answer(message, f"✅ Персональный ответ для <code>{user_id}</code> установлен")
+
+        except Exception as e:
+            self.logger.error("[Sleep] Ошибка в sleepreplycmd: %s", e)
+            await utils.answer(message, f"❌ Ошибка: {e}")
