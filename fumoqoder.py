@@ -16,9 +16,11 @@
 #   .fumometa on|off             toggle auto metadata footer in caption
 #   .fumotags [source] [tags]    per-source search tags (show if no args)
 #   .fumoexclude <tags>          global minus-tag blacklist for boorus
+#   .fumokonachan net|com        konachan.net (safe) / konachan.com (R-18, filtered)
 #   .fumoreddit on|off           toggle Reddit fallback source
 #   .fumoredditmedia pics|videos|all   what to fetch from Reddit
 #   .fumoredditauth <id> <secret>      Reddit OAuth app credentials (403 fallback)
+#   .fumoredditcookie <cookie>         browser cookie for Reddit (403 fallback)
 #   .fumosub <subreddit>         set subreddit (default Fumofumo)
 #   .fumoflickrkey <key>         set Flickr API key (empty disables Flickr)
 #   .fumotest [source] [count]   post fumo now (optionally from one source)
@@ -196,16 +198,19 @@ class FumoQoder(loader.Module):
         return []
 
     async def _src_konachan(self) -> list:
+        # konachan.net = safe-only mirror, konachan.com = R-18 (filtered by rating).
+        domain = self._get("konachan_domain", "konachan.net") or "konachan.net"
         tags = self._booru_tags("konachan")
         for page in self._page_candidates(3, 1):
             posts = [
                 {
                     "id": f"kn_{p.get('id')}", "url": p["file_url"], "src": "Konachan",
-                    "post_url": f"https://konachan.com/post/show/{p.get('id')}",
+                    "post_url": f"https://{domain}/post/show/{p.get('id')}",
                     "tags": tags,
                 }
-                for p in await self._moebooru("https://konachan.com/post.json", tags, page)
-                if isinstance(p, dict) and p.get("file_url") and p.get("rating") == "s"
+                for p in await self._moebooru(f"https://{domain}/post.json", tags, page)
+                if isinstance(p, dict) and p.get("file_url")
+                and (domain == "konachan.net" or p.get("rating") == "s")
             ]
             if posts:
                 return posts
@@ -253,9 +258,12 @@ class FumoQoder(loader.Module):
                 logger.warning("[FumoQoder] reddit oauth failed: %r", exc)
 
         if payload is None:
+            headers = {"User-Agent": REDDIT_USER_AGENT}
+            cookie = (self._get("reddit_cookie", "") or "").strip()
+            if cookie:
+                headers["Cookie"] = cookie
             payload = await self._json(
-                f"https://www.reddit.com/r/{sub}/hot.json", params,
-                headers={"User-Agent": REDDIT_USER_AGENT},
+                f"https://www.reddit.com/r/{sub}/hot.json", params, headers=headers,
             )
 
         children = (payload or {}).get("data", {}).get("children", []) if isinstance(payload, dict) else []
@@ -779,6 +787,39 @@ class FumoQoder(loader.Module):
             return f"\u274C <b>Token failed:</b> <code>{utils.escape_html(repr(exc))}</code>"
 
     @loader.command(
+        ru_doc="Куки Reddit из браузера: .fumoredditcookie <cookie> (пусто — сброс)",
+        en_doc="Browser cookies for Reddit: .fumoredditcookie <cookie> (empty clears)",
+    )
+    async def fumoredditcookie(self, message):
+        """Cookie header for anonymous Reddit requests (copy from a logged-in browser)"""
+        cookie = utils.get_args_raw(message).strip()
+        self._set("reddit_cookie", cookie)
+        if not cookie:
+            await utils.answer(message, "\U0001F36A <b>Reddit cookie cleared.</b>")
+            return
+        await utils.answer(
+            message, f"\U0001F36A <b>Reddit cookie set</b> ({len(cookie)} chars). "
+            "Test it: <code>.fumotest reddit</code>"
+        )
+
+    @loader.command(
+        ru_doc="Домен Konachan: .fumokonachan net|com (net — safe, com — R-18 с фильтром)",
+        en_doc="Konachan domain: .fumokonachan net|com (net = safe, com = R-18 filtered)",
+    )
+    async def fumokonachan(self, message):
+        """Switch Konachan domain: konachan.net (safe) or konachan.com (R-18, rating-filtered)"""
+        args = utils.get_args_raw(message).strip().lower().replace("konachan.", "")
+        if args not in ("net", "com"):
+            cur = (self._get("konachan_domain", "konachan.net") or "konachan.net").split(".")[-1]
+            await utils.answer(
+                message, f"<b>Konachan:</b> konachan.{cur}\n<code>.fumokonachan net|com</code>"
+            )
+            return
+        self._set("konachan_domain", f"konachan.{args}")
+        note = " (safe)" if args == "net" else " (R-18, only rating:safe is fetched)"
+        await utils.answer(message, f"\U0001F338 <b>Konachan:</b> <code>konachan.{args}</code>{note}")
+
+    @loader.command(
         ru_doc="Отправить фумо сейчас: .fumotest [safebooru|konachan|reddit|flickr] [count]",
         en_doc="Post fumo now: .fumotest [source] [count]",
     )
@@ -834,7 +875,7 @@ class FumoQoder(loader.Module):
         else:
             state = "\U0001F534 disabled"
 
-        active = ["safebooru", "konachan"]
+        active = ["safebooru", f"konachan({(self._get('konachan_domain', 'konachan.net') or 'konachan.net').split('.')[-1]})"]
         if self._get("flickr_key", ""):
             active.append("flickr")
         if self._get("reddit", True):
@@ -850,6 +891,7 @@ class FumoQoder(loader.Module):
             f"<b>Sources:</b> <code>{utils.escape_html(', '.join(active))}</code>\n"
             f"<b>Reddit media:</b> <code>{utils.escape_html(self._get('reddit_media', 'pics'))}</code>\n"
             f"<b>Reddit auth:</b> {'set' if self._get('reddit_id', '') else 'anonymous'}\n"
+            f"<b>Reddit cookie:</b> {'set' if (self._get('reddit_cookie', '') or '').strip() else 'none'}\n"
             f"<b>Meta footer:</b> {'on' if self._get('meta', True) else 'off'}\n"
             f"<b>Caption:</b> <code>{utils.escape_html(self._get('caption', '') or '—')}</code>\n"
             f"<b>Exclude:</b> <code>{utils.escape_html(self._exclude() or '—')}</code>\n"
@@ -879,13 +921,16 @@ class FumoQoder(loader.Module):
             "<code>.fumotags</code> — show tags per source\n"
             "<code>.fumotags safebooru fumo_(doll) touhou</code> — set tags for one source\n"
             "<code>.fumoexclude nude gore</code> — minus-tag blacklist for boorus\n"
+            "<code>.fumokonachan net|com</code> — konachan.net (safe) / konachan.com (R-18, filtered)\n"
             "<code>.fumoflickrkey &lt;key&gt;</code> — enable Flickr (empty = off)\n\n"
             "<b>Reddit</b>\n"
             "<code>.fumoreddit on|off</code> — fallback source\n"
             "<code>.fumosub Fumofumo</code> — subreddit\n"
             "<code>.fumoredditmedia pics|videos|all</code> — what to fetch\n"
             "<code>.fumoredditauth &lt;client_id&gt; &lt;client_secret&gt;</code> — OAuth app "
-            "(saves you when anonymous access is 403-blocked); empty = clear\n\n"
+            "(saves you when anonymous access is 403-blocked); empty = clear\n"
+            "<code>.fumoredditcookie &lt;cookie&gt;</code> — browser cookie fallback "
+            "(dev tools → Network → any reddit request → Cookie header); empty = clear\n\n"
             "<b>Misc</b>\n"
             "<code>.fumotest</code> — post now\n"
             "<code>.fumotest reddit 2</code> — post 2 from a specific source\n"
