@@ -18,8 +18,8 @@
 #   -r / --regex  regex-триггер: например "[?&]si=[^&\s]+" вырезает
 #                 трекинг si= из ссылок ютуба (в качестве замены укажи "-")
 #   -c / --case   учитывать регистр
-#   -n / --neg    не срабатывать после «не»/«ни» (подстрока/слово):
-#                 «удивлен -n» не тронет «не удивлен», а просто «удивлен» — да
+#   -n / --neg    не срабатывать после «не»/«нет»/«неа»/«ни» (подстрока/слово):
+#                 «удивлен -n» не тронет «не удивлен», «нет удивлен», «неа удивлен»
 #
 # Визард .repadd:
 #   1) триггер из аргументов (или ответом, если не указан)
@@ -45,6 +45,9 @@ PER_PAGE = 30
 CANCEL_WORDS = ("отмена", "cancel", "стоп", "stop", "хватит")
 YES_WORDS = ("да", "yes", "+", "угу", "ага")
 NO_WORDS = ("нет", "no", "-", "неа")
+# группа 1 = «не»/«нет»/«ни»/«неа» перед совпадением: с флагом -n такие
+# вхождения не трогаем (см. _apply)
+NEG_PREFIX = r"((?:[нН][еЕ][тТ]|[нН][еЕ][аА]|[нН][иИ]|[нН][еЕ])\s+)?"
 
 
 @loader.tds
@@ -104,9 +107,9 @@ class TriggerChangerMod(loader.Module):
         else:
             core = re.escape(trigger)
             if entry.get("neg"):
-                # группа 1 = «не»/«ни» перед совпадением; -n такие вхождения
-                # пропускает (см. _apply)
-                core = r"((?:[нН][еЕ]|[нН][иИ])\s+)?" + core
+                # группа 1 = отрицание перед совпадением (см. NEG_PREFIX);
+                # -n такие вхождения пропускает (см. _apply)
+                core = NEG_PREFIX + core
             if mode == "word":
                 core = r"(?<!\w)" + core + r"(?!\w)"
             pattern = core
@@ -135,7 +138,7 @@ class TriggerChangerMod(loader.Module):
                 continue
             neg = bool(entry.get("neg")) and entry.get("mode", "sub") != "regex"
             if neg:
-                # срабатываем, только если есть вхождение БЕЗ «не»/«ни» перед ним
+                # срабатываем, только если есть вхождение БЕЗ отрицания перед ним
                 applies = any(m.group(1) is None for m in rx.finditer(text))
             else:
                 applies = rx.search(text) is not None
@@ -256,7 +259,7 @@ class TriggerChangerMod(loader.Module):
         if entry["case"]:
             flags.append("регистр")
         if entry["neg"]:
-            flags.append("не после «не»/«ни»")
+            flags.append("не после «не»/«нет»/«неа»/«ни»")
         flag_str = f" <i>({', '.join(flags)})</i>" if flags else ""
         photo_str = "\n🖼 Картинка: прикреплена" if entry["photo"] else ""
         if entry["repl"] is None:
@@ -382,7 +385,7 @@ class TriggerChangerMod(loader.Module):
             "<code>.reptoggle [on|off]</code> — вкл/выкл\n"
             "<code>.reptest &lt;текст&gt;</code> — проверить без отправки\n\n"
             "Флаги: <code>-r</code> regex, <code>-w</code> целое слово, "
-            "<code>-c</code> регистр, <code>-n</code> не после «не»/«ни».\n"
+            "<code>-c</code> регистр, <code>-n</code> не после «не»/«нет»/«неа»/«ни».\n"
             "Пример: <code>.repadd да</code>, в ответ пишешь <code>da✅</code> — и каждое «да» "
             "в твоих сообщениях станет <code>da✅</code> сразу после отправки.",
         )
