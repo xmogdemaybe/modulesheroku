@@ -4,24 +4,26 @@
 #
 # Sources (tried in random order, then fallbacks):
 #   Safebooru / Konachan             -> boorus (safe-only)
-#   Reddit (r/Fumofumo)              -> fallback, no API key (needs system VPN in RU)
+#   Reddit (r/Fumofumo)              -> fallback, anonymous or OAuth (.fumoredditauth)
 #   Flickr                           -> optional, only if API key is set (safe_search=1)
 #
 # Commands:
 #   .fumo on|off                 toggle autoposting
 #   .fumotarget [chat]           set target (arg / reply / current chat)
 #   .fumointerval 30m|2h|90      set interval (minutes by default), 1m..7d
+#   .fumocount <1-10>            how many pictures to send at once (album)
 #   .fumocaption <text>          custom caption text (placeholders allowed)
 #   .fumometa on|off             toggle auto metadata footer in caption
 #   .fumotags [source] [tags]    per-source search tags (show if no args)
 #   .fumoexclude <tags>          global minus-tag blacklist for boorus
 #   .fumoreddit on|off           toggle Reddit fallback source
+#   .fumoredditmedia pics|videos|all   what to fetch from Reddit
+#   .fumoredditauth <id> <secret>      Reddit OAuth app credentials (403 fallback)
 #   .fumosub <subreddit>         set subreddit (default Fumofumo)
 #   .fumoflickrkey <key>         set Flickr API key (empty disables Flickr)
-#   .fumoproxy <url>             HTTP/SOCKS5 proxy for all module traffic
-#                                (e.g. local WARP: socks5://127.0.0.1:40000)
-#   .fumotest                    post one fumo into current chat right now
+#   .fumotest [source] [count]   post fumo now (optionally from one source)
 #   .fumostatus                  show all settings + enabled sources
+#   .fumohelp                    command list with examples
 #
 # Caption placeholders: {source} {post} {url} {tags} {id} {date} {time}
 
@@ -61,6 +63,8 @@ SAFE_EXTS = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+EXT_MIME = {**SAFE_EXTS, ".mp4": "video/mp4"}
+MAX_COUNT = 10
 
 # Sensible per-source defaults (Safebooru uses fumo_(doll); Konachan needs a
 # broader tag). Override any of them with: .fumotags <source> <tags>
@@ -71,6 +75,12 @@ DEFAULT_TAGS = {
 }
 BOORU_SOURCES = ("safebooru", "konachan")
 DEFAULT_SUBREDDIT = "Fumofumo"
+SOURCE_MAP = {
+    "safebooru": "_src_safebooru",
+    "konachan": "_src_konachan",
+    "reddit": "_src_reddit",
+    "flickr": "_src_flickr",
+}
 
 
 @loader.tds
@@ -118,7 +128,7 @@ class FumoQoder(loader.Module):
 
     async def _json(self, url: str, params: dict, headers: Optional[dict] = None) -> Any:
         session = await self._http()
-        async with session.get(url, params=params, headers=headers, proxy=self._proxy()) as resp:
+        async with session.get(url, params=params, headers=headers) as resp:
             resp.raise_for_status()
             return await resp.json(content_type=None)
 
@@ -129,9 +139,6 @@ class FumoQoder(loader.Module):
 
     def _exclude(self) -> str:
         return (self._get("exclude", "") or "").strip()
-
-    def _proxy(self) -> Optional[str]:
-        return (self._get("proxy", "") or "").strip() or None
 
     def _booru_tags(self, source: str) -> str:
         """Search tags + site rating filter + global minus-tag blacklist."""
@@ -204,18 +211,68 @@ class FumoQoder(loader.Module):
                 return posts
         return []
 
+    async def _reddit_token(self) -> str:
+        """App-only OAuth token (client_credentials), cached in memory until expiry."""
+        now = time.time()
+        token = getattr(self, "_rd_token", None)
+        if token and now < getattr(self, "_rd_token_exp", 0) - 60:
+            return token
+        session = await self._http()
+        auth = aiohttp.BasicAuth(self._get("reddit_id", ""), self._get("reddit_secret", ""))
+        async with session.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=auth,
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": REDDIT_USER_AGENT},
+        ) as resp:
+            resp.raise_for_status()
+            payload = await resp.json(content_type=None)
+        self._rd_token = payload["access_token"]
+        self._rd_token_exp = now + int(payload.get("expires_in", 3600))
+        return self._rd_token
+
     async def _src_reddit(self) -> list:
         sub = self._get("subreddit", DEFAULT_SUBREDDIT) or DEFAULT_SUBREDDIT
-        payload = await self._json(
-            f"https://www.reddit.com/r/{sub}/hot.json", {"limit": "50", "raw_json": "1"},
-            headers={"User-Agent": REDDIT_USER_AGENT},
-        )
+        media = self._get("reddit_media", "pics")
+        params = {"limit": "50", "raw_json": "1"}
+        payload = None
+
+        # OAuth first when credentials are set: anonymous JSON is 403-blocked on
+        # some networks (e.g. RU), an app-only token goes through oauth.reddit.com.
+        if self._get("reddit_id", "") and self._get("reddit_secret", ""):
+            try:
+                token = await self._reddit_token()
+                payload = await self._json(
+                    f"https://oauth.reddit.com/r/{sub}/hot", params,
+                    headers={
+                        "User-Agent": REDDIT_USER_AGENT,
+                        "Authorization": f"Bearer {token}",
+                    },
+                )
+            except Exception as exc:
+                logger.warning("[FumoQoder] reddit oauth failed: %r", exc)
+
+        if payload is None:
+            payload = await self._json(
+                f"https://www.reddit.com/r/{sub}/hot.json", params,
+                headers={"User-Agent": REDDIT_USER_AGENT},
+            )
+
         children = (payload or {}).get("data", {}).get("children", []) if isinstance(payload, dict) else []
         posts = []
         for c in children:
             d = c.get("data", {}) if isinstance(c, dict) else {}
             img = d.get("url_overridden_by_dest") or d.get("url") or ""
-            if not self._ext(img):
+            video = ((d.get("secure_media") or {}).get("reddit_video") or {}).get("fallback_url") or ""
+            is_video = bool(video) and media in ("videos", "all")
+            if is_video:
+                img = video
+            ext = self._ext(img)
+            if not ext:
+                continue
+            if media == "pics" and (video or ext == ".mp4"):
+                continue
+            if media == "videos" and not is_video:
                 continue
             posts.append({
                 "id": f"rd_{d.get('id')}", "url": img, "src": "Reddit",
@@ -261,10 +318,13 @@ class FumoQoder(loader.Module):
     @staticmethod
     def _ext(url: str) -> Optional[str]:
         clean = (url or "").lower().split("?", 1)[0]
-        for ext in SAFE_EXTS:
+        for ext in EXT_MIME:
             if clean.endswith(ext):
                 return ".jpg" if ext == ".jpeg" else ext
         return None
+
+    def _source_by_name(self, name: str):
+        return getattr(self, SOURCE_MAP[name.lower()])
 
     def _active_sources(self) -> list:
         """Boorus (shuffled) first, then optional fallbacks: Flickr, Reddit."""
@@ -277,12 +337,19 @@ class FumoQoder(loader.Module):
             sources.append(self._src_reddit)
         return sources
 
-    async def _pick_post(self) -> dict:
-        """Return a fresh, unseen, safe canonical post with an added 'ext' field."""
+    async def _pick_posts(self, count: int = 1, source: Optional[str] = None) -> list:
+        """Return up to `count` fresh, unseen posts with an added 'ext' field.
+
+        Raises only when nothing at all could be picked; a partial result is fine.
+        """
         history = set(self._get("history", []) or [])
-        errors = []
-        for src in self._active_sources():
+        picked, errors = [], []
+        sources = [self._source_by_name(source)] if source else self._active_sources()
+        for src in sources:
+            if len(picked) >= count:
+                break
             name = src.__name__
+            added = 0
             try:
                 posts = await src()
             except Exception as exc:
@@ -290,15 +357,23 @@ class FumoQoder(loader.Module):
                 logger.warning("[FumoQoder] source %s failed: %r", name, exc)
                 continue
             random.shuffle(posts)
+            chosen_ids = {p["id"] for p in picked}
             for p in posts:
+                if len(picked) >= count:
+                    break
                 ext = self._ext(p["url"])
-                if not ext or p["id"] in history:
+                if not ext or p["id"] in history or p["id"] in chosen_ids:
                     continue
                 p["ext"] = ext
+                chosen_ids.add(p["id"])
                 self._push_history(p["id"])
-                return p
-            errors.append(f"{name}:no-fresh")
-        raise RuntimeError("all sources failed: " + ", ".join(errors) if errors else "no fumo found")
+                picked.append(p)
+                added += 1
+            if not added:
+                errors.append(f"{name}:no-fresh")
+        if not picked:
+            raise RuntimeError("all sources failed: " + ", ".join(errors) if errors else "no fumo found")
+        return picked
 
     def _push_history(self, post_id: str):
         history = self._get("history", []) or []
@@ -310,7 +385,7 @@ class FumoQoder(loader.Module):
         async with session.get(url, headers={
             "User-Agent": USER_AGENT,
             "Referer": "/".join(url.split("/")[:3]) + "/",
-        }, proxy=self._proxy()) as resp:
+        }) as resp:
             resp.raise_for_status()
             data = bytearray()
             async for chunk in resp.content.iter_chunked(64 * 1024):
@@ -321,51 +396,67 @@ class FumoQoder(loader.Module):
             raise RuntimeError("empty response")
         return bytes(data)
 
-    async def _send(self, entity) -> dict:
-        post = None
+    async def _send(self, entity, source: Optional[str] = None, count: Optional[int] = None) -> list:
+        if count is None:
+            count = self._get("count", 1)
+        count = max(1, min(MAX_COUNT, int(count or 1)))
+        posts = await self._pick_posts(count, source)
+
+        files, sent = [], []
         last_err = None
-        for _ in range(3):
-            post = await self._pick_post()
-            try:
-                data = await self._download(post["url"])
-                break
-            except Exception as exc:
-                last_err = exc
-                logger.warning("[FumoQoder] download failed for %s: %r", post["url"], exc)
-        else:
+        for post in posts:
+            data = None
+            for _ in range(3):
+                try:
+                    data = await self._download(post["url"])
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    logger.warning("[FumoQoder] download failed for %s: %r", post["url"], exc)
+            if data is None:
+                continue
+            logger.info("[FumoQoder] RAW POST %r", post)
+            file = BytesIO(data)
+            file.name = f"fumo_{post['id']}{post['ext']}"
+            files.append(file)
+            sent.append(post)
+        if not files:
             raise RuntimeError(f"download failed: {last_err}")
 
-        logger.info("[FumoQoder] RAW POST %r", post)
-
-        file = BytesIO(data)
-        file.name = f"fumo_{post['id']}{post['ext']}"
+        kwargs = {}
+        if len(files) == 1:
+            kwargs["mime_type"] = EXT_MIME[sent[0]["ext"]]
         msg = await self.client.send_file(
-            entity, file, caption=self._caption(post), mime_type=SAFE_EXTS[post["ext"]],
+            entity, files[0] if len(files) == 1 else files,
+            caption=self._caption(sent), **kwargs,
         )
 
         now = time.time()
         self._set("last_post_ts", now)
-        self._set("last_source", post["src"])
-        self._set("last_url", post["url"])
+        self._set("last_source", sent[0]["src"])
+        self._set("last_url", sent[0]["url"])
         self._next_post = now + self._get("interval", DEFAULT_INTERVAL)
         logger.info(
-            "[FumoQoder] SENT src=%s id=%s bytes=%d target=%s msg_id=%s",
-            post["src"], post["id"], len(data),
+            "[FumoQoder] SENT n=%d src=%s id=%s target=%s msg_id=%s",
+            len(files), sent[0]["src"], sent[0]["id"],
             getattr(entity, "id", entity), getattr(msg, "id", "?"),
         )
-        return post
+        return sent
 
-    def _caption(self, post: dict) -> str:
+    def _caption(self, posts) -> str:
+        if isinstance(posts, dict):
+            posts = [posts]
+        first = posts[0]
         now = datetime.now(timezone.utc)
         # Telegram parses captions as HTML, so every dynamic value must be escaped:
         # booru post URLs contain bare '&' (?page=post&s=view&id=..), which Telegram
         # rejects with "Failed to parse message" unless it is '&amp;'.
         vals = {
-            "{source}": utils.escape_html(post["src"]),
-            "{post}": utils.escape_html(post.get("post_url", "")),
-            "{url}": utils.escape_html(post["url"]),
-            "{tags}": utils.escape_html(post.get("tags", "")),
-            "{id}": utils.escape_html(post["id"]),
+            "{source}": utils.escape_html(first["src"]),
+            "{post}": utils.escape_html(first.get("post_url", "")),
+            "{url}": utils.escape_html(first["url"]),
+            "{tags}": utils.escape_html(first.get("tags", "")),
+            "{id}": utils.escape_html(first["id"]),
             "{date}": now.strftime("%Y-%m-%d"),
             "{time}": now.strftime("%H:%M:%S"),
         }
@@ -380,10 +471,18 @@ class FumoQoder(loader.Module):
         if custom:
             parts.append(custom)
         if self._get("meta", True):
-            parts.append(
-                f"\U0001F338 {vals['{source}']} \u2022 \U0001F3F7 {vals['{tags}']}\n"
-                f"\U0001F517 {vals['{post}']}"
-            )
+            if len(posts) == 1:
+                parts.append(
+                    f"\U0001F338 {vals['{source}']} \u2022 \U0001F3F7 {vals['{tags}']}\n"
+                    f"\U0001F517 {vals['{post}']}"
+                )
+            else:
+                lines = [
+                    f"{i}. \U0001F338 {utils.escape_html(p['src'])} "
+                    f"\U0001F517 {utils.escape_html(p.get('post_url', ''))}"
+                    for i, p in enumerate(posts, 1)
+                ]
+                parts.append("\n".join(lines))
         return "\n\n".join(parts)
 
     # ---------- target ----------
@@ -611,42 +710,110 @@ class FumoQoder(loader.Module):
         )
 
     @loader.command(
-        ru_doc="Прокси для трафика модуля: .fumoproxy socks5://127.0.0.1:40000 (пусто — выключить)",
-        en_doc="Proxy for module traffic: .fumoproxy socks5://127.0.0.1:40000 (empty disables)",
+        ru_doc="Сколько картинок за одну отправку: .fumocount 1-10",
+        en_doc="How many pictures per send: .fumocount 1-10",
     )
-    async def fumoproxy(self, message):
-        """HTTP/SOCKS5 proxy for all module requests (e.g. local WARP socks5)"""
-        proxy = utils.get_args_raw(message).strip()
-        if proxy and not proxy.startswith(("http://", "https://", "socks5://", "socks5h://", "socks4://")):
-            await utils.answer(
-                message, "\u26A0\uFE0F <b>Proxy URL must start with http://, https:// or socks5://</b>"
-            )
+    async def fumocount(self, message):
+        """How many pictures to send at once (album), 1..10"""
+        args = utils.get_args_raw(message).strip()
+        try:
+            count = int(args)
+        except ValueError:
+            await utils.answer(message, "\u26A0\uFE0F <b>Example:</b> <code>.fumocount 3</code>")
             return
-        self._set("proxy", proxy)
-        await utils.answer(
-            message, f"\U0001F310 <b>Proxy:</b> <code>{utils.escape_html(proxy)}</code>" if proxy
-            else "\U0001F310 <b>Proxy disabled.</b>"
-        )
+        if not 1 <= count <= MAX_COUNT:
+            await utils.answer(message, f"\u26A0\uFE0F <b>Count: 1 .. {MAX_COUNT}.</b>")
+            return
+        self._set("count", count)
+        await utils.answer(message, f"\U0001F5BC <b>Per send:</b> <code>{count}</code>")
 
     @loader.command(
-        ru_doc="Отправить одно фумо в текущий чат прямо сейчас",
-        en_doc="Post one fumo into the current chat right now",
+        ru_doc="Медиа с Reddit: .fumoredditmedia pics|videos|all",
+        en_doc="Reddit media type: .fumoredditmedia pics|videos|all",
+    )
+    async def fumoredditmedia(self, message):
+        """What to fetch from Reddit: pics, videos or all"""
+        args = utils.get_args_raw(message).strip().lower()
+        if args not in ("pics", "videos", "all"):
+            state = self._get("reddit_media", "pics")
+            await utils.answer(
+                message, f"<b>Reddit media:</b> {state}\n"
+                "<code>.fumoredditmedia pics|videos|all</code>"
+            )
+            return
+        self._set("reddit_media", args)
+        await utils.answer(message, f"\U0001F4E1 <b>Reddit media:</b> <code>{args}</code>")
+
+    @loader.command(
+        ru_doc="Reddit OAuth: .fumoredditauth <client_id> <client_secret> (пусто — сброс)",
+        en_doc="Reddit OAuth app credentials: .fumoredditauth <client_id> <client_secret>",
+    )
+    async def fumoredditauth(self, message):
+        """Reddit app-only OAuth credentials; used when anonymous JSON is blocked (403)"""
+        parts = utils.get_args_raw(message).split()
+        if not parts:
+            self._set("reddit_id", "")
+            self._set("reddit_secret", "")
+            self._rd_token = None
+            await utils.answer(message, "\U0001F4E1 <b>Reddit auth cleared (anonymous mode).</b>")
+            return
+        if len(parts) != 2:
+            await utils.answer(
+                message, "\u26A0\uFE0F <b>Usage:</b> <code>.fumoredditauth &lt;client_id&gt; &lt;client_secret&gt;</code>"
+            )
+            return
+        self._set("reddit_id", parts[0])
+        self._set("reddit_secret", parts[1])
+        self._rd_token = None
+        await utils.answer(
+            message, f"\U0001F4E1 <b>Reddit auth set</b> (id <code>{utils.escape_html(parts[0])}</code>). "
+            "Testing token...\n" + await self._test_reddit_token()
+        )
+
+    async def _test_reddit_token(self) -> str:
+        try:
+            await self._reddit_token()
+            return "\u2705 <b>Token OK.</b>"
+        except Exception as exc:
+            logger.warning("[FumoQoder] reddit token test failed: %r", exc)
+            return f"\u274C <b>Token failed:</b> <code>{utils.escape_html(repr(exc))}</code>"
+
+    @loader.command(
+        ru_doc="Отправить фумо сейчас: .fumotest [safebooru|konachan|reddit|flickr] [count]",
+        en_doc="Post fumo now: .fumotest [source] [count]",
     )
     async def fumotest(self, message):
-        """Post one fumo into the current chat right now"""
+        """Post fumo right now; optional source (safebooru|konachan|reddit|flickr) and count"""
+        args = utils.get_args_raw(message).split()
+        source, count = None, None
+        for a in args[:2]:
+            if a.lower() in SOURCE_MAP:
+                source = a.lower()
+            elif a.isdigit():
+                count = int(a)
+            else:
+                await utils.answer(
+                    message, "\u26A0\uFE0F <b>Usage:</b> <code>.fumotest [safebooru|konachan|"
+                    "reddit|flickr] [count]</code>"
+                )
+                return
         status = await utils.answer(message, "\U0001F50E <b>Fetching fumo...</b>")
         try:
-            post = await self._send(await message.get_chat())
+            sent = await self._send(await message.get_chat(), source=source, count=count)
         except FloodWaitError as exc:
             await utils.answer(status, f"\U0001F40C <b>FloodWait:</b> <code>{exc.seconds}s</code>")
             return
         except Exception as exc:
-            logger.error("[FumoQoder] fumotest failed: %r", exc)
+            logger.error("[FumoQoder] fumotest failed (source=%s): %r", source, exc)
             await utils.answer(
-                status, f"\u274C <b>Failed:</b>\n<code>{utils.escape_html(str(exc))}</code>"
+                status, f"\u274C <b>Failed{' (' + source + ')' if source else ''}:</b>\n"
+                f"<code>{utils.escape_html(str(exc))}</code>"
             )
             return
-        await utils.answer(status, f"\u2705 <b>Sent.</b> <i>Source:</i> {post['src']}")
+        srcs = ", ".join(dict.fromkeys(p["src"] for p in sent))
+        await utils.answer(
+            status, f"\u2705 <b>Sent {len(sent)}.</b> <i>Source:</i> {utils.escape_html(srcs)}"
+        )
 
     @loader.command(
         ru_doc="Показать все настройки и активные источники",
@@ -679,13 +846,50 @@ class FumoQoder(loader.Module):
             f"<b>Status:</b> {state}\n"
             f"<b>Target:</b> <code>{utils.escape_html(target_str)}</code>\n"
             f"<b>Interval:</b> <code>{fmt_interval(self._get('interval', DEFAULT_INTERVAL))}</code>\n"
+            f"<b>Per send:</b> <code>{self._get('count', 1)}</code>\n"
             f"<b>Sources:</b> <code>{utils.escape_html(', '.join(active))}</code>\n"
+            f"<b>Reddit media:</b> <code>{utils.escape_html(self._get('reddit_media', 'pics'))}</code>\n"
+            f"<b>Reddit auth:</b> {'set' if self._get('reddit_id', '') else 'anonymous'}\n"
             f"<b>Meta footer:</b> {'on' if self._get('meta', True) else 'off'}\n"
             f"<b>Caption:</b> <code>{utils.escape_html(self._get('caption', '') or '—')}</code>\n"
             f"<b>Exclude:</b> <code>{utils.escape_html(self._exclude() or '—')}</code>\n"
-            f"<b>Proxy:</b> <code>{utils.escape_html(self._get('proxy', '') or '—')}</code>\n"
             f"<b>Last post:</b> <code>{last_str}</code> "
             f"({utils.escape_html(self._get('last_source', '') or '—')})",
+        )
+
+    @loader.command(
+        ru_doc="Список команд FumoQoder с примерами",
+        en_doc="FumoQoder command list with examples",
+    )
+    async def fumohelp(self, message):
+        """Show all FumoQoder commands with examples"""
+        await utils.answer(
+            message,
+            "\U0001F338 <b>FumoQoder — commands</b>\n\n"
+            "<b>Autoposting</b>\n"
+            "<code>.fumo on</code> / <code>.fumo off</code> — enable/disable\n"
+            "<code>.fumotarget @mychannel</code> — where to post (or reply / empty = current chat)\n"
+            "<code>.fumointerval 30m</code> — how often (30m / 2h / 90 = minutes)\n"
+            "<code>.fumocount 3</code> — how many pictures per send (1..10, album)\n\n"
+            "<b>Caption</b>\n"
+            "<code>.fumocaption Fumo time! {source}</code> — custom text "
+            "({source} {post} {url} {tags} {id} {date} {time}); empty = clear\n"
+            "<code>.fumometa off</code> — hide source/tags/link footer\n\n"
+            "<b>Sources & tags</b>\n"
+            "<code>.fumotags</code> — show tags per source\n"
+            "<code>.fumotags safebooru fumo_(doll) touhou</code> — set tags for one source\n"
+            "<code>.fumoexclude nude gore</code> — minus-tag blacklist for boorus\n"
+            "<code>.fumoflickrkey &lt;key&gt;</code> — enable Flickr (empty = off)\n\n"
+            "<b>Reddit</b>\n"
+            "<code>.fumoreddit on|off</code> — fallback source\n"
+            "<code>.fumosub Fumofumo</code> — subreddit\n"
+            "<code>.fumoredditmedia pics|videos|all</code> — what to fetch\n"
+            "<code>.fumoredditauth &lt;client_id&gt; &lt;client_secret&gt;</code> — OAuth app "
+            "(saves you when anonymous access is 403-blocked); empty = clear\n\n"
+            "<b>Misc</b>\n"
+            "<code>.fumotest</code> — post now\n"
+            "<code>.fumotest reddit 2</code> — post 2 from a specific source\n"
+            "<code>.fumostatus</code> — all settings\n",
         )
 
 
