@@ -6,7 +6,7 @@
 # Правила хранятся в БД (json Heroku), картинки — в base64.
 #
 # Команды:
-#   .repadd <триггер> [-r|-w|-c|-n]   добавить замену (визард: замена -> картинка?)
+#   .repadd <триггер> [-r|-w|-c|-n|-e]   добавить замену (визард: замена -> картинка?)
 #   .replist [страница]            список правил
 #   .repdel <id|all>               удалить правило / всё
 #   .reptoggle [on|off]            вкл/выкл автозамену
@@ -20,6 +20,9 @@
 #   -c / --case   учитывать регистр
 #   -n / --neg    не срабатывать после «не»/«нет»/«неа»/«ни» (подстрока/слово):
 #                 «удивлен -n» не тронет «не удивлен», «нет удивлен», «неа удивлен»
+#   -e / --end    только в конце сообщения (подстрока/слово): после совпадения
+#                 больше нет слов — «нет -e» заменит «нет», «ну нет», «нет!»,
+#                 но не тронет «нет удивлен», «нет, спасибо»
 #
 # Визард .repadd:
 #   1) триггер из аргументов (или ответом, если не указан)
@@ -48,6 +51,8 @@ NO_WORDS = ("нет", "no", "-", "неа")
 # группа 1 = «не»/«нет»/«ни»/«неа» перед совпадением: с флагом -n такие
 # вхождения не трогаем (см. _apply)
 NEG_PREFIX = r"((?:[нН][еЕ][тТ]|[нН][еЕ][аА]|[нН][иИ]|[нН][еЕ])\s+)?"
+# хвост для -e: дальше до конца сообщения — только не-словá (знаки, эмодзи)
+END_SUFFIX = r"(?=[\W]*$)"
 
 
 @loader.tds
@@ -112,6 +117,9 @@ class TriggerChangerMod(loader.Module):
                 core = NEG_PREFIX + core
             if mode == "word":
                 core = r"(?<!\w)" + core + r"(?!\w)"
+            if entry.get("end"):
+                # после совпадения — только пробелы/знаки/эмодзи до конца
+                core = core + END_SUFFIX
             pattern = core
         try:
             return re.compile(pattern, flags)
@@ -245,6 +253,7 @@ class TriggerChangerMod(loader.Module):
             "mode": state.get("mode", "sub"),
             "case": bool(state.get("case", False)),
             "neg": bool(state.get("neg", False)),
+            "end": bool(state.get("end", False)),
             "photo": state.get("photo"),
         }
         entries.append(entry)
@@ -260,6 +269,8 @@ class TriggerChangerMod(loader.Module):
             flags.append("регистр")
         if entry["neg"]:
             flags.append("не после «не»/«нет»/«неа»/«ни»")
+        if entry["end"]:
+            flags.append("только в конце")
         flag_str = f" <i>({', '.join(flags)})</i>" if flags else ""
         photo_str = "\n🖼 Картинка: прикреплена" if entry["photo"] else ""
         if entry["repl"] is None:
@@ -379,26 +390,27 @@ class TriggerChangerMod(loader.Module):
             message,
             f"🔁 <b>TriggerChanger</b> — {state}, правил: <code>{len(entries)}</code> "
             f"(с картинками: <code>{photos}</code>)\n\n"
-            "<code>.repadd &lt;триггер&gt; [-r|-w|-c|-n]</code> — добавить замену (дальше по подсказкам)\n"
+            "<code>.repadd &lt;триггер&gt; [-r|-w|-c|-n|-e]</code> — добавить замену (дальше по подсказкам)\n"
             "<code>.replist</code> — список правил\n"
             "<code>.repdel &lt;id|all&gt;</code> — удалить правило / всё\n"
             "<code>.reptoggle [on|off]</code> — вкл/выкл\n"
             "<code>.reptest &lt;текст&gt;</code> — проверить без отправки\n\n"
             "Флаги: <code>-r</code> regex, <code>-w</code> целое слово, "
-            "<code>-c</code> регистр, <code>-n</code> не после «не»/«нет»/«неа»/«ни».\n"
+            "<code>-c</code> регистр, <code>-n</code> не после «не»/«нет»/«неа»/«ни», "
+            "<code>-e</code> только в конце сообщения.\n"
             "Пример: <code>.repadd да</code>, в ответ пишешь <code>da✅</code> — и каждое «да» "
             "в твоих сообщениях станет <code>da✅</code> сразу после отправки.",
         )
 
     @loader.command(
-        ru_doc="Добавить замену: .repadd <триггер> [-r|-w|-c|-n]; дальше по подсказкам бота",
-        en_doc="Add a replacement rule: .repadd <trigger> [-r|-w|-c|-n], then follow the prompts",
+        ru_doc="Добавить замену: .repadd <триггер> [-r|-w|-c|-n|-e]; дальше по подсказкам бота",
+        en_doc="Add a replacement rule: .repadd <trigger> [-r|-w|-c|-n|-e], then follow the prompts",
     )
     async def repadd(self, message):
         """Wizard: add a replacement rule"""
         uid = message.sender_id
         args = utils.get_args_raw(message)
-        mode, case, neg = "sub", False, False
+        mode, case, neg, end = "sub", False, False, False
         rest = []
         for token in args.split():
             if token in ("-r", "--regex"):
@@ -409,20 +421,24 @@ class TriggerChangerMod(loader.Module):
                 case = True
             elif token in ("-n", "--neg"):
                 neg = True
+            elif token in ("-e", "--end"):
+                end = True
             else:
                 rest.append(token)
         trigger = " ".join(rest).strip()
 
         note = ""
-        if neg and mode == "regex":
-            neg = False
+        if mode == "regex" and (neg or end):
+            dropped = [name for name, on in (("-n", neg), ("-e", end)) if on]
+            neg = end = False
             note = (
-                "⚠️ <code>-n</code> работает только для подстроки и слова; "
-                "в regex-режиме впиши lookbehind сам: <code>(?&lt;!не\\s)</code>.\n\n"
+                f"⚠️ {' и '.join(dropped)} работает только для подстроки и слова; "
+                "в regex-режиме впиши сам: <code>(?&lt;!не\\s)</code> для -n, "
+                "<code>$</code> для -e.\n\n"
             )
 
         state = {"step": "trigger", "mode": mode, "case": case, "neg": neg,
-                 "trigger": "", "repl": None, "photo": None}
+                 "end": end, "trigger": "", "repl": None, "photo": None}
 
         if trigger:
             if mode == "regex":
@@ -493,6 +509,8 @@ class TriggerChangerMod(loader.Module):
                 flags += "C"
             if entry.get("neg"):
                 flags += "N"
+            if entry.get("end"):
+                flags += "E"
             flag_str = f" <code>[{flags}]</code>" if flags else ""
             photo = " 🖼" if entry.get("photo") else ""
             trig = utils.escape_html(entry.get("trigger", ""))
