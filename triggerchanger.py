@@ -10,13 +10,16 @@
 #   .replist [страница]            список правил
 #   .repdel <id|all>               удалить правило / всё
 #   .reptoggle [on|off]            вкл/выкл автозамену
+#   .repclean [on|off]             вкл/выкл чистку ссылок от трекеров
 #   .reptest <текст>               проверить текст без отправки
 #
 # Режимы совпадения (флаги при добавлении):
 #   (без флага)   подстрока, регистр не важен: "да" ловит "да", "Да", "ДА"
 #   -w / --word   только целое слово: "да" НЕ ловит "даже"
-#   -r / --regex  regex-триггер: например "\?si=[^&\s]+(?=\s|$)|(?<=\?)si=[^&\s]+&|&si=[^&\s]+"
-#                 вырезает трекинг si= из ссылок ютуба (в качестве замены укажи "-")
+#   -r / --regex  regex-триггер: например "[?&]si=[^&\s]+" вырезает
+#                 трекинг si= из ссылок ютуба (в качестве замены укажи "-")
+#                 Для ссылок лучше не городить регулярку, а включить .repclean —
+#                 он разбирает query и не ломает ссылку, где si= стоит первым.
 #   -c / --case   учитывать регистр
 #   -n / --neg    не срабатывать после «не»/«нет»/«неа»/«ни» (подстрока/слово):
 #                 «удивлен -n» не тронет «не удивлен», «нет удивлен», «неа удивлен»
@@ -55,6 +58,17 @@ NEG_PREFIX = r"((?:[нН][еЕ][тТ]|[нН][еЕ][аА]|[нН][иИ]|[нН][е�
 END_SUFFIX = r"(?=[\W]*$)"
 # символы, по которым подозреваем забытый -r: в обычных триггерах почти не бывают
 REGEX_CHARS = "\\[]{}|*+"
+
+URL_RX = re.compile(r"""https?://[^\s<>"']+""")
+# трекер-параметры, которые режем в любых ссылках
+TRACKER_PARAMS = {
+    "fbclid", "gclid", "dclid", "gbraid", "wbraid", "yclid",
+    "igshid", "igsh", "mc_cid", "mc_eid", "_openstat", "sxsrf",
+}
+# а эти — только у ютуба (в других доменах могут быть полезными)
+YT_PARAMS = {"si", "feature"}
+YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+URL_TAIL = ".,;:!?»'\""
 
 
 @loader.tds
@@ -133,6 +147,51 @@ class TriggerChangerMod(loader.Module):
             except (re.error, ValueError):
                 return None
 
+    def _clean_links(self, text):
+        """Вырезать трекер-параметры (si=, utm_* и т.п.) из URL в тексте.
+
+        Делается разбором query, а не регуляркой: параметр может стоять
+        первым, в середине и последним, и в каждом случае ссылка должна
+        остаться рабочей.
+        """
+        if not self._get("clean_links", False):
+            return text
+
+        def clean(match):
+            url = match.group(0)
+            trail = ""
+            while url and url[-1] in URL_TAIL:
+                trail = url[-1] + trail
+                url = url[:-1]
+            while url.endswith(")") and url.count("(") < url.count(")"):
+                trail = ")" + trail
+                url = url[:-1]
+            head, sep, rest = url.partition("?")
+            if not sep or not rest:
+                return match.group(0)
+            frag = ""
+            if "#" in rest:
+                rest, _, f = rest.partition("#")
+                frag = "#" + f
+            parts = head.split("/")
+            host = parts[2].lower() if len(parts) > 2 else ""
+            yt = host.endswith(YT_HOSTS)
+            kept = []
+            for part in rest.split("&"):
+                if not part:
+                    continue
+                key = part.split("=", 1)[0].lower()
+                if key.startswith("utm_") or key in TRACKER_PARAMS:
+                    continue
+                if yt and key in YT_PARAMS:
+                    continue
+                kept.append(part)
+            if kept:
+                head += "?" + "&".join(kept)
+            return head + frag + trail
+
+        return URL_RX.sub(clean, text)
+
     def _apply(self, text):
         """Вернуть (новый текст, сработавшие правила).
 
@@ -140,7 +199,7 @@ class TriggerChangerMod(loader.Module):
         терялась, если более раннее правило уже переписало его триггер.
         """
         entries = self._get("entries", []) or []
-        new_text = text
+        new_text = self._clean_links(text)
         matched = []
         for entry in entries:
             rx = self._compile(entry)
@@ -398,24 +457,52 @@ class TriggerChangerMod(loader.Module):
         enabled = self._get("enabled", True)
         photos = sum(1 for e in entries if e.get("photo"))
         state = "🟢 вкл" if enabled else "🔴 выкл"
+        clean = "🟢 вкл" if self._get("clean_links", False) else "🔴 выкл"
         await utils.answer(
             message,
             f"🔁 <b>TriggerChanger</b> — {state}, правил: <code>{len(entries)}</code> "
-            f"(с картинками: <code>{photos}</code>)\n\n"
+            f"(с картинками: <code>{photos}</code>)\n"
+            f"🔗 Чистка ссылок от трекеров — {clean}\n\n"
             "<code>.repadd &lt;триггер&gt; [-r|-w|-c|-n|-e]</code> — добавить замену (дальше по подсказкам)\n"
             "<code>.replist</code> — список правил\n"
             "<code>.repdel &lt;id|all&gt;</code> — удалить правило / всё\n"
             "<code>.reptoggle [on|off]</code> — вкл/выкл\n"
+            "<code>.repclean [on|off]</code> — вкл/выкл чистку ссылок (si=, utm_* и т.п.)\n"
             "<code>.reptest &lt;текст&gt;</code> — проверить без отправки\n\n"
             "Флаги: <code>-r</code> regex, <code>-w</code> целое слово, "
             "<code>-c</code> регистр, <code>-n</code> не после «не»/«нет»/«неа»/«ни», "
             "<code>-e</code> только в конце сообщения.\n"
             "Пример: <code>.repadd да</code>, в ответ пишешь <code>da✅</code> — и каждое «да» "
-            "в твоих сообщениях станет <code>da✅</code> сразу после отправки.\n"
-            "Regex-пример: <code>.repadd \\?si=[^&amp;\\s]+(?=\\s|$)|"
-            "(?&lt;=\\?)si=[^&amp;\\s]+&amp;|&amp;si=[^&amp;\\s]+ -r</code>, замена "
-            "<code>-</code> — вырезает трекинг <code>si=</code> из ютуб-ссылок.",
+            "в твоих сообщениях станет <code>da✅</code> сразу после отправки.",
         )
+
+    @loader.command(
+        ru_doc="Вкл/выкл чистку ссылок от трекеров: .repclean [on|off]; без аргументов — переключить",
+        en_doc="Toggle link tracker cleaning: .repclean [on|off]; no args flips",
+    )
+    async def repclean(self, message):
+        """Toggle link tracker cleaning"""
+        raw = utils.get_args_raw(message).strip().lower()
+        if raw in ("on", "1", "вкл", "enable"):
+            new = True
+        elif raw in ("off", "0", "выкл", "disable"):
+            new = False
+        elif not raw:
+            new = not self._get("clean_links", False)
+        else:
+            await utils.answer(
+                message, "❌ Аргумент: <code>on</code> / <code>off</code> / пусто."
+            )
+            return
+        self._set("clean_links", new)
+        if new:
+            await utils.answer(
+                message,
+                "🔗 Чистка ссылок включена: <code>si=</code>, <code>utm_*</code>, "
+                "<code>fbclid</code> и прочие трекеры будут вырезаться.",
+            )
+        else:
+            await utils.answer(message, "🔗 Чистка ссылок выключена.")
 
     @loader.command(
         ru_doc="Добавить замену: .repadd <триггер> [-r|-w|-c|-n|-e]; дальше по подсказкам бота",
@@ -616,7 +703,15 @@ class TriggerChangerMod(loader.Module):
             return
         new_text, matched = self._apply(text)
         if not matched:
-            await utils.answer(message, "ℹ️ Совпадений нет — текст останется как есть.")
+            if new_text == text:
+                await utils.answer(message, "ℹ️ Совпадений нет — текст останется как есть.")
+                return
+            await utils.answer(
+                message,
+                "🔗 Сработала чистка ссылок (правил нет)\n\n"
+                f"<b>Было:</b> <code>{utils.escape_html(text)}</code>\n"
+                f"<b>Стало:</b> <code>{utils.escape_html(new_text)}</code>",
+            )
             return
         ids = ", ".join(f"#{e['id']}" for e in matched)
         photos = any(e.get("photo") for e in matched)
