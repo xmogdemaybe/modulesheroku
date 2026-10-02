@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 # Calculator — автопосчёт выражений в отправляемых сообщениях (Hikka / Heroku).
 #
-# Как работает: watcher ловит ТВОИ отправленные сообщения, и если ВСЁ сообщение
-# целиком является математическим выражением — дописывает к нему результат.
-# «240*15+199» ➜ «240*15+199 = 3799». Обычный текст не трогается: разбор strict,
-# любое непонятное слово («15*4 рубля») = ошибка = не трогаем.
+# Как работает: watcher ловит ТВОИ отправленные сообщения и дописывает к ним
+# результат. Три уровня строгости (см. decide()):
+#   1) всё сообщение — пример:            «240*15+199» ➜ «240*15+199 = 3799»
+#   2) единицы измерения:                «5 mi to km» ➜ «... = 8.04672 km»
+#   3) пример среди слов — но только если рядом знак «=»/«?» или слово из
+#      FILLERS: «но 250*100» ➜ «но 250*100 = 25000»,
+#      «итого 15*4 рублей =» ➜ «... = 60». Случайные «кв 15/4», «артикул A12-B34»
+#      не трогаем: непонятное слово без «=» = пропуск.
 # Никакого eval(): свой токенайзер + рекурсивный спуск, с ограничением на размер.
 #
 # Про откат: после каждой правки в чат логов улетает форма с кнопками
@@ -22,12 +26,19 @@
 #
 # Фильтр «жизни» пропускает «+7 912 345-67-89», «2-1» (счёт), «1991-2025» (года).
 # Если написал «2-1 =» или «2-1?» — считаем всегда: знак на конце = явная просьба.
+# За цену такой записи «2х3» — уже не счёт матча, а 6. «2-1» как не считался, так
+# и не считается.
 #
 # Что понимает: + - * / // % ^ (), скобки, унарный минус, «x»/«х»/«×»/«·» как
 # умножение, «÷», проценты (199+15% = 228.85, 500-10%, 20% of 50), % как остаток
 # (10%3), sqrt/cbrt/abs и приставные √/∛ (√16), π, десятичная запятая (2,5*4),
 # группы разрядов пробелом (1 000 000/3), точка-группировка только через две
 # («1.234.567» = 1234567; «1.500» = 1,5).
+#
+# Единицы (связка to / into / в / → / -> / =): мили↔км, футы/дюймы/ярд↔м/см,
+# фунты/унции↔кг/г, галлоны↔литры, мили/ч↔км/ч, °F/°C/K, мб↔гб. Миля = 1609.344 м,
+# галлон американский, приставки данных — двоичные (1024). Пишем как удобно:
+# «5 mi to km», «178 см в футы», «98.6 F в C», «1024 mb в гб».
 
 import logging
 import math
@@ -48,8 +59,9 @@ UNDO_TTL = 3600
 
 # выражение из двух 4-значных чисел через минус — это обычно годы, а не пример
 YEAR_RANGE = re.compile(r"^\d{4}\s*[-−–—]\s*\d{4}$")
-# счёт матча: «2-1», «1x0», «3:2» — однозначные с обеих сторон
-SCORE = re.compile(r"^\d\s*[-xх×:]\s*\d$")
+# счёт матча: «2-1», «3:2» — однозначные с обеих сторон. «x», «х», «×» сюда не
+# входят: по просьбе хозяина это в первую очередь умножение («2х3» = 6).
+SCORE = re.compile(r"^\d\s*[-:]\s*\d$")
 # всё, что остаётся цифрами после вырезания телефонных разделителей
 PHONE_MARKS = re.compile(r"[\s()\-\u2212\u2013\u2014+]")
 GROUPED_DOT = re.compile(r"^\d{1,3}(\.\d{3}){2,}$")
@@ -380,6 +392,22 @@ def evaluate(text):
         return None, "не посчиталось: %s" % exc
 
 
+def _fmt(value, comma, digits=10):
+    if isinstance(value, int):
+        shown = str(value)
+    else:
+        magnitude = abs(value)
+        if magnitude != 0 and (magnitude >= 1e16 or magnitude < 1e-9):
+            shown = "%.6g" % value
+        elif float(value).is_integer() and magnitude < 1e15:
+            shown = str(int(value))
+        else:
+            shown = ("%%.%df" % digits % value).rstrip("0").rstrip(".")
+    if comma and "." in shown:
+        shown = shown.replace(".", ",")
+    return shown
+
+
 def _evaluate(text):
     body = _strip_markers(text)
     if not body:
@@ -397,19 +425,213 @@ def _evaluate(text):
         # одиночное число с минусом/процентом: «-5», «50%» — не пример
         return None, "нет действия"
     value = _Parser(tokens).parse()
-    if isinstance(value, int):
-        shown = str(value)
-    else:
-        magnitude = abs(value)
-        if magnitude != 0 and (magnitude >= 1e16 or magnitude < 1e-9):
-            shown = "%.6g" % value
-        elif float(value).is_integer() and magnitude < 1e15:
-            shown = str(int(value))
+    return _fmt(value, comma), None
+
+
+# ---------- единицы измерения ----------
+
+# группа, коэффициент к базовой единице, написания (латиница + кириллица, падежи)
+UNIT_TABLE = [
+    ("len", 1.0, "м метра метров метры m meter meters metre metres"),
+    ("len", 1000.0, "км километр километра километров километры km kms kilometer kilometers kilometre kilometres"),
+    ("len", 0.01, "см сантиметра сантиметров сантиметры cm centimeter centimeters"),
+    ("len", 0.001, "мм миллиметра миллиметров миллиметры mm millimeter millimeters"),
+    ("len", 0.0254, "дюйма дюймов дюймы in inch inches"),
+    ("len", 0.3048, "фута футов футы ft foot feet"),
+    ("len", 0.9144, "ярда ярдов ярды yd yard yards"),
+    ("len", 1609.344, "миля мили миль mi mile miles"),
+    ("mass", 1.0, "кг kilogram kilograms килограмма килограммов килограммы kg"),
+    ("mass", 0.001, "г грамма граммов грамм граммы g gram grams"),
+    ("mass", 1000.0, "т тонны тонн тонна ton tons tonne tonnes"),
+    ("mass", 0.45359237, "lb lbs фунта фунтов фунты pound pounds"),
+    ("mass", 0.028349523125, "oz унции унций унция ounce ounces"),
+    ("vol", 1.0, "л литра литров литры l liter liters litre litres"),
+    ("vol", 0.001, "мл миллилитра миллилитров миллилитры ml"),
+    ("vol", 3.785411784, "gal галлона галлонов галлоны gallon gallons"),
+    ("speed", 1.0, "м/с m/s"),
+    ("speed", 1000 / 3600, "км/ч km/h kmh kph"),
+    ("speed", 1609.344 / 3600, "mph миль/ч мили/ч mile/h"),
+    ("data", 1.0, "б байта байтов байт b byte bytes"),
+    ("data", 1024.0, "кб kb kilobyte kilobytes"),
+    ("data", 1024 ** 2, "мб mb megabyte megabytes"),
+    ("data", 1024 ** 3, "гб gb gigabyte gigabytes"),
+    ("data", 1024 ** 4, "тб tb terabyte terabytes"),
+]
+UNITS = {}
+for _group, _factor, _aliases in UNIT_TABLE:
+    for _alias in _aliases.split():
+        UNITS[_alias] = (_group, _factor)
+
+TEMP_KEYS = {"c": "c", "°c": "c", "celsius": "c", "ц": "c", "цельсия": "c",
+             "f": "f", "°f": "f", "fahrenheit": "f", "ф": "f", "фаренгейта": "f",
+             "k": "k", "°k": "k", "kelvin": "k", "к": "k", "кельвина": "k"}
+
+UNIT_SPLIT = re.compile(r"\s*(?:→|->|=>|=)\s*|\s+(?:to|into|в)\s+", re.IGNORECASE)
+# знак перед числом: «-40 F в C». (?<!\d) не даёт сожрать минус из «5-10 миль»
+QTY_RX = re.compile(
+    r"(?P<num>(?<![\d.,])[-+]?\d[\d\s.,]*?)\s*"
+    r"(?P<unit>[A-Za-zА-Яа-яЁё°/][A-Za-zА-Яа-яЁё°/.]*)"
+)
+
+
+def _to_celsius(key, value):
+    if key == "f":
+        return (value - 32) * 5 / 9
+    if key == "k":
+        return value - 273.15
+    return value
+
+
+def _from_celsius(key, celsius):
+    if key == "f":
+        return celsius * 9 / 5 + 32
+    if key == "k":
+        return celsius + 273.15
+    return celsius
+
+
+def _unit_key(token):
+    return token.strip().lower().replace("ё", "е").strip(".!?=,")
+
+
+def _as_unit(key):
+    """Ключ словаря -> {group, conv} либо None."""
+    if key in TEMP_KEYS:
+        return {"group": "temp", "conv": TEMP_KEYS[key]}
+    found = UNITS.get(key)
+    if found is None:
+        return None
+    return {"group": found[0], "conv": found[1]}
+
+
+def _source(chunk):
+    """Ближайшее к концу «число + единица». Их может быть несколько — берём последнее."""
+    best = None
+    for match in QTY_RX.finditer(chunk):
+        unit = _as_unit(_unit_key(match.group("unit")))
+        if unit is None:
+            continue
+        best = (match, unit)
+    if best is None:
+        return None
+    match, unit = best
+    raw = match.group("num").strip()
+    sign = -1.0 if raw.startswith("-") else 1.0
+    try:
+        value, comma = _parse_number(raw.lstrip("-+"))
+    except CalcError:
+        return None
+    result = dict(unit)
+    result.update(
+        {"value": sign * float(value), "comma": comma, "raw": match.group("unit").strip(".")}
+    )
+    return result
+
+
+def _target(chunk):
+    """Единица без числа: «в футы», «km», «в мили/ч»."""
+    for token in re.split(r"[\s,]+", chunk):
+        unit = _as_unit(_unit_key(token))
+        if unit is not None:
+            result = dict(unit)
+            result["raw"] = token.strip().strip(".!?=")
+            return result
+    return None
+
+
+def convert(text):
+    """«5 mi to km», «178 см в футы», «98.6 F в C» -> (результат, None) или (None, причина)."""
+    body = text.strip()
+    marks = list(UNIT_SPLIT.finditer(body))
+    if not marks:
+        return None, "нет связи между единицами (to/в/=)"
+    for mark in marks:
+        left, right = _source(body[: mark.start()]), _target(body[mark.end() :])
+        if left is None or right is None:
+            continue
+        if left["group"] != right["group"]:
+            continue
+        if left["group"] == "temp":
+            value = _from_celsius(
+                right["conv"], _to_celsius(left["conv"], left["value"])
+            )
         else:
-            shown = ("%.10f" % value).rstrip("0").rstrip(".")
-    if comma:
-        shown = shown.replace(".", ",")
-    return shown, None
+            value = left["value"] * left["conv"] / right["conv"]
+        return "%s %s" % (_fmt(value, left["comma"], 6), right["raw"]), None
+    return None, "не знаю такую единицу или это разные величины"
+
+
+# ---------- нестрогий режим: пример среди слов ----------
+
+# заполнители: с ними «но 250*100» считается и без знака «=»
+FILLERS = set(
+    "но и а ну да вот это то короче типа типо щас сейчас итого выходит примерно "
+    "будет сколько стоит цена где там хотя кстати прикинь считай ок надо "
+    "приблизительно вобщем".split()
+) | set(FUNCS) | {"of"}
+MATHY_RX = re.compile(r"\d[\d\s.,%+\-*/^()√∛πxх×·]*")
+# без «=» считаем только явно математическое: умножение/деление/степень/скобки/процент
+STRONG_RX = re.compile(r"[*/^%(]|[xх×·√∛]")
+URLISH_RX = re.compile(r"https?://|www\.|@|[A-Za-z0-9_-]\.[A-Za-z]{2,6}/")
+WORDS_RX = re.compile(r"[A-Za-zА-Яа-яЁё]+")
+
+
+def _fuzzy_run(text, explicit, safe_on):
+    """Самое длинное вычислимое выражение внутри текста со словами."""
+    if URLISH_RX.search(text):
+        return None
+    if not explicit:
+        for word in WORDS_RX.findall(text):
+            if word.lower().replace("ё", "е") not in FILLERS:
+                return None
+    best = None
+    for match in MATHY_RX.finditer(text):
+        run = match.group(0).strip().rstrip(".,")
+        if best is not None and len(run) <= len(best):
+            continue
+        if not explicit and not STRONG_RX.search(run):
+            continue
+        if safe_on and _looks_like_life(run):
+            continue
+        if evaluate(run)[0] is not None:
+            best = run
+    return best
+
+
+def _compose(base, shown):
+    glue = "" if base.endswith("=") else " ="
+    return base + glue + " " + shown
+
+
+def _mentions_unit(text):
+    """Есть ли в тексте хотя бы одно знакомое имя единицы (для честной причины)."""
+    return any(
+        _as_unit(_unit_key(tok)) is not None
+        for tok in re.split(r"[^0-9A-Za-zА-Яа-яё°/]+", text)
+    )
+
+
+def decide(text, safe_on=True):
+    """Вернуть (новый текст, None) либо (None, причина пропуска)."""
+    stripped = text.strip()
+    explicit = "=" in stripped or stripped.endswith("?")
+    shown, error = evaluate(stripped)
+    if shown is not None:
+        life = _looks_like_life(stripped) if safe_on and not explicit else None
+        if life:
+            return None, life
+        return _compose(stripped, shown), None
+    shown, conv_error = convert(stripped)
+    if shown is not None:
+        return _compose(stripped, shown), None
+    run = _fuzzy_run(stripped, explicit, safe_on)
+    if run is not None:
+        shown = evaluate(run)[0]
+        if shown is not None:
+            return _compose(stripped, shown), None
+    if _mentions_unit(stripped):
+        return None, conv_error
+    return None, error
 
 
 # ---------- модуль ----------
@@ -481,18 +703,18 @@ class CalculatorMod(loader.Module):
         for key in [k for k, v in self._undo.items() if v["ts"] < cutoff]:
             self._undo.pop(key, None)
 
-    async def _notify(self, message, text, shown, key):
+    async def _notify(self, message, new_text, key):
         """Всё остальное — только в терминал; в TG летит только форма с откатом."""
         chat = self._logchat()
         if not chat:
             logger.info(
-                "[Calculator] %s = %s (msg %s), но чат логов не задан — .calclogs",
-                text, shown, message.id,
+                "[Calculator] %r (msg %s), но чат логов не задан — .calclogs",
+                new_text, message.id,
             )
             return
         header = (
             "🧮 <b>Calculator</b>\n"
-            f"<code>{utils.escape_html(text)}</code> = <b>{utils.escape_html(shown)}</b>\n"
+            f"<code>{utils.escape_html(new_text)}</code>\n"
             f"💬 <i>{utils.escape_html(self._chat_name(message))}</i>"
         )
         try:
@@ -568,22 +790,11 @@ class CalculatorMod(loader.Module):
             if ts is not None and time.time() - ts < 300:
                 return
             stripped = text.strip()
-            # «=» или «?» на конце = явная просьба посчитать, фильтр молчит
-            if self._get("safe", True) and not stripped.endswith(("=", "?")):
-                life = _looks_like_life(stripped)
-                if life:
-                    logger.debug("[Calculator] пропуск %r: %s", text, life)
-                    return
-
-            shown, error = evaluate(text)
-            if error:
+            new_text, reason = decide(stripped, self._get("safe", True))
+            if new_text is None:
                 # не сработало — это не событие, только в терминал
-                logger.debug("[Calculator] пропуск %r: %s", text, error)
+                logger.debug("[Calculator] пропуск %r: %s", text, reason)
                 return
-
-            base = stripped
-            glue = "" if base.endswith("=") else " ="
-            new_text = base + glue + " " + shown
             if not 0 < len(new_text) <= 4096:
                 return
             try:
@@ -601,8 +812,8 @@ class CalculatorMod(loader.Module):
             self._undo[key] = {
                 "msg": message, "orig": text, "id": message.id, "ts": time.time(),
             }
-            logger.info("[Calculator] %s = %s (msg %s)", base, shown, message.id)
-            await self._notify(message, base, shown, key)
+            logger.info("[Calculator] %r -> %r (msg %s)", text, new_text, message.id)
+            await self._notify(message, new_text, key)
         except Exception as exc:
             logger.exception("[Calculator] watcher error: %r", exc)
 
@@ -628,12 +839,20 @@ class CalculatorMod(loader.Module):
             "<code>.calclogs [чат]</code> — куда кидать кнопку отката\n"
             "<code>.calctest 2,5*4</code> — проверить, ничего не правя\n"
             "<code>.calcundo</code> — откатить последний посчёт\n\n"
-            "Считает <b>только если всё сообщение — пример</b>. Можно: "
-            "<code>+ - * / // % ^ ()</code>, <code>x</code>/<code>х</code>/<code>×</code> "
-            "как умножение, <code>÷</code>, проценты (<code>199+15%</code>, "
-            "<code>20% of 50</code>), <code>sqrt</code>/<code>√</code>/<code>cbrt</code>/"
-            "<code>abs</code>, <code>π</code>, запятая (<code>2,5</code>) и пробелы "
-            "в числах (<code>1 000 000</code>). «=» на конце не обязателен, но можно.",
+            "Можно: <code>+ - * / // % ^ ()</code>, <code>x</code>/<code>х</code>/"
+            "<code>×</code> как умножение, <code>÷</code>, проценты "
+            "(<code>199+15%</code>, <code>20% of 50</code>), <code>sqrt</code>/"
+            "<code>√</code>/<code>cbrt</code>/<code>abs</code>, <code>π</code>, запятая "
+            "(<code>2,5</code>) и пробелы в числах (<code>1 000 000</code>).\n\n"
+            "<b>Слова вокруг.</b> Без знака «=» считается только если всё сообщение — "
+            "пример, либо перед ним слово-заполнитель (<code>но 250*100</code> ➜ "
+            "<code>но 250*100 = 25000</code>). Написал «=» или «?» где угодно — "
+            "вытащу пример из любого текста: <code>итого 15*4 рублей =</code>.\n\n"
+            "<b>Единицы</b> (через <code>to</code>/<code>в</code>/<code>=</code>): "
+            "<code>5 mi to km</code>, <code>178 см в футы</code>, <code>180 lb в кг</code>, "
+            "<code>12 gal в литры</code>, <code>100 км/ч в mph</code>, "
+            "<code>98.6 F в C</code>, <code>1024 mb в гб</code>. Миля/фут/фунт/галлон — "
+            "американские, узкий нет.",
         )
 
     @loader.command(
@@ -683,17 +902,17 @@ class CalculatorMod(loader.Module):
                 message, "❌ Укажи выражение: <code>.calctest 240*15+199</code>"
             )
             return
-        shown, error = evaluate(raw)
-        if error:
+        new_text, reason = decide(raw, self._get("safe", True))
+        if new_text is None:
             await utils.answer(
                 message,
-                f"❌ Не считаю: <code>{utils.escape_html(error)}</code>\n"
+                f"❌ Не считаю: <code>{utils.escape_html(reason)}</code>\n"
                 f"<code>{utils.escape_html(raw.strip())}</code>",
             )
             return
         await utils.answer(
             message,
-            f"<code>{utils.escape_html(raw.strip())}</code> = <b>{utils.escape_html(shown)}</b>",
+            f"Будет так: <code>{utils.escape_html(new_text)}</code>",
         )
 
     @loader.command(
