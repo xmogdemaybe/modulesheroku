@@ -7,7 +7,7 @@ from .. import loader, utils
 class SleepMod(loader.Module):
     """Автоответ в личных сообщениях с БД, расписанием, задержкой и персональными ответами
 
-    мета_девелопер @xmogde
+    dev: @xmogde
     """
 
     strings = {
