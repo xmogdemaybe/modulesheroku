@@ -5,7 +5,6 @@
 # Sources (tried in random order, then fallbacks):
 #   Safebooru / Konachan             -> boorus (safe-only)
 #   Reddit (r/Fumofumo)              -> fallback, anonymous or OAuth (.fumoredditauth)
-#   Flickr                           -> optional, only if API key is set (safe_search=1)
 #
 # Commands:
 #   .fumo on|off                 toggle autoposting
@@ -22,7 +21,6 @@
 #   .fumoredditauth <id> <secret>      Reddit OAuth app credentials (403 fallback)
 #   .fumoredditcookie <cookie>         browser cookie for Reddit (403 fallback)
 #   .fumosub <subreddit>         set subreddit (default Fumofumo)
-#   .fumoflickrkey <key>         set Flickr API key (empty disables Flickr)
 #   .fumotest [source] [count]   post fumo now (optionally from one source)
 #   .fumoreset                   clear sent-images history (settings are kept)
 #   .fumostatus                  show all settings + enabled sources
@@ -74,7 +72,6 @@ MAX_COUNT = 10
 DEFAULT_TAGS = {
     "safebooru": "fumo_(doll)",
     "konachan": "touhou doll",
-    "flickr": "fumo",
 }
 BOORU_SOURCES = ("safebooru", "konachan")
 DEFAULT_SUBREDDIT = "Fumofumo"
@@ -82,13 +79,12 @@ SOURCE_MAP = {
     "safebooru": "_src_safebooru",
     "konachan": "_src_konachan",
     "reddit": "_src_reddit",
-    "flickr": "_src_flickr",
 }
 
 
 @loader.tds
 class FumoQoder(loader.Module):
-    """Random Touhou fumo autoposter (Safebooru / Konachan + Reddit/Flickr fallbacks)"""
+    """Random Touhou fumo autoposter (Safebooru / Konachan + Reddit fallback)"""
 
     strings = {"name": "FumoQoder"}
 
@@ -290,32 +286,6 @@ class FumoQoder(loader.Module):
             })
         return posts
 
-    async def _src_flickr(self) -> list:
-        key = self._get("flickr_key", "")
-        if not key:
-            return []
-        params = {
-            "method": "flickr.photos.search", "api_key": key,
-            "text": self._tags_for("flickr"), "safe_search": "1", "content_type": "1",
-            "media": "photos", "per_page": "100", "format": "json", "nojsoncallback": "1",
-            "extras": "url_o,url_l,url_m,owner_name,tags",
-        }
-        payload = await self._json("https://www.flickr.com/services/rest/", params)
-        photos = (payload or {}).get("photos", {}).get("photo", []) if isinstance(payload, dict) else []
-        posts = []
-        for p in photos:
-            if not isinstance(p, dict):
-                continue
-            img = p.get("url_o") or p.get("url_l") or p.get("url_m")
-            if not img or not self._ext(img):
-                continue
-            posts.append({
-                "id": f"fl_{p.get('id')}", "url": img, "src": "Flickr",
-                "post_url": f"https://www.flickr.com/photos/{p.get('owner')}/{p.get('id')}",
-                "tags": (p.get("tags") or "")[:120],
-            })
-        return posts
-
     @staticmethod
     def _dapi_parse(payload: Any) -> list:
         if isinstance(payload, dict):
@@ -336,12 +306,10 @@ class FumoQoder(loader.Module):
         return getattr(self, SOURCE_MAP[name.lower()])
 
     def _active_sources(self) -> list:
-        """Boorus (shuffled) first, then optional fallbacks: Flickr, Reddit."""
+        """Boorus (shuffled) first, then the optional Reddit fallback."""
         boorus = [self._src_safebooru, self._src_konachan]
         random.shuffle(boorus)
         sources = list(boorus)
-        if self._get("flickr_key", ""):
-            sources.append(self._src_flickr)
         if self._get("reddit", True):
             sources.append(self._src_reddit)
         return sources
@@ -636,14 +604,14 @@ class FumoQoder(loader.Module):
         await utils.answer(message, f"\U0001F4DD <b>Meta footer:</b> {state}")
 
     @loader.command(
-        ru_doc="Теги по источникам: .fumotags <safebooru|konachan|flickr> <теги>; без аргументов — показать",
+        ru_doc="Теги по источникам: .fumotags <safebooru|konachan> <теги>; без аргументов — показать",
         en_doc="Per-source tags: .fumotags <source> <tags>; no args shows current",
     )
     async def fumotags(self, message):
         """Per-source tags: .fumotags <source> <tags>; no args shows all"""
         raw = utils.get_args_raw(message).strip()
         parts = raw.split(None, 1)
-        all_src = BOORU_SOURCES + ("flickr",)
+        all_src = BOORU_SOURCES
         if not parts:
             lines = [f"<code>{s}</code>: {utils.escape_html(self._tags_for(s))}" for s in all_src]
             await utils.answer(message, "\U0001F3F7 <b>Tags per source:</b>\n" + "\n".join(lines))
@@ -703,19 +671,6 @@ class FumoQoder(loader.Module):
         self._set("subreddit", sub or DEFAULT_SUBREDDIT)
         await utils.answer(
             message, f"\U0001F4E1 <b>Subreddit:</b> <code>r/{utils.escape_html(sub or DEFAULT_SUBREDDIT)}</code>"
-        )
-
-    @loader.command(
-        ru_doc="Flickr API-ключ: .fumoflickrkey <key> (пусто — выключить Flickr)",
-        en_doc="Set Flickr API key: .fumoflickrkey <key> (empty disables Flickr)",
-    )
-    async def fumoflickrkey(self, message):
-        """Set the Flickr API key (Flickr stays off until a key is set)"""
-        key = utils.get_args_raw(message).strip()
-        self._set("flickr_key", key)
-        await utils.answer(
-            message, "\U0001F4F7 <b>Flickr enabled.</b>" if key
-            else "\U0001F4F7 <b>Flickr disabled (no key).</b>"
         )
 
     @loader.command(
@@ -821,11 +776,11 @@ class FumoQoder(loader.Module):
         await utils.answer(message, f"\U0001F338 <b>Konachan:</b> <code>konachan.{args}</code>{note}")
 
     @loader.command(
-        ru_doc="Отправить фумо сейчас: .fumotest [safebooru|konachan|reddit|flickr] [count]",
+        ru_doc="Отправить фумо сейчас: .fumotest [safebooru|konachan|reddit] [count]",
         en_doc="Post fumo now: .fumotest [source] [count]",
     )
     async def fumotest(self, message):
-        """Post fumo right now; optional source (safebooru|konachan|reddit|flickr) and count"""
+        """Post fumo right now; optional source (safebooru|konachan|reddit) and count"""
         args = utils.get_args_raw(message).split()
         source, count = None, None
         for a in args[:2]:
@@ -836,7 +791,7 @@ class FumoQoder(loader.Module):
             else:
                 await utils.answer(
                     message, "\u26A0\uFE0F <b>Usage:</b> <code>.fumotest [safebooru|konachan|"
-                    "reddit|flickr] [count]</code>"
+                    "reddit] [count]</code>"
                 )
                 return
         status = await utils.answer(message, "\U0001F50E <b>Fetching fumo...</b>")
@@ -890,8 +845,6 @@ class FumoQoder(loader.Module):
             state = "\U0001F534 disabled"
 
         active = ["safebooru", f"konachan({(self._get('konachan_domain', 'konachan.net') or 'konachan.net').split('.')[-1]})"]
-        if self._get("flickr_key", ""):
-            active.append("flickr")
         if self._get("reddit", True):
             active.append(f"reddit(r/{self._get('subreddit', DEFAULT_SUBREDDIT)})")
 
@@ -935,8 +888,7 @@ class FumoQoder(loader.Module):
             "<code>.fumotags</code> — show tags per source\n"
             "<code>.fumotags safebooru fumo_(doll) touhou</code> — set tags for one source\n"
             "<code>.fumoexclude nude gore</code> — minus-tag blacklist for boorus\n"
-            "<code>.fumokonachan net|com</code> — konachan.net (safe) / konachan.com (R-18, filtered)\n"
-            "<code>.fumoflickrkey &lt;key&gt;</code> — enable Flickr (empty = off)\n\n"
+            "<code>.fumokonachan net|com</code> — konachan.net (safe) / konachan.com (R-18, filtered)\n\n"
             "<b>Reddit</b>\n"
             "<code>.fumoreddit on|off</code> — fallback source\n"
             "<code>.fumosub Fumofumo</code> — subreddit\n"
