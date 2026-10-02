@@ -15,8 +15,8 @@
 # Режимы совпадения (флаги при добавлении):
 #   (без флага)   подстрока, регистр не важен: "да" ловит "да", "Да", "ДА"
 #   -w / --word   только целое слово: "да" НЕ ловит "даже"
-#   -r / --regex  regex-триггер: например "[?&]si=[^&\s]+" вырезает
-#                 трекинг si= из ссылок ютуба (в качестве замены укажи "-")
+#   -r / --regex  regex-триггер: например "\?si=[^&\s]+(?=\s|$)|(?<=\?)si=[^&\s]+&|&si=[^&\s]+"
+#                 вырезает трекинг si= из ссылок ютуба (в качестве замены укажи "-")
 #   -c / --case   учитывать регистр
 #   -n / --neg    не срабатывать после «не»/«нет»/«неа»/«ни» (подстрока/слово):
 #                 «удивлен -n» не тронет «не удивлен», «нет удивлен», «неа удивлен»
@@ -53,6 +53,8 @@ NO_WORDS = ("нет", "no", "-", "неа")
 NEG_PREFIX = r"((?:[нН][еЕ][тТ]|[нН][еЕ][аА]|[нН][иИ]|[нН][еЕ])\s+)?"
 # хвост для -e: дальше до конца сообщения — только не-словá (знаки, эмодзи)
 END_SUFFIX = r"(?=[\W]*$)"
+# символы, по которым подозреваем забытый -r: в обычных триггерах почти не бывают
+REGEX_CHARS = "\\[]{}|*+"
 
 
 @loader.tds
@@ -273,6 +275,16 @@ class TriggerChangerMod(loader.Module):
             flags.append("только в конце")
         flag_str = f" <i>({', '.join(flags)})</i>" if flags else ""
         photo_str = "\n🖼 Картинка: прикреплена" if entry["photo"] else ""
+        # буквальный «[?&]si=...» никогда не совпадёт со ссылкой — напоминаем про -r
+        warn = ""
+        if entry["mode"] != "regex" and any(
+            ch in entry["trigger"] for ch in REGEX_CHARS
+        ):
+            warn = (
+                "\n⚠️ Триггер похож на регулярку, но флаг <code>-r</code> не указан — "
+                "совпадение ищется как обычный текст. Если нужна регулярка: "
+                f"<code>.repdel {entry['id']}</code> и добавь заново с <code>-r</code>."
+            )
         if entry["repl"] is None:
             repl_str = "<i>(без текста)</i>"
         elif entry["repl"] == "":
@@ -282,7 +294,7 @@ class TriggerChangerMod(loader.Module):
         await utils.answer(
             message,
             f"✅ Добавлено <code>#{entry['id']}</code>{flag_str}\n"
-            f"<code>{utils.escape_html(entry['trigger'])}</code> ➜ {repl_str}{photo_str}",
+            f"<code>{utils.escape_html(entry['trigger'])}</code> ➜ {repl_str}{photo_str}{warn}",
         )
 
     async def _wizard_step(self, message, text):
@@ -399,7 +411,10 @@ class TriggerChangerMod(loader.Module):
             "<code>-c</code> регистр, <code>-n</code> не после «не»/«нет»/«неа»/«ни», "
             "<code>-e</code> только в конце сообщения.\n"
             "Пример: <code>.repadd да</code>, в ответ пишешь <code>da✅</code> — и каждое «да» "
-            "в твоих сообщениях станет <code>da✅</code> сразу после отправки.",
+            "в твоих сообщениях станет <code>da✅</code> сразу после отправки.\n"
+            "Regex-пример: <code>.repadd \\?si=[^&amp;\\s]+(?=\\s|$)|"
+            "(?&lt;=\\?)si=[^&amp;\\s]+&amp;|&amp;si=[^&amp;\\s]+ -r</code>, замена "
+            "<code>-</code> — вырезает трекинг <code>si=</code> из ютуб-ссылок.",
         )
 
     @loader.command(
@@ -514,6 +529,10 @@ class TriggerChangerMod(loader.Module):
             flag_str = f" <code>[{flags}]</code>" if flags else ""
             photo = " 🖼" if entry.get("photo") else ""
             trig = utils.escape_html(entry.get("trigger", ""))
+            suspect = entry.get("mode", "sub") != "regex" and any(
+                ch in entry.get("trigger", "") for ch in REGEX_CHARS
+            )
+            warn = " ⚠️ <i>похоже на regex без -r</i>" if suspect else ""
             raw_repl = entry.get("repl")
             if raw_repl is None:
                 repl = "<i>(без текста)</i>"
@@ -522,7 +541,7 @@ class TriggerChangerMod(loader.Module):
             else:
                 repl = utils.escape_html(raw_repl)
             lines.append(
-                f"<code>#{entry['id']}</code>{flag_str}{photo} {trig} ➜ {repl}"
+                f"<code>#{entry['id']}</code>{flag_str}{photo} {trig} ➜ {repl}{warn}"
             )
         header = "📋 <b>Правила автозамены</b>"
         if pages > 1:
