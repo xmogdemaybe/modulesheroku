@@ -35,6 +35,7 @@ import asyncio
 import base64
 import logging
 import os
+import re
 from typing import Any, Optional
 
 import aiohttp
@@ -86,6 +87,36 @@ DEFAULT_QUERY = {
     "audio": "Расшифруй это аудиосообщение дословно.",
     "document": "Что это за файл и о чём он?",
 }
+
+# «3.7» / «3.8-flash» → «gemini-3.7-flash» и т.п. Полные имена не трогаем.
+_MODEL_BARE = re.compile(r"^\d+(?:\.\d+)?(?:-[a-z0-9]+)?$", re.I)
+# 503 «high demand» / 429 «quota» = ключ валиден (авторизация прошла), модель просто занята.
+_TRANSIENT_WORDS = (
+    "high demand", "quota", "rate limit", "rate-limit", "too many requests",
+    "overloaded", "unavailable", "try again later", "capacity", "temporarily",
+    "resource_exhausted", "resource exhausted",
+)
+
+
+def normalize_model(name: str) -> str:
+    n = (name or "").strip()
+    if not n or n.lower().startswith("gemini") or n.startswith("models/"):
+        return n
+    if _MODEL_BARE.match(n):
+        if "-" not in n:
+            n += "-flash"
+        return "gemini-" + n
+    return n
+
+
+def friendly_error(status: int, msg: str) -> str:
+    """Добавляет RU-подсказку к временным ошибкам (перегруз/лимит)."""
+    blob = f"{status} {msg}".lower()
+    if status in (429, 500, 503, 504) or any(w in blob for w in _TRANSIENT_WORDS):
+        return (f"{msg}\n\n⚠️ Модель перегружена или исчерпан лимит запросов — это "
+                f"временно, ключ тут ни при чём. Попробуй позже или смени модель: "
+                f"<code>.gmodel &lt;имя&gt;</code>.")
+    return msg
 
 
 class GeminiError(Exception):
@@ -152,7 +183,7 @@ class GeminiAI(loader.Module):
         return (self._get("prompt", "") or "").strip()
 
     def _model(self) -> str:
-        return (self._get("model", "") or "").strip() or DEFAULT_MODEL
+        return normalize_model(self._get("model", "") or "") or DEFAULT_MODEL
 
     # ---------- media ----------
 
@@ -267,26 +298,28 @@ class GeminiAI(loader.Module):
         session = await self._http()
         headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
         last_data: dict = {}
+        last_status = 0
         for attempt in (1, 2):
             async with session.post(url, json=body, headers=headers) as resp:
+                last_status = resp.status
                 try:
                     last_data = await resp.json()
                 except Exception:
                     last_data = {}
-                if resp.status == 429 and attempt == 1:
+                if resp.status in (429, 500, 503, 504) and attempt == 1:
                     try:
                         retry = int(resp.headers.get("Retry-After", "5"))
                     except ValueError:
                         retry = 5
-                    logger.warning("[GeminiAI] 429, retry in %ss", retry)
+                    logger.warning("[GeminiAI] %s, retry in %ss", resp.status, retry)
                     await asyncio.sleep(min(max(retry, 1), 30))
                     continue
                 if resp.status != 200:
                     err = (last_data.get("error") or {}).get("message") or f"HTTP {resp.status}"
-                    raise GeminiError(err)
+                    raise GeminiError(friendly_error(resp.status, err))
                 return last_data
-        err = (last_data.get("error") or {}).get("message") or "HTTP 429"
-        raise GeminiError(err)
+        err = (last_data.get("error") or {}).get("message") or f"HTTP {last_status or 429}"
+        raise GeminiError(friendly_error(last_status or 429, err))
 
     async def _ask(self, parts: list, chat_id: int, key: str) -> str:
         body: dict = {"model": self._model(), "input": parts}
@@ -318,7 +351,7 @@ class GeminiAI(loader.Module):
             errors = data.get("errors") or []
             msg = (errors[0].get("message") if errors and isinstance(errors[0], dict) else "") \
                 or "запрос не удался"
-            raise GeminiError(msg)
+            raise GeminiError(friendly_error(0, msg))
 
         text = self._extract_text(data)
         if not text:
@@ -565,13 +598,14 @@ class GeminiAI(loader.Module):
         """Show or set the model"""
         args = utils.get_args_raw(message).strip()
         if args:
-            self._set("model", args)
-            await utils.answer(message, f"✅ Модель: <code>{utils.escape_html(args)}</code>")
+            norm = normalize_model(args)
+            self._set("model", norm)
+            await utils.answer(message, f"✅ Модель: <code>{utils.escape_html(norm)}</code>")
         else:
             await utils.answer(
                 message,
                 f"ℹ️ Модель: <code>{utils.escape_html(self._model())}</code>\n"
-                "Сменить: <code>.gmodel gemini-3.7-flash</code>",
+                "Сменить: <code>.gmodel gemini-3.7-flash</code> (или просто <code>.gmodel 3.7</code>)",
             )
 
     @loader.command(
