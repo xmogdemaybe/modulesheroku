@@ -45,6 +45,7 @@ import html
 import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -72,6 +73,21 @@ POLL_TIMEOUT = 240
 TEST_POLL_TIMEOUT = 60
 
 SEP = "──────────"
+
+# «3.7» / «3.8-flash» → «gemini-3.7-flash» и т.п. Полные имена не трогаем.
+_MODEL_BARE = re.compile(r"^\d+(?:\.\d+)?(?:-[a-z0-9]+)?$", re.I)
+
+# 503 «high demand» и 429 «quota» значат, что авторизация ПРОШЛА и ключ валиден,
+# просто модель перегружена/лимит. Это не «плохой ключ».
+TRANSIENT_WORDS = (
+    "high demand", "quota", "rate limit", "rate-limit", "too many requests",
+    "overloaded", "unavailable", "try again later", "capacity", "temporarily",
+    "resource_exhausted", "resource exhausted",
+)
+TRANSIENT_HINT = (
+    "модель перегружена или исчерпан лимит запросов (high demand / quota). "
+    "Это временно и НЕ значит, что ключ плохой"
+)
 
 NO_KEY_TEXT = (
     "🔑 <b>Сначала привяжи свой Gemini API-ключ</b> — просто отправь его следующим "
@@ -280,8 +296,25 @@ def system_instruction_for(user: dict) -> str:
     return (user.get("prompt") or "").strip()
 
 
+def normalize_model(name: str) -> str:
+    """«3.7» → «gemini-3.7-flash», «3.8-flash» → «gemini-3.8-flash»; полные имена как есть."""
+    n = (name or "").strip()
+    if not n or n.lower().startswith("gemini") or n.startswith("models/"):
+        return n
+    if _MODEL_BARE.match(n):
+        if "-" not in n:
+            n += "-flash"
+        return "gemini-" + n
+    return n
+
+
+def is_transient_msg(msg: str) -> bool:
+    blob = (msg or "").lower()
+    return any(w in blob for w in TRANSIENT_WORDS)
+
+
 def model_for(user: dict) -> str:
-    return (user.get("model") or "").strip() or DEFAULT_MODEL
+    return normalize_model(user.get("model") or "") or DEFAULT_MODEL
 
 
 def extract_text(data: dict) -> str:
@@ -307,6 +340,26 @@ def _poll_interaction(key: str, iid: str, status: str, data: dict, timeout: int)
     return data
 
 
+def classify_error(status_code: int, data: dict) -> tuple:
+    """(kind, message): kind = 'invalid_key' | 'transient' | 'other'.
+
+    'transient' (429/500/503/504, high demand, quota) = авторизация прошла, ключ
+    валиден, просто модель перегружена/лимит. 'invalid_key' — ключ реально плохой.
+    """
+    err = (data or {}).get("error") or {}
+    message = err.get("message") or f"HTTP {status_code}"
+    status = str(err.get("status") or "").upper()
+    blob = f"{message} {status}".lower()
+    if (status_code in (401, 403)
+            or "api key not valid" in blob or "api_key_invalid" in blob
+            or "invalid api key" in blob or "key not valid" in blob
+            or "permission_denied" in blob):
+        return "invalid_key", message
+    if status_code in (429, 500, 503, 504) or is_transient_msg(blob):
+        return "transient", message
+    return "other", message
+
+
 def _check_status(data: dict) -> str:
     """Возвращает текст ответа или кидает GeminiError по статусу interaction."""
     status = data.get("status", "")
@@ -314,6 +367,8 @@ def _check_status(data: dict) -> str:
         errors = data.get("errors") or []
         msg = (errors[0].get("message") if errors and isinstance(errors[0], dict) else "") \
             or "запрос не удался"
+        if is_transient_msg(msg):
+            msg += "\n\n⚠️ Модель перегружена/лимит — попробуй позже или смени: /model <имя>."
         raise GeminiError(msg)
     text = extract_text(data)
     if not text:
@@ -321,26 +376,37 @@ def _check_status(data: dict) -> str:
     return text
 
 
-def test_key(key: str) -> str:
-    """Проверяет ключ реальным мини-запросом. Возвращает тест-ответ модели."""
+def test_key(key: str, model: str = "") -> tuple:
+    """Мини-запрос для проверки ключа. Возвращает (kind, detail):
+    'ok' (detail — ответ модели) | 'transient' | 'invalid_key' | 'other' | 'network'.
+    Один запрос — не жжёт квоту ретраями.
+    """
+    model = normalize_model(model) or DEFAULT_MODEL
     body = {
-        "model": DEFAULT_MODEL,
+        "model": model,
         "input": "Ответь одним словом: OK",
         "store": False,
         "generation_config": {"max_output_tokens": 8},
     }
-    resp = requests.post(f"{API_BASE}/interactions", json=body,
-                         headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                         timeout=REQUEST_TIMEOUT)
+    try:
+        resp = requests.post(f"{API_BASE}/interactions", json=body,
+                             headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                             timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        return "network", f"{type(exc).__name__}: {exc}"
     try:
         data = resp.json()
     except ValueError:
         data = {}
     if resp.status_code != 200:
-        err = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
-        raise GeminiError(err)
+        return classify_error(resp.status_code, data)
     data = _poll_interaction(key, data.get("id", ""), data.get("status", ""), data, TEST_POLL_TIMEOUT)
-    return _check_status(data)
+    if data.get("status", "") == "failed":
+        errors = data.get("errors") or []
+        msg = (errors[0].get("message") if errors and isinstance(errors[0], dict) else "") \
+            or "запрос не удался"
+        return ("transient" if is_transient_msg(msg) else "other"), msg
+    return "ok", (extract_text(data) or "(ключ сработал, но ответ пустой)")
 
 
 def looks_like_key(text: str) -> bool:
@@ -374,19 +440,20 @@ def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
             data = resp.json()
         except ValueError:
             data = {}
-        if resp.status_code == 429 and attempt == 1:
+        if resp.status_code in (429, 500, 503, 504) and attempt == 1:
             try:
                 wait = min(max(int(resp.headers.get("Retry-After", "5")), 1), 30)
             except ValueError:
                 wait = 5
-            logger.warning("429, retry in %ss", wait)
+            logger.warning("%s, retry in %ss", resp.status_code, wait)
             time.sleep(wait)
             continue
         break
 
     if resp is None or resp.status_code != 200:
-        err = ((data or {}).get("error") or {}).get("message") or \
-            f"HTTP {resp.status_code if resp is not None else '?'}"
+        kind, err = classify_error(resp.status_code if resp is not None else 0, data or {})
+        if kind == "transient":
+            err += "\n\n⚠️ Модель перегружена/лимит — попробуй позже или смени: /model <имя>."
         raise GeminiError(err)
 
     data = _poll_interaction(key, data.get("id", ""), data.get("status", ""), data, POLL_TIMEOUT)
@@ -537,31 +604,55 @@ def create_bot(token: str) -> telebot.TeleBot:
             logger.exception("failed to send error")
 
     def try_save_key(message, key: str):
-        """Валидирует ключ тест-запросом к Gemini и сохраняет на юзера."""
+        """Валидирует ключ тест-запросом к Gemini и сохраняет на юзера.
+
+        Ключ СОХРАНЯЕТСЯ даже если модель перегружена (503/429): это значит, что
+        авторизация прошла и ключ валиден. Отклоняем только реально невалидный ключ
+        (401/403/API key not valid) и когда до Gemini вовсе не достучаться (гео/прокси).
+        """
         uid = message.from_user.id
-        status = bot.reply_to(message, "🔑 Проверяю ключ тест-запросом к Gemini…")
-        try:
-            test_answer = test_key(key)
-        except GeminiError as exc:
-            logger.warning("key check failed for %s: %s", uid, exc)
+        model = model_for(get_user(uid))
+        status = bot.reply_to(message, f"🔑 Проверяю ключ тест-запросом к Gemini (<code>{esc(model)}</code>)…")
+        kind, detail = test_key(key, model)
+
+        if kind == "invalid_key":
+            logger.warning("invalid key for %s: %s", uid, detail)
             bot.edit_message_text(
-                f"❌ <b>Ключ не работает:</b> {esc(exc)}\n\nПришли другой ключ "
+                f"❌ <b>Ключ не принят:</b> {esc(detail)}\n\nПришли другой ключ "
                 f"сообщением или через /key &lt;ключ&gt;.",
                 message.chat.id, status.message_id)
             return
-        except Exception as exc:
-            logger.exception("key check error")
+
+        if kind == "network":
+            logger.warning("key check network error for %s: %s", uid, detail)
             bot.edit_message_text(
-                f"❌ Не смог проверить ключ ({esc(type(exc).__name__)}). "
-                f"Проверь интернет/прокси и пришли ключ ещё раз.",
+                f"❌ <b>Не достучаться до Gemini:</b> {esc(detail)}\n"
+                f"Это проблема доступа, а не ключа. Включи VPN/прокси "
+                f"(поле <code>proxy</code> в config.json) и пришли ключ ещё раз.",
                 message.chat.id, status.message_id)
             return
+
+        # ok / transient / other → авторизация прошла, ключ сохраняем
         set_user(uid, "api_key", key)
-        bot.edit_message_text(
-            f"✅ <b>Ключ сохранён и проверен!</b>\n"
-            f"Тест-ответ Gemini: <i>{esc(test_answer[:200])}</i>\n\n"
-            f"Теперь просто напиши вопрос или кинь фото/войс. /help — команды.",
-            message.chat.id, status.message_id)
+        if kind == "ok":
+            bot.edit_message_text(
+                f"✅ <b>Ключ сохранён и проверен!</b>\n"
+                f"Тест-ответ Gemini: <i>{esc(str(detail)[:200])}</i>\n\n"
+                f"Теперь просто напиши вопрос или кинь фото/войс. /help — команды.",
+                message.chat.id, status.message_id)
+        elif kind == "transient":
+            bot.edit_message_text(
+                f"✅ <b>Ключ сохранён</b> (авторизация прошла).\n"
+                f"⚠️ Тест-ответ не получен: {esc(TRANSIENT_HINT)}.\n\n"
+                f"Попробуй через минуту или смени модель: <code>/model 3.7</code>.\n"
+                f"Детали: <i>{esc(str(detail)[:200])}</i>",
+                message.chat.id, status.message_id)
+        else:  # other
+            bot.edit_message_text(
+                f"✅ <b>Ключ сохранён</b> (авторизация прошла).\n"
+                f"⚠️ Тест-запрос вернул: <i>{esc(str(detail)[:200])}</i>\n"
+                f"Если модель задана криво — поправь: <code>/model &lt;имя&gt;</code>.",
+                message.chat.id, status.message_id)
 
     def handle_command(message, cmd, args):
         uid = message.from_user.id
@@ -637,11 +728,12 @@ def create_bot(token: str) -> telebot.TeleBot:
 
         elif cmd == "model":
             if args:
-                set_user(uid, "model", args)
-                bot.reply_to(message, f"✅ Модель: <code>{esc(args)}</code>")
+                norm = normalize_model(args)
+                set_user(uid, "model", norm)
+                bot.reply_to(message, f"✅ Модель: <code>{esc(norm)}</code>")
             else:
                 bot.reply_to(message, f"ℹ️ Модель: <code>{esc(model_for(user))}</code>\n"
-                             "Сменить: /model gemini-3.7-flash")
+                             "Сменить: /model gemini-3.7-flash (или просто /model 3.7)")
 
         elif cmd == "chat":
             state = args.lower()
