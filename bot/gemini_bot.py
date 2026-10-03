@@ -1,24 +1,31 @@
 # -*- coding: utf-8 -*-
 # Gemini Bot — Telegram-бот (Bot API, БЕЗ MTProto) с Gemini внутри.
 #
-# Другу, который не может держать юзербота: это обычный бот, созданный через
-# @BotFather. Шлёшь ему текст / фото / войс / видео / доку — он отвечает
-# сообщением: твой запрос сверху, «──────────», ответ Gemini ниже (бот
-# редактирует СВОЁ сообщение, пока «думает»).
+# Каждый юзер привязывает СВОЙ Gemini API-ключ: при первом сообщении бот
+# просит ключ, проверяет его реальным тест-запросом к Gemini и сохраняет в
+# базу. Без ключа бот не отвечает — только просит его прислать.
 #
-# Запуск:
-#   export BOT_TOKEN="токен от @BotFather"
-#   export GEMINI_API_KEY="ключ Gemini"   # общий ключ для всех (или каждый юзер задаёт свой через /key)
-#   export HTTPS_PROXY="http://127.0.0.1:1080"  # если Telegram/Gemini блокируются (РФ)
+# Первый запуск (никаких export не нужно):
+#   pip install pyTelegramBotAPI requests
 #   python gemini_bot.py
+# Бот сам спросит токен в терминале (получить у @BotFather → /newbot) и
+# сохранит его в config.json рядом со скриптом. Остановка — Ctrl+C (чистый
+# выход без трейсбеков).
+#
+# config.json (создаётся автоматически, права 600):
+#   {
+#     "bot_token": "123456:ABC...",   # обязателен (спросится при запуске)
+#     "proxy": "http://127.0.0.1:1080",  # если TG/Gemini блокируются (РФ)
+#     "db_path": "/путь/gemini_bot.db"   # необязательно
+#   }
 #
 # ВАЖНО про гео: с российских IP api.telegram.org и generativelanguage.googleapis.com
-# могут не отвечать. Бот должен крутиться там, где оба хоста доступны: VPS за
-# рубежом, или включённый VPN/прокси (HTTPS_PROXY подхватывается автоматически).
+# могут не отвечать — тогда впиши "proxy" в config.json (VPN/прокси) или крути
+# бота на зарубежном VPS.
 #
 # Команды:
 #   /start, /help        справка
-#   /key <ключ>          свой Gemini API-ключ (иначе используется общий из env)
+#   /key <ключ>          сменить свой Gemini API-ключ (проверяется тест-запросом)
 #   /prompt <текст>      системный промпт (без аргумента — показать)
 #   /save <имя> <текст>  именованный промпт
 #   /prompts             список именованных промптов
@@ -28,18 +35,19 @@
 #   /chat [on|off]       память диалога (Gemini помнит прошлые реплики)
 #   /clear               сбросить память в этом чате
 #
-# База: SQLite (файл gemini_bot.db рядом со скриптом, путь — env DB_PATH).
-# Настройки и промпты — свои на каждого юзера; память диалога — на пару
-# (чат, юзер). История переписки при /chat on живёт на серверах Google
-# (previous_interaction_id), локально хранится только id последнего ответа.
-#
-# Логи — только в терминал. В чат уходят лишь ответы и сообщения об ошибках.
+# База: SQLite (gemini_bot.db рядом со скриптом). Ключи, промпты, модель и
+# память — свои на каждого юзера (user_id). История переписки при /chat on
+# живёт на серверах Google (previous_interaction_id), локально только id.
+# Логи — в терминал, в чат уходят только ответы и ошибки.
 
 import base64
 import html
+import json
 import logging
 import os
+import signal
 import sqlite3
+import sys
 import time
 
 import requests
@@ -47,17 +55,31 @@ import telebot
 
 logger = logging.getLogger("gemini_bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# telebot любит спамить «Warning: this message appearance will be changed...»
+# и служебным INFO — глушим, в консоли оставляем только своё и ошибки.
+logging.getLogger("telebot").setLevel(logging.ERROR)
 
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-3.8-flash"
-DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_bot.db"))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+DB_PATH = os.path.join(BASE_DIR, "gemini_bot.db")
 MAX_FILE = 20 * 1024 * 1024   # лимит скачивания Bot API = лимит инлайн-данных Gemini
 MAX_TEXT_DOC = 100_000        # символы для текстовых файлов
 ANSWER_LIMIT = 3_800          # лимит сообщения TG 4096, с запасом на оформление
 REQUEST_TIMEOUT = (15, 300)   # (connect, read): thinking-модели отвечают долго
 POLL_TIMEOUT = 240
+TEST_POLL_TIMEOUT = 60
 
 SEP = "──────────"
+
+NO_KEY_TEXT = (
+    "🔑 <b>Сначала привяжи свой Gemini API-ключ</b> — просто отправь его следующим "
+    "сообщением (выглядит как <code>AIza...</code>).\n\n"
+    "Где взять: зайди с VPN на <code>aistudio.google.com</code> → <b>Get API key</b> → "
+    "<b>Create API key</b> и скопируй его сюда.\n\n"
+    "Ключ проверю тест-запросом и сохраню в базу — он твой личный, у каждого своя связка."
+)
 
 IMAGE_MIMES = {
     "image/png", "image/jpeg", "image/webp", "image/heic", "image/heif",
@@ -93,6 +115,55 @@ class GeminiError(Exception):
 
 def esc(text) -> str:
     return html.escape(str(text), quote=False)
+
+
+# ---------- конфиг ----------
+
+def load_config() -> dict:
+    if not os.path.exists(CONFIG_PATH):
+        return {}
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (ValueError, OSError):
+        logger.warning("config.json повреждён — начинаю с пустого")
+        return {}
+
+
+def save_config(cfg: dict):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    try:
+        os.chmod(CONFIG_PATH, 0o600)  # внутри токен — не для чужих глаз
+    except OSError:
+        pass
+
+
+def ensure_token(cfg: dict) -> str:
+    token = (cfg.get("bot_token") or "").strip()
+    if token:
+        return token
+    print("Токен бота не найден в config.json.")
+    print("Получи его у @BotFather: /newbot → имя → username → токен.")
+    token = input("Вставь токен сюда и нажми Enter: ").strip()
+    if not token:
+        raise SystemExit("Без токена запускать нечего — пока.")
+    cfg["bot_token"] = token
+    save_config(cfg)
+    print(f"Токен сохранён в {CONFIG_PATH} (больше спрашивать не буду).")
+    return token
+
+
+def apply_proxy(cfg: dict):
+    proxy = (cfg.get("proxy") or "").strip()
+    if not proxy:
+        return
+    # requests (запросы к Gemini) берёт прокси из env, telebot — из apihelper
+    os.environ["HTTPS_PROXY"] = proxy
+    os.environ["HTTP_PROXY"] = proxy
+    telebot.apihelper.proxy = {"https": proxy, "http": proxy}
+    logger.info("proxy: %s", proxy)
 
 
 # ---------- база ----------
@@ -196,10 +267,8 @@ def clear_ctx(chat_id: int, user_id: int):
 # ---------- gemini ----------
 
 def api_key_for(user: dict) -> str:
-    key = (user.get("api_key") or "").strip()
-    if key:
-        return key
-    return (os.environ.get("GEMINI_API_KEY", "") or "").strip()
+    # Ключ строго свой у каждого юзера (из базы), общих ключей из env больше нет.
+    return (user.get("api_key") or "").strip()
 
 
 def system_instruction_for(user: dict) -> str:
@@ -226,10 +295,63 @@ def extract_text(data: dict) -> str:
     return "\n".join(chunks).strip()
 
 
+def _poll_interaction(key: str, iid: str, status: str, data: dict, timeout: int) -> dict:
+    waited = 0
+    while status in ("in_progress", "queued") and iid and waited < timeout:
+        time.sleep(3 if timeout > 60 else 2)
+        waited += 3 if timeout > 60 else 2
+        r = requests.get(f"{API_BASE}/interactions/{iid}",
+                         headers={"x-goog-api-key": key}, timeout=REQUEST_TIMEOUT)
+        data = r.json()
+        status = data.get("status", status)
+    return data
+
+
+def _check_status(data: dict) -> str:
+    """Возвращает текст ответа или кидает GeminiError по статусу interaction."""
+    status = data.get("status", "")
+    if status == "failed":
+        errors = data.get("errors") or []
+        msg = (errors[0].get("message") if errors and isinstance(errors[0], dict) else "") \
+            or "запрос не удался"
+        raise GeminiError(msg)
+    text = extract_text(data)
+    if not text:
+        raise GeminiError("Gemini вернул пустой ответ (возможно, сработал фильтр)")
+    return text
+
+
+def test_key(key: str) -> str:
+    """Проверяет ключ реальным мини-запросом. Возвращает тест-ответ модели."""
+    body = {
+        "model": DEFAULT_MODEL,
+        "input": "Ответь одним словом: OK",
+        "store": False,
+        "generation_config": {"max_output_tokens": 8},
+    }
+    resp = requests.post(f"{API_BASE}/interactions", json=body,
+                         headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                         timeout=REQUEST_TIMEOUT)
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    if resp.status_code != 200:
+        err = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+        raise GeminiError(err)
+    data = _poll_interaction(key, data.get("id", ""), data.get("status", ""), data, TEST_POLL_TIMEOUT)
+    return _check_status(data)
+
+
+def looks_like_key(text: str) -> bool:
+    t = (text or "").strip()
+    return 15 <= len(t) <= 200 and not any(c.isspace() for c in t)
+
+
 def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
     key = api_key_for(user)
     if not key:
-        raise GeminiError("API-ключ не задан: /key <ключ> (или общий через env GEMINI_API_KEY)")
+        raise GeminiError("API-ключ не задан: пришли его сообщением или /key <ключ>")
 
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
     body = {"model": model_for(user), "input": parts}
@@ -244,6 +366,7 @@ def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
             body["previous_interaction_id"] = prev
 
     data = None
+    resp = None
     for attempt in (1, 2):
         resp = requests.post(f"{API_BASE}/interactions", json=body, headers=headers,
                              timeout=REQUEST_TIMEOUT)
@@ -259,34 +382,17 @@ def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
             logger.warning("429, retry in %ss", wait)
             time.sleep(wait)
             continue
-        if resp.status_code != 200:
-            err = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
-            raise GeminiError(err)
         break
-    else:
-        raise GeminiError((data.get("error") or {}).get("message") or "HTTP 429")
 
-    status, iid = data.get("status", ""), data.get("id", "")
-    waited = 0
-    while status in ("in_progress", "queued") and iid and waited < POLL_TIMEOUT:
-        time.sleep(3)
-        waited += 3
-        r = requests.get(f"{API_BASE}/interactions/{iid}",
-                         headers={"x-goog-api-key": key}, timeout=REQUEST_TIMEOUT)
-        data = r.json()
-        status = data.get("status", status)
+    if resp is None or resp.status_code != 200:
+        err = ((data or {}).get("error") or {}).get("message") or \
+            f"HTTP {resp.status_code if resp is not None else '?'}"
+        raise GeminiError(err)
 
-    if status == "failed":
-        errors = data.get("errors") or []
-        msg = (errors[0].get("message") if errors and isinstance(errors[0], dict) else "") \
-            or "запрос не удался"
-        raise GeminiError(msg)
-
-    text = extract_text(data)
-    if not text:
-        raise GeminiError("Gemini вернул пустой ответ (возможно, сработал фильтр)")
-    if ctx_on and iid:
-        set_ctx(chat_id, user["user_id"], iid)
+    data = _poll_interaction(key, data.get("id", ""), data.get("status", ""), data, POLL_TIMEOUT)
+    text = _check_status(data)
+    if ctx_on and data.get("id"):
+        set_ctx(chat_id, user["user_id"], data["id"])
     return text
 
 
@@ -409,7 +515,7 @@ HELP_TEXT = (
     "Просто напиши текст, либо кинь фото/войс/видео/документ (можно с подписью-"
     "вопросом, можно отвечать сообщением на медиа).\n\n"
     "<b>Команды:</b>\n"
-    "/key &lt;ключ&gt; — свой Gemini API-ключ\n"
+    "/key &lt;ключ&gt; — сменить свой Gemini API-ключ\n"
     "/prompt &lt;текст&gt; — системный промпт\n"
     "/save &lt;имя&gt; &lt;текст&gt; — именованный промпт\n"
     "/prompts — список промптов\n"
@@ -422,13 +528,6 @@ HELP_TEXT = (
 
 
 def create_bot(token: str) -> telebot.TeleBot:
-    # Прокси для РФ: requests сам подхватит HTTPS_PROXY из env, а telebot
-    # (polling/getFile) ходит через apihelper — ему прокси задаётся отдельно.
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-    if proxy:
-        telebot.apihelper.proxy = {"https": proxy, "http": os.environ.get("HTTP_PROXY", "")}
-        logger.info("proxy configured: %s", proxy)
-
     bot = telebot.TeleBot(token, threaded=True, parse_mode="HTML")
 
     def answer_error(message, text):
@@ -437,21 +536,54 @@ def create_bot(token: str) -> telebot.TeleBot:
         except Exception:
             logger.exception("failed to send error")
 
+    def try_save_key(message, key: str):
+        """Валидирует ключ тест-запросом к Gemini и сохраняет на юзера."""
+        uid = message.from_user.id
+        status = bot.reply_to(message, "🔑 Проверяю ключ тест-запросом к Gemini…")
+        try:
+            test_answer = test_key(key)
+        except GeminiError as exc:
+            logger.warning("key check failed for %s: %s", uid, exc)
+            bot.edit_message_text(
+                f"❌ <b>Ключ не работает:</b> {esc(exc)}\n\nПришли другой ключ "
+                f"сообщением или через /key &lt;ключ&gt;.",
+                message.chat.id, status.message_id)
+            return
+        except Exception as exc:
+            logger.exception("key check error")
+            bot.edit_message_text(
+                f"❌ Не смог проверить ключ ({esc(type(exc).__name__)}). "
+                f"Проверь интернет/прокси и пришли ключ ещё раз.",
+                message.chat.id, status.message_id)
+            return
+        set_user(uid, "api_key", key)
+        bot.edit_message_text(
+            f"✅ <b>Ключ сохранён и проверен!</b>\n"
+            f"Тест-ответ Gemini: <i>{esc(test_answer[:200])}</i>\n\n"
+            f"Теперь просто напиши вопрос или кинь фото/войс. /help — команды.",
+            message.chat.id, status.message_id)
+
     def handle_command(message, cmd, args):
         uid = message.from_user.id
         user = get_user(uid)
 
         if cmd in ("start", "help"):
-            bot.reply_to(message, HELP_TEXT)
+            if not api_key_for(user):
+                bot.reply_to(message, HELP_TEXT + "\n\n" + NO_KEY_TEXT)
+            else:
+                bot.reply_to(message, HELP_TEXT)
 
         elif cmd == "key":
-            if args:
-                set_user(uid, "api_key", args)
-                bot.reply_to(message, f"🔑 Ключ сохранён: <code>{esc(args[:8])}…</code>")
+            if args and looks_like_key(args):
+                try_save_key(message, args.strip())
+            elif args:
+                bot.reply_to(message, "❌ Это не похоже на ключ (без пробелов, 15+ символов).")
             else:
-                shown = "свой" if (user.get("api_key") or "").strip() else \
-                    ("общий (env)" if os.environ.get("GEMINI_API_KEY") else "НЕ задан")
-                bot.reply_to(message, f"🔑 Ключ: {shown}. Задать свой: /key &lt;ключ&gt;")
+                has = bool(api_key_for(user))
+                bot.reply_to(
+                    message,
+                    f"🔑 Свой ключ: {'привязан ✅' if has else 'НЕ привязан ❌'}\n"
+                    f"Задать/сменить: /key &lt;ключ&gt; или просто отправь ключ сообщением.")
 
         elif cmd == "prompt":
             if args:
@@ -536,10 +668,14 @@ def create_bot(token: str) -> telebot.TeleBot:
         """Любое не-командное сообщение: текст/медиа → Gemini."""
         uid = message.from_user.id if message.from_user else 0
         user = get_user(uid)
+
+        # нет ключа — любое текстовое сообщение считается попыткой его ввести
         if not api_key_for(user):
-            answer_error(message, "API-ключ не задан. /key &lt;ключ&gt; (aistudio.google.com → "
-                         "Get API key, нужен VPN с поддерживаемого региона) "
-                         "или попроси владельца задать общий env GEMINI_API_KEY.")
+            text = (message.text or "").strip()
+            if text and looks_like_key(text):
+                try_save_key(message, text)
+            else:
+                bot.reply_to(message, NO_KEY_TEXT)
             return
 
         # медиа: в самом сообщении или в том, на которое отвечают
@@ -635,15 +771,35 @@ def create_bot(token: str) -> telebot.TeleBot:
 
 
 def main():
-    token = os.environ.get("BOT_TOKEN", "").strip()
-    if not token:
-        raise SystemExit('BOT_TOKEN не задан. Получи токен у @BotFather и запусти:\n'
-                         '  export BOT_TOKEN="..." && python gemini_bot.py')
+    cfg = load_config()
+    global DB_PATH
+    if cfg.get("db_path"):
+        DB_PATH = cfg["db_path"]
+
+    token = ensure_token(cfg)
+    apply_proxy(cfg)
     db_init()
+
     bot = create_bot(token)
-    logger.info("bot started (db: %s, default model: %s)", DB_PATH, DEFAULT_MODEL)
-    # retry_on_error: сеть может моргать (особенно через прокси) — не роняем бота
-    bot.infinity_polling(timeout=30, long_polling_timeout=25)
+    logger.info("бот запущен (db: %s, модель по умолчанию: %s)", DB_PATH, DEFAULT_MODEL)
+    print("Бот работает. Остановка — Ctrl+C.")
+
+    # SIGTERM (docker/kill) → тот же чистый выход, что и Ctrl+C
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    try:
+        # skip_pending: после перезапуска не отвечать на старые сообщения
+        bot.infinity_polling(timeout=30, long_polling_timeout=25,
+                             skip_pending=True, logger_level=logging.ERROR)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        try:
+            bot.stop_bot()  # остановить polling + закрыть пул воркеров
+        except Exception:
+            pass
+        print("\n✅ Бот остановлен. Пока!")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
