@@ -33,6 +33,7 @@
 
 import asyncio
 import base64
+import html
 import logging
 import os
 import re
@@ -117,6 +118,69 @@ def friendly_error(status: int, msg: str) -> str:
                 f"временно, ключ тут ни при чём. Попробуй позже или смени модель: "
                 f"<code>.gmodel &lt;имя&gt;</code>.")
     return msg
+
+
+# ---------- markdown/latex → telegram html ----------
+# Gemini отвечает Markdown'ом и LaTeX ($\text{CaO}$). Telegram у юзербота рендерит
+# HTML (<b>,<i>,<code>,<pre>,<a>,<s>) — превращаем разметку и простые формулы в него,
+# чтобы в сообщении не торчали звёздочки и \text{}.
+
+_SUB = str.maketrans("0123456789+-()=", "₀₁₂₃₄₅₆₇₈₉₊₋₍₎₌")
+_SUP = str.maketrans("0123456789+-()=ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁽⁾⁼ⁿⁱ")
+_LATEX = {
+    "\\rightarrow": "→", "\\to": "→", "\\leftarrow": "←", "\\leftrightarrow": "↔",
+    "\\Rightarrow": "⇒", "\\cdot": "·", "\\times": "×", "\\div": "÷", "\\pm": "±",
+    "\\approx": "≈", "\\neq": "≠", "\\leq": "≤", "\\geq": "≥", "\\infty": "∞",
+    "\\degree": "°", "\\alpha": "α", "\\beta": "β", "\\gamma": "γ", "\\delta": "δ",
+    "\\Delta": "Δ", "\\mu": "μ", "\\lambda": "λ", "\\pi": "π", "\\sigma": "σ",
+    "\\omega": "ω", "\\theta": "θ", "\\rho": "ρ", "\\phi": "φ", "\\sum": "Σ",
+    "\\quad": " ", "\\qquad": "  ", "\\,": " ", "\\;": " ", "\\!": "", "\\ ": " ",
+}
+
+
+def latex_to_text(s: str) -> str:
+    s = re.sub(r"\\(?:text|mathrm|mathbf|mathit|mathsf|mbox|operatorname)\s*\{([^{}]*)\}",
+               r"\1", s)
+    for k, v in _LATEX.items():
+        s = s.replace(k, v)
+    s = re.sub(r"_\{([^{}]*)\}", lambda m: m.group(1).translate(_SUB), s)
+    s = re.sub(r"\^\{([^{}]*)\}", lambda m: m.group(1).translate(_SUP), s)
+    s = re.sub(r"_(\S)", lambda m: m.group(1).translate(_SUB), s)
+    s = re.sub(r"\^(\S)", lambda m: m.group(1).translate(_SUP), s)
+    s = s.replace("\\left", "").replace("\\right", "")
+    s = re.sub(r"\\[a-zA-Z]+", "", s)
+    return s.replace("{", "").replace("}", "").replace("\\", "").strip()
+
+
+def md_to_tg_html(text: str) -> str:
+    """Markdown+LaTeX → Telegram-HTML. Нераспознанное экранируется."""
+    if not text:
+        return text
+    blocks, inlines = [], []
+    text = re.sub(r"```[^\n]*\n?(.*?)```",
+                  lambda m: (blocks.append(m.group(1)), f"\x00B{len(blocks)-1}\x00")[1],
+                  text, flags=re.S)
+    text = re.sub(r"`([^`\n]+)`",
+                  lambda m: (inlines.append(m.group(1)), f"\x00I{len(inlines)-1}\x00")[1],
+                  text)
+    text = re.sub(r"\$\$(.+?)\$\$", lambda m: latex_to_text(m.group(1)), text, flags=re.S)
+    text = re.sub(r"\$([^$\n]+?)\$", lambda m: latex_to_text(m.group(1)), text)
+    text = html.escape(text, quote=False)
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r'<a href="\2">\1</a>', text)
+    text = re.sub(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t#]*$", r"<b>\1</b>", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<![\w_])_(?!_)(.+?)(?<![\w_])_(?![\w_])", r"<i>\1</i>", text)
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.S)
+    text = re.sub(r"(?m)^([ \t]*)[*+\-][ \t]+", r"\1• ", text)
+    text = re.sub(r"\x00I(\d+)\x00",
+                  lambda m: "<code>" + html.escape(inlines[int(m.group(1))], quote=False) + "</code>",
+                  text)
+    text = re.sub(r"\x00B(\d+)\x00",
+                  lambda m: "<pre><code>" + html.escape(blocks[int(m.group(1))], quote=False) + "</code></pre>",
+                  text)
+    return text
 
 
 class GeminiError(Exception):
@@ -459,7 +523,7 @@ class GeminiAI(loader.Module):
                 f"<b>{q_esc}</b>\n{SEP}\n❌ {utils.escape_html(type(exc).__name__)} (см. heroku logs)"
             )
             return
-        await message.edit(f"<b>{q_esc}</b>\n{SEP}\n{utils.escape_html(self._fit(answer))}")
+        await message.edit(f"<b>{q_esc}</b>\n{SEP}\n{md_to_tg_html(self._fit(answer))}")
 
     @loader.command(
         ru_doc="API-ключ Gemini: .gkey <ключ> (без аргумента — показать текущий)",
