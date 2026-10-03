@@ -501,6 +501,16 @@ def _file_meta(msg, kind: str) -> tuple:
     return d.file_id, d.mime_type or "", d.file_name or "file", getattr(d, "file_size", 0)
 
 
+def _download(bot, file_id) -> bytes:
+    """Скачивает файл и всегда отдаёт bytes.
+
+    pyTelegramBotAPI download_file возвращает bytes (не файл-объект), но в разных
+    версиях бывает BytesIO — поэтому .read() только если он реально есть.
+    """
+    raw = bot.download_file(bot.get_file(file_id).file_path)
+    return raw.read() if hasattr(raw, "read") else raw
+
+
 def build_media_parts(bot, msg) -> tuple:
     """(parts, error). Скачивает медиа и собирает контент-блоки для input."""
     kind = media_kind(msg)
@@ -524,7 +534,7 @@ def build_media_parts(bot, msg) -> tuple:
             ext = ("." + name.rsplit(".", 1)[1].lower()) if "." in name else ""
             if mime.startswith("text/") or ext in TEXT_DOC_EXTS:
                 try:
-                    raw = bot.download_file(bot.get_file(file_id).file_path).read()
+                    raw = _download(bot, file_id)
                 except Exception as exc:
                     logger.error("download failed: %r", exc)
                     return [], "не смог скачать файл"
@@ -544,7 +554,7 @@ def build_media_parts(bot, msg) -> tuple:
         return [], "формат видео не поддерживается Gemini"
 
     try:
-        data = bot.download_file(bot.get_file(file_id).file_path).read()
+        data = _download(bot, file_id)
     except Exception as exc:
         logger.error("download failed: %r", exc)
         return [], "не смог скачать медиа (файл больше 20 МБ или недоступен)"
