@@ -345,6 +345,26 @@ class GeminiAI(loader.Module):
         return [{"type": block_type, "data": base64.b64encode(data).decode(),
                  "mime_type": mime}], None
 
+    async def _album_media(self, msg):
+        """Все медиа одного альбома (grouped_id) в хронологическом порядке.
+
+        Возвращает список сообщений; на ошибке — [msg] (одиночное медиа).
+        """
+        gid = getattr(msg, "grouped_id", None)
+        if not gid:
+            return [msg]
+        try:
+            msgs = await self.client.get_messages(msg.peer_id, limit=10)
+            same = [m for m in msgs
+                    if getattr(m, "grouped_id", None) == gid and self._media_kind(m)]
+            if not same:
+                return [msg]
+            same.reverse()  # get_messages отдаёт свежие первыми → разворачиваем
+            return same
+        except Exception as exc:
+            logger.error("[GeminiAI] album gather failed: %r", exc)
+            return [msg]
+
     # ---------- api ----------
 
     @staticmethod
@@ -467,14 +487,24 @@ class GeminiAI(loader.Module):
                 elif (reply.raw_text or "").strip():
                     reply_text = (reply.raw_text or "").strip()[:MAX_REPLY_CTX]
 
+        # альбом: собираем все медиа одной группы, а не только отмеченное
+        album = await self._album_media(media_msg) if media_msg is not None else []
+
         parts = []
-        kind = self._media_kind(media_msg) if media_msg is not None else None
-        if media_msg is not None:
-            media_parts, err = await self._media_parts(media_msg)
-            if err:
-                await utils.answer(message, f"❌ {utils.escape_html(err)}")
-                return
-            parts.extend(media_parts)
+        kind = self._media_kind(album[0]) if album else None
+        if album:
+            if len(album) > 1:
+                await message.edit(
+                    f"📷 <i>Альбом получен: {len(album)} медиа — загружаю…</i>"
+                )
+            else:
+                await message.edit("📥 <i>Медиа получено — загружаю…</i>")
+            for m in album:
+                media_parts, err = await self._media_parts(m)
+                if err:
+                    await utils.answer(message, f"❌ {utils.escape_html(err)}")
+                    return
+                parts.extend(media_parts)
 
         query = args
         if not query:

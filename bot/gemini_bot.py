@@ -49,6 +49,7 @@ import re
 import signal
 import sqlite3
 import sys
+import threading
 import time
 
 import requests
@@ -830,10 +831,131 @@ def create_bot(token: str) -> telebot.TeleBot:
         else:
             bot.reply_to(message, "Не знаю такой команды. /help")
 
+    # --- альбомы (media_group): все фото вместе, ОДИН запрос вместо N ---
+    albums = {}          # media_group_id -> [messages]
+    album_timers = {}    # media_group_id -> threading.Timer
+    recent_albums = {}   # media_group_id -> (timestamp, [media msgs]) для ответов на альбом
+    album_lock = threading.Lock()
+    ALBUM_WAIT = 1.2     # сколько ждём остальные фото альбома
+    ALBUM_TTL = 180      # сколько храним альбом для возможных ответов на него
+
+    def _cache_album(mgid, media_msgs):
+        now = time.time()
+        with album_lock:
+            recent_albums[mgid] = (now, media_msgs)
+            for k in [k for k, (ts, _) in recent_albums.items() if now - ts > ALBUM_TTL]:
+                recent_albums.pop(k, None)
+            if len(recent_albums) > 30:
+                for k in sorted(recent_albums, key=lambda x: recent_albums[x][0])[:-30]:
+                    recent_albums.pop(k, None)
+
+    def _cached_album(mgid):
+        if not mgid:
+            return None
+        with album_lock:
+            item = recent_albums.get(mgid)
+            if not item:
+                return None
+            ts, msgs = item
+            if time.time() - ts > ALBUM_TTL:
+                recent_albums.pop(mgid, None)
+                return None
+            return list(msgs)
+
+    def default_group_query(media_msgs):
+        kinds = [media_kind(m) for m in media_msgs]
+        if len(media_msgs) > 1:
+            if all(k in ("photo", "sticker") for k in kinds):
+                return "Что изображено на этих фото? Опиши кратко."
+            return "Опиши эти медиа кратко."
+        k = kinds[0] if kinds else ""
+        if k in ("photo", "sticker"):
+            return DEFAULT_QUERY["photo"]
+        if k == "video":
+            return DEFAULT_QUERY["video"]
+        if k in ("voice", "audio"):
+            return DEFAULT_QUERY["audio"]
+        if k == "document":
+            return DEFAULT_QUERY["document"]
+        return "Опиши это."
+
+    def ask_and_reply(chat_id, media_msgs, query, reply_text, user, initial_status):
+        """Статус → качаем медиа → ОДИН вопрос Gemini → правим статус в ответ."""
+        status_msg = bot.send_message(chat_id, initial_status)
+        parts = []
+        for m in media_msgs:
+            media_parts, err = build_media_parts(bot, m)
+            if err:
+                bot.edit_message_text(f"❌ {esc(err)}", chat_id, status_msg.message_id)
+                return
+            parts.extend(media_parts)
+        if reply_text:
+            parts.append({"type": "text", "text": f"Сообщение, на которое я отвечаю:\n{reply_text}"})
+        parts.append({"type": "text", "text": query})
+        head = f"<b>{esc(query[:500])}</b>\n{SEP}\n"
+        bot.edit_message_text(head + "⏳ <i>Gemini думает…</i>", chat_id, status_msg.message_id)
+        try:
+            answer = ask_gemini(parts, user, chat_id)
+        except GeminiError as exc:
+            logger.error("api error: %s", exc)
+            bot.edit_message_text(head + f"❌ {esc(exc)}", chat_id, status_msg.message_id)
+            return
+        except Exception as exc:
+            logger.exception("unexpected error")
+            bot.edit_message_text(head + f"❌ {esc(type(exc).__name__)} (см. логи)",
+                                  chat_id, status_msg.message_id)
+            return
+        bot.edit_message_text(head + md_to_tg_html(fit(answer)), chat_id, status_msg.message_id)
+
+    def handle_group(msgs):
+        first = msgs[0]
+        chat_id = first.chat.id
+        uid = first.from_user.id if first.from_user else 0
+        user = get_user(uid)
+        if not api_key_for(user):
+            bot.reply_to(first, NO_KEY_TEXT)
+            return
+        media_msgs = [m for m in msgs if media_kind(m)]
+        query = ""
+        for m in msgs:
+            cap = (getattr(m, "caption", "") or "").strip()
+            if cap:
+                query = cap
+                break
+        if not media_msgs and not query:
+            return
+        if not query:
+            query = default_group_query(media_msgs)
+        ask_and_reply(chat_id, media_msgs, query, "", user,
+                      f"📷 Альбом получен: {len(media_msgs)} медиа — загружаю…")
+
+    def flush_album(mgid):
+        with album_lock:
+            msgs = albums.pop(mgid, [])
+            album_timers.pop(mgid, None)
+        if not msgs:
+            return
+        _cache_album(mgid, [m for m in msgs if media_kind(m)])
+        try:
+            handle_group(msgs)
+        except Exception:
+            logger.exception("album error")
+
+    def schedule_album(mgid, message):
+        with album_lock:
+            albums.setdefault(mgid, []).append(message)
+            old = album_timers.get(mgid)
+            if old:
+                old.cancel()
+            timer = threading.Timer(ALBUM_WAIT, flush_album, args=(mgid,))
+            album_timers[mgid] = timer
+            timer.start()
+
     def handle_content(message):
-        """Любое не-командное сообщение: текст/медиа → Gemini."""
+        """Одиночное сообщение (не альбом): текст/медиа/ответ на медиа → Gemini."""
         uid = message.from_user.id if message.from_user else 0
         user = get_user(uid)
+        chat_id = message.chat.id
 
         # нет ключа — любое текстовое сообщение считается попыткой его ввести
         if not api_key_for(user):
@@ -844,64 +966,39 @@ def create_bot(token: str) -> telebot.TeleBot:
                 bot.reply_to(message, NO_KEY_TEXT)
             return
 
-        # медиа: в самом сообщении или в том, на которое отвечают
-        media_msg = message if media_kind(message) else None
+        media_msgs = []
         reply_text = ""
-        if media_msg is None and getattr(message, "reply_to_message", None):
+        if media_kind(message):
+            media_msgs = [message]
+            query = (message.caption or "").strip()
+        elif getattr(message, "reply_to_message", None):
             reply = message.reply_to_message
-            if media_kind(reply):
-                media_msg = reply
+            cached = _cached_album(getattr(reply, "media_group_id", None))
+            if cached:
+                media_msgs = cached            # ответ на альбом → берём все его фото
+            elif media_kind(reply):
+                media_msgs = [reply]
             elif (reply.text or reply.caption or "").strip():
                 reply_text = (reply.text or reply.caption or "").strip()[:8_000]
+            query = (message.text or "").strip()
+        else:
+            query = (message.text or "").strip()
 
-        parts = []
-        kind = media_kind(media_msg)
-        if media_msg is not None:
-            media_parts, err = build_media_parts(bot, media_msg)
-            if err:
-                answer_error(message, err)
-                return
-            parts.extend(media_parts)
+        if not media_msgs and not query and not reply_text:
+            return  # пустое сообщение — игнор
+        if media_msgs and not query:
+            query = default_group_query(media_msgs)
+        if not query and reply_text:
+            query = "Ответь на это сообщение."
 
-        query = (message.caption if message.photo or message.video or message.document
-                 or message.animation or message.sticker or message.audio
-                 else message.text) or ""
-        query = query.strip()
-        if not query:
-            if kind in ("photo", "sticker"):
-                query = DEFAULT_QUERY["photo"]
-            elif kind == "video":
-                query = DEFAULT_QUERY["video"]
-            elif kind in ("voice", "audio"):
-                query = DEFAULT_QUERY["audio"]
-            elif kind == "document":
-                query = DEFAULT_QUERY["document"]
-            elif reply_text:
-                query = "Ответь на это сообщение."
-            else:
-                return  # пустое сообщение без медиа — игнор
-
-        if reply_text:
-            parts.append({"type": "text", "text": f"Сообщение, на которое я отвечаю:\n{reply_text}"})
-        parts.append({"type": "text", "text": query})
-
-        # бот не может редактировать чужие сообщения — шлём своё и правим его
-        status_msg = bot.send_message(message.chat.id,
-                                      f"<b>{esc(query[:500])}</b>\n{SEP}\n⏳ <i>Gemini думает…</i>")
-        try:
-            answer = ask_gemini(parts, user, message.chat.id)
-        except GeminiError as exc:
-            logger.error("api error: %s", exc)
-            bot.edit_message_text(f"<b>{esc(query[:500])}</b>\n{SEP}\n❌ {esc(exc)}",
-                                  message.chat.id, status_msg.message_id)
-            return
-        except Exception as exc:
-            logger.exception("unexpected error")
-            bot.edit_message_text(f"<b>{esc(query[:500])}</b>\n{SEP}\n❌ {esc(type(exc).__name__)} "
-                                  f"(см. логи)", message.chat.id, status_msg.message_id)
-            return
-        bot.edit_message_text(f"<b>{esc(query[:500])}</b>\n{SEP}\n{md_to_tg_html(fit(answer))}",
-                              message.chat.id, status_msg.message_id)
+        n = len(media_msgs)
+        if n > 1:
+            initial = f"📷 Альбом: {n} медиа — загружаю…"
+        elif n == 1:
+            initial = "📥 Медиа получено — загружаю…"
+        else:
+            initial = "⏳ <i>Gemini думает…</i>"
+        ask_and_reply(chat_id, media_msgs, query, reply_text, user, initial)
 
     @bot.message_handler(commands=[
         "start", "help", "key", "prompt", "prompts", "save", "use", "del",
@@ -925,6 +1022,10 @@ def create_bot(token: str) -> telebot.TeleBot:
         if cmd:
             return
         try:
+            mgid = getattr(message, "media_group_id", None)
+            if mgid:
+                schedule_album(mgid, message)   # соберём альбом и спросим один раз
+                return
             handle_content(message)
         except Exception:
             logger.exception("content error")
