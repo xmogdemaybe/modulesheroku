@@ -490,15 +490,27 @@ class GeminiAI(loader.Module):
         # альбом: собираем все медиа одной группы, а не только отмеченное
         album = await self._album_media(media_msg) if media_msg is not None else []
 
+        # Если команда была подписью к медиа, её текст — caption (лимит 1024),
+        # и правка затрёт запрос. Поэтому статус/ответ пишем отдельным сообщением.
+        has_media = self._media_kind(message) is not None
+        status_box = {}
+
+        async def show(text):
+            if has_media:
+                if "m" in status_box:
+                    await status_box["m"].edit(text)
+                else:
+                    status_box["m"] = await message.respond(text)
+            else:
+                await message.edit(text)
+
         parts = []
         kind = self._media_kind(album[0]) if album else None
         if album:
             if len(album) > 1:
-                await message.edit(
-                    f"📷 <i>Альбом получен: {len(album)} медиа — загружаю…</i>"
-                )
+                await show(f"📷 <i>Альбом получен: {len(album)} медиа — загружаю…</i>")
             else:
-                await message.edit("📥 <i>Медиа получено — загружаю…</i>")
+                await show("📥 <i>Медиа получено — загружаю…</i>")
             for m in album:
                 media_parts, err = await self._media_parts(m)
                 if err:
@@ -539,21 +551,20 @@ class GeminiAI(loader.Module):
             parts.append({"type": "text", "text": f"Сообщение, на которое я отвечаю:\n{reply_text}"})
         parts.append({"type": "text", "text": query})
 
-        q_esc = utils.escape_html(query)
-        await message.edit(f"<b>{q_esc}</b>\n{SEP}\n⏳ <i>Gemini думает…</i>")
+        q_disp = query if len(query) <= 300 else query[:300] + "…"
+        head = f"<b>{utils.escape_html(q_disp)}</b>\n{SEP}\n"
+        await show(head + "⏳ <i>Gemini думает…</i>")
         try:
             answer = await self._ask(parts, message.chat_id, key)
         except GeminiError as exc:
             logger.error("[GeminiAI] api error: %s", exc)
-            await message.edit(f"<b>{q_esc}</b>\n{SEP}\n❌ {utils.escape_html(str(exc))}")
+            await show(head + f"❌ {utils.escape_html(str(exc))}")
             return
         except Exception as exc:
             logger.exception("[GeminiAI] unexpected error")
-            await message.edit(
-                f"<b>{q_esc}</b>\n{SEP}\n❌ {utils.escape_html(type(exc).__name__)} (см. heroku logs)"
-            )
+            await show(head + f"❌ {utils.escape_html(type(exc).__name__)} (см. heroku logs)")
             return
-        await message.edit(f"<b>{q_esc}</b>\n{SEP}\n{md_to_tg_html(self._fit(answer))}")
+        await show(head + md_to_tg_html(self._fit(answer)))
 
     @loader.command(
         ru_doc="API-ключ Gemini: .gkey <ключ> (без аргумента — показать текущий)",
