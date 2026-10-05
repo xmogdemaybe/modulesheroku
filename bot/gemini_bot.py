@@ -16,8 +16,18 @@
 #   {
 #     "bot_token": "123456:ABC...",   # обязателен (спросится при запуске)
 #     "proxy": "http://127.0.0.1:1080",  # если TG/Gemini блокируются (РФ)
-#     "db_path": "/путь/gemini_bot.db"   # необязательно
+#     "db_path": "/путь/gemini_bot.db",  # необязательно
+#
+#     # --- локальные бэкенды (LM Studio / koboldcpp), необязательно ---
+#     "lmstudio_url": "http://localhost:1234/v1",   # OpenAI-совместимый сервер
+#     "koboldcpp_url": "http://localhost:5001/v1",
+#     "lmstudio_model": "qwen2.5-7b",   # необяз.: id модели + подпись в статусе
+#     "local_for_all": true,   # true — локальные бэкенды доступны ВСЕМ юзерам
+#     "owner_id": 123456789    # твой user_id: тебе локалка доступна всегда,
+#                              # даже когда local_for_all=false (чтобы тестить)
 #   }
+#   Любое из этих полей также читается из env (LMSTUDIO_URL, LOCAL_FOR_ALL,
+#   OWNER_ID и т.д.) — env используется, если поля нет в config.json.
 #
 # ВАЖНО про гео: с российских IP api.telegram.org и generativelanguage.googleapis.com
 # могут не отвечать — тогда впиши "proxy" в config.json (VPN/прокси) или крути
@@ -32,6 +42,8 @@
 #   /use <имя>|default   активный промпт
 #   /del <имя>           удалить промпт
 #   /model [имя]         модель (по умолчанию gemini-3.8-flash)
+#   /think [уровень]     раздумья Gemini: minimal|low|medium|high (по умолч. medium)
+#   /backend [имя]       gemini | lmstudio | koboldcpp (локалка без ключа Gemini)
 #   /chat [on|off]       память диалога (Gemini помнит прошлые реплики)
 #   /clear               сбросить память в этом чате
 #
@@ -72,6 +84,22 @@ ANSWER_LIMIT = 3_800          # лимит сообщения TG 4096, с зап
 REQUEST_TIMEOUT = (15, 300)   # (connect, read): thinking-модели отвечают долго
 POLL_TIMEOUT = 240
 TEST_POLL_TIMEOUT = 60
+
+# Уровень «раздумий» Gemini 3 (thinking_level). Без него модель думает на high —
+# отсюда и задержки. medium — баланс; ниже = быстрее.
+DEFAULT_THINK = "medium"
+THINK_LEVELS = ("minimal", "low", "medium", "high")
+
+# Локальные OpenAI-совместимые бэкенды. Адреса и доступ настраиваются в
+# config.json / env: <backend>_url, <backend>_model, local_for_all, owner_id.
+LOCAL_BACKENDS = {"lmstudio": "LM Studio", "koboldcpp": "koboldcpp"}
+LOCAL_DEFAULT_URL = {
+    "lmstudio": "http://localhost:1234/v1",
+    "koboldcpp": "http://localhost:5001/v1",
+}
+LOCAL_TIMEOUT = (10, 600)     # локальная генерация бывает очень долгой
+
+CONFIG = {}                   # заполняется в main() из config.json (+ env-фолбэк)
 
 SEP = "──────────"
 
@@ -267,7 +295,9 @@ def db_init():
                 prompt TEXT DEFAULT '',
                 model TEXT DEFAULT '',
                 active_prompt TEXT DEFAULT '',
-                ctx INTEGER DEFAULT 0
+                ctx INTEGER DEFAULT 0,
+                think TEXT DEFAULT '',
+                backend TEXT DEFAULT 'gemini'
             );
             CREATE TABLE IF NOT EXISTS prompts(
                 user_id INTEGER, name TEXT, text TEXT,
@@ -279,6 +309,12 @@ def db_init():
             );
             """
         )
+        # миграция старой базы: докидываем недостающие колонки
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "think" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN think TEXT DEFAULT ''")
+        if "backend" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN backend TEXT DEFAULT 'gemini'")
 
 
 def get_user(user_id: int) -> dict:
@@ -289,7 +325,7 @@ def get_user(user_id: int) -> dict:
 
 
 def set_user(user_id: int, field: str, value):
-    assert field in ("api_key", "prompt", "model", "active_prompt", "ctx")
+    assert field in ("api_key", "prompt", "model", "active_prompt", "ctx", "think", "backend")
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
         conn.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, user_id))
@@ -380,6 +416,61 @@ def is_transient_msg(msg: str) -> bool:
 
 def model_for(user: dict) -> str:
     return normalize_model(user.get("model") or "") or DEFAULT_MODEL
+
+
+def think_for(user: dict) -> str:
+    lvl = (user.get("think") or "").strip().lower()
+    return lvl if lvl in THINK_LEVELS else DEFAULT_THINK
+
+
+def cfg_get(key: str, default=None):
+    """Значение из config.json, иначе из env (KEY в верхнем регистре), иначе default."""
+    if key in CONFIG and CONFIG[key] not in (None, ""):
+        return CONFIG[key]
+    env = os.environ.get(key.upper())
+    return env if env not in (None, "") else default
+
+
+def owner_id():
+    v = cfg_get("owner_id")
+    try:
+        return int(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def local_for_all() -> bool:
+    return str(cfg_get("local_for_all", "")).lower() in ("1", "true", "yes", "on")
+
+
+def backend_for(user: dict) -> str:
+    be = (user.get("backend") or "gemini").strip().lower()
+    return be if (be in LOCAL_BACKENDS or be == "gemini") else "gemini"
+
+
+def backend_allowed(uid: int, be: str) -> bool:
+    if be == "gemini":
+        return True
+    if be not in LOCAL_BACKENDS:
+        return False
+    own = owner_id()
+    return local_for_all() or (own is not None and uid == own)
+
+
+def local_url(backend: str) -> str:
+    return (cfg_get(f"{backend}_url") or LOCAL_DEFAULT_URL.get(backend, "")).rstrip("/")
+
+
+def local_model_id(backend: str) -> str:
+    return cfg_get(f"{backend}_model") or "local-model"
+
+
+def status_label(user: dict) -> str:
+    """Что показываем в статусе «…думает»: имя модели Gemini или локальный бэкенд."""
+    be = backend_for(user)
+    if be == "gemini":
+        return model_for(user)
+    return cfg_get(f"{be}_model") or LOCAL_BACKENDS[be]
 
 
 def extract_text(data: dict) -> str:
@@ -485,7 +576,8 @@ def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
         raise GeminiError("API-ключ не задан: пришли его сообщением или /key <ключ>")
 
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    body = {"model": model_for(user), "input": parts}
+    body = {"model": model_for(user), "input": parts,
+            "generation_config": {"thinking_level": think_for(user)}}
     si = system_instruction_for(user)
     if si:
         body["system_instruction"] = si
@@ -526,6 +618,71 @@ def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
     if ctx_on and data.get("id"):
         set_ctx(chat_id, user["user_id"], data["id"])
     return text
+
+
+# ---------- локальные бэкенды (LM Studio / koboldcpp, OpenAI-совместимые) ----------
+
+def gemini_parts_to_openai(parts: list) -> tuple:
+    """Gemini content-блоки → OpenAI 'content'. Возвращает (content, error).
+
+    Локальные серверы понимают текст и (LM Studio с vision-моделью) картинки как
+    data-URI. Аудио/видео/документы не поддерживаются — возвращаем понятную ошибку.
+    """
+    content = []
+    for p in parts:
+        t = p.get("type")
+        if t == "text":
+            content.append({"type": "text", "text": p.get("text", "")})
+        elif t == "image":
+            mime = p.get("mime_type", "image/jpeg")
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{p.get('data', '')}"}})
+        else:
+            return None, f"локальный бэкенд не поддерживает тип «{t}» (только текст и фото)"
+    return content, None
+
+
+def ask_local(backend: str, parts: list, user: dict, chat_id: int) -> tuple:
+    """Запрос к LM Studio / koboldcpp. Возвращает (text, label)."""
+    url = local_url(backend)
+    if not url:
+        raise GeminiError(f"не задан адрес {backend} (поле {backend}_url в config.json)")
+    content, err = gemini_parts_to_openai(parts)
+    if err:
+        raise GeminiError(err)
+    messages = []
+    si = system_instruction_for(user)
+    if si:
+        messages.append({"role": "system", "content": si})
+    messages.append({"role": "user", "content": content})
+    body = {"model": local_model_id(backend), "messages": messages, "stream": False}
+    try:
+        resp = requests.post(f"{url}/chat/completions", json=body, timeout=LOCAL_TIMEOUT)
+    except requests.RequestException as exc:
+        raise GeminiError(
+            f"не достучаться до {LOCAL_BACKENDS.get(backend, backend)} ({url}): "
+            f"{type(exc).__name__}: {exc}\nСервер запущен и адрес верный?")
+    if resp.status_code != 200:
+        raise GeminiError(f"{backend} вернул HTTP {resp.status_code}: {(resp.text or '')[:300]}")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise GeminiError(f"{backend}: ответ не JSON")
+    choices = data.get("choices") or []
+    text = ""
+    if choices:
+        text = ((choices[0].get("message") or {}).get("content") or "").strip()
+    if not text:
+        raise GeminiError(f"{backend} вернул пустой ответ")
+    return text, (data.get("model") or status_label(user))
+
+
+def dispatch_ask(parts: list, user: dict, chat_id: int) -> tuple:
+    """Единая точка: (answer_text, model_label). Выбирает Gemini или локальный бэкенд."""
+    be = backend_for(user)
+    if be in LOCAL_BACKENDS:
+        return ask_local(be, parts, user, chat_id)
+    return ask_gemini(parts, user, chat_id), model_for(user)
 
 
 # ---------- медиа ----------
@@ -664,6 +821,8 @@ HELP_TEXT = (
     "/use &lt;имя&gt;|default — активный промпт\n"
     "/del &lt;имя&gt; — удалить промпт\n"
     "/model [имя] — модель (сейчас по умолчанию <code>" + DEFAULT_MODEL + "</code>)\n"
+    "/think [minimal|low|medium|high] — уровень раздумий (ниже = быстрее)\n"
+    "/backend [gemini|lmstudio|koboldcpp] — облако Gemini или локальный сервер\n"
     "/chat [on|off] — память диалога\n"
     "/clear — сбросить память в этом чате"
 )
@@ -810,6 +969,42 @@ def create_bot(token: str) -> telebot.TeleBot:
                 bot.reply_to(message, f"ℹ️ Модель: <code>{esc(model_for(user))}</code>\n"
                              "Сменить: /model gemini-3.7-flash (или просто /model 3.7)")
 
+        elif cmd == "think":
+            lvl = args.lower()
+            if not lvl:
+                bot.reply_to(message, f"🧠 Уровень раздумий: <b>{think_for(user)}</b>\n"
+                             "Сменить: /think minimal|low|medium|high\n"
+                             "Чем ниже — тем быстрее ответ (high — максимум рассуждений, "
+                             "по умолчанию у Gemini 3).")
+            elif lvl not in THINK_LEVELS:
+                bot.reply_to(message, "❌ Доступно: <code>minimal</code>, <code>low</code>, "
+                             "<code>medium</code>, <code>high</code>.")
+            else:
+                set_user(uid, "think", lvl)
+                bot.reply_to(message, f"🧠 Уровень раздумий: <b>{lvl}</b>.")
+
+        elif cmd == "backend":
+            cur = backend_for(user)
+            be = args.lower()
+            if not be:
+                avail = ["gemini"] + [b for b in LOCAL_BACKENDS if backend_allowed(uid, b)]
+                bot.reply_to(message, f"ℹ️ Бэкенд: <b>{esc(cur)}</b>\n"
+                             f"Доступны тебе: {', '.join('<code>'+esc(a)+'</code>' for a in avail)}\n"
+                             "Сменить: /backend gemini|lmstudio|koboldcpp")
+            elif be not in LOCAL_BACKENDS and be != "gemini":
+                bot.reply_to(message, "❌ Не знаю такого бэкенда. Есть: "
+                             "<code>gemini</code>, <code>lmstudio</code>, <code>koboldcpp</code>.")
+            elif not backend_allowed(uid, be):
+                bot.reply_to(message, "❌ Локальные бэкенды сейчас отключены для всех "
+                             "(владелец бота не включил <code>local_for_all</code>).")
+            else:
+                set_user(uid, "backend", be)
+                if be == "gemini":
+                    bot.reply_to(message, "✅ Бэкенд: <b>Gemini</b> (облако, нужен свой API-ключ).")
+                else:
+                    bot.reply_to(message, f"✅ Бэкенд: <b>{esc(LOCAL_BACKENDS[be])}</b> "
+                                 f"(<code>{esc(local_url(be))}</code>). API-ключ Gemini не нужен.")
+
         elif cmd == "chat":
             state = args.lower()
             if state in ("on", "1", "enable"):
@@ -880,7 +1075,8 @@ def create_bot(token: str) -> telebot.TeleBot:
         return "Опиши это."
 
     def ask_and_reply(chat_id, media_msgs, query, reply_text, user, initial_status):
-        """Статус → качаем медиа → ОДИН вопрос Gemini → правим статус в ответ."""
+        """Статус → качаем медиа → ОДИН вопрос (Gemini или локалка) → правим в ответ."""
+        label = status_label(user)
         status_msg = bot.send_message(chat_id, initial_status)
         parts = []
         for m in media_msgs:
@@ -893,9 +1089,10 @@ def create_bot(token: str) -> telebot.TeleBot:
             parts.append({"type": "text", "text": f"Сообщение, на которое я отвечаю:\n{reply_text}"})
         parts.append({"type": "text", "text": query})
         head = f"<b>{esc(query[:500])}</b>\n{SEP}\n"
-        bot.edit_message_text(head + "⏳ <i>Gemini думает…</i>", chat_id, status_msg.message_id)
+        bot.edit_message_text(head + f"⏳ <i>{esc(label)} думает…</i>",
+                              chat_id, status_msg.message_id)
         try:
-            answer = ask_gemini(parts, user, chat_id)
+            answer, used = dispatch_ask(parts, user, chat_id)
         except GeminiError as exc:
             logger.error("api error: %s", exc)
             bot.edit_message_text(head + f"❌ {esc(exc)}", chat_id, status_msg.message_id)
@@ -905,14 +1102,15 @@ def create_bot(token: str) -> telebot.TeleBot:
             bot.edit_message_text(head + f"❌ {esc(type(exc).__name__)} (см. логи)",
                                   chat_id, status_msg.message_id)
             return
-        bot.edit_message_text(head + md_to_tg_html(fit(answer)), chat_id, status_msg.message_id)
+        bot.edit_message_text(head + f"🤖 <b>{esc(used)}</b> — ответ:\n{md_to_tg_html(fit(answer))}",
+                              chat_id, status_msg.message_id)
 
     def handle_group(msgs):
         first = msgs[0]
         chat_id = first.chat.id
         uid = first.from_user.id if first.from_user else 0
         user = get_user(uid)
-        if not api_key_for(user):
+        if backend_for(user) == "gemini" and not api_key_for(user):
             bot.reply_to(first, NO_KEY_TEXT)
             return
         media_msgs = [m for m in msgs if media_kind(m)]
@@ -958,7 +1156,8 @@ def create_bot(token: str) -> telebot.TeleBot:
         chat_id = message.chat.id
 
         # нет ключа — любое текстовое сообщение считается попыткой его ввести
-        if not api_key_for(user):
+        # (для локальных бэкендов ключ Gemini не нужен)
+        if backend_for(user) == "gemini" and not api_key_for(user):
             text = (message.text or "").strip()
             if text and looks_like_key(text):
                 try_save_key(message, text)
@@ -997,12 +1196,12 @@ def create_bot(token: str) -> telebot.TeleBot:
         elif n == 1:
             initial = "📥 Медиа получено — загружаю…"
         else:
-            initial = "⏳ <i>Gemini думает…</i>"
+            initial = f"⏳ <i>{esc(status_label(user))} думает…</i>"
         ask_and_reply(chat_id, media_msgs, query, reply_text, user, initial)
 
     @bot.message_handler(commands=[
         "start", "help", "key", "prompt", "prompts", "save", "use", "del",
-        "model", "chat", "clear",
+        "model", "think", "backend", "chat", "clear",
     ])
     def on_command(message):
         cmd, args = parse_command(message.text)
@@ -1039,7 +1238,8 @@ def create_bot(token: str) -> telebot.TeleBot:
 
 def main():
     cfg = load_config()
-    global DB_PATH
+    global DB_PATH, CONFIG
+    CONFIG = cfg
     if cfg.get("db_path"):
         DB_PATH = cfg["db_path"]
 
@@ -1049,6 +1249,8 @@ def main():
 
     bot = create_bot(token)
     logger.info("бот запущен (db: %s, модель по умолчанию: %s)", DB_PATH, DEFAULT_MODEL)
+    logger.info("локальные бэкенды: local_for_all=%s, owner_id=%s; lmstudio=%s, koboldcpp=%s",
+                local_for_all(), owner_id(), local_url("lmstudio"), local_url("koboldcpp"))
     print("Бот работает. Остановка — Ctrl+C.")
 
     # SIGTERM (docker/kill) → тот же чистый выход, что и Ctrl+C

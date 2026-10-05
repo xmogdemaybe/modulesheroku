@@ -55,6 +55,13 @@ ANSWER_LIMIT = 3_700  # ответ Telegram на сообщение — 4096, о
 REQUEST_TIMEOUT = 300
 POLL_TIMEOUT = 240
 
+# Уровень «раздумий» Gemini 3 (thinking_level). По умолчанию модель думает на
+# high — отсюда и задержки. medium — баланс; ниже = быстрее.
+DEFAULT_THINK = "medium"
+THINK_LEVELS = ("minimal", "low", "medium", "high")
+MAX_NOTES = 200          # потолок числа заметок
+MAX_NOTE_LEN = 4_000     # потолок длины одной заметки
+
 IMAGE_MIMES = {
     "image/png", "image/jpeg", "image/webp", "image/heic", "image/heif",
     "image/gif", "image/bmp", "image/tiff",
@@ -249,6 +256,47 @@ class GeminiAI(loader.Module):
     def _model(self) -> str:
         return normalize_model(self._get("model", "") or "") or DEFAULT_MODEL
 
+    def _think(self) -> str:
+        lvl = (self._get("think", "") or "").strip().lower()
+        return lvl if lvl in THINK_LEVELS else DEFAULT_THINK
+
+    # ---------- notes ----------
+
+    def _notes(self) -> list:
+        notes = self._get("notes", [])
+        return notes if isinstance(notes, list) else []
+
+    def _set_notes(self, notes: list):
+        self._set("notes", notes)
+
+    def _add_note(self, text: str) -> int:
+        notes = self._notes()
+        notes.append(text[:MAX_NOTE_LEN])
+        if len(notes) > MAX_NOTES:
+            notes = notes[-MAX_NOTES:]
+        self._set_notes(notes)
+        return len(notes)
+
+    def _del_note(self, num: int) -> Optional[str]:
+        """Удаляет заметку по 1-based номеру. Возвращает удалённый текст или None."""
+        notes = self._notes()
+        if not (1 <= num <= len(notes)):
+            return None
+        removed = notes.pop(num - 1)
+        self._set_notes(notes)
+        return removed
+
+    def _notes_block(self, indices) -> str:
+        """Текстовый блок выбранных заметок. indices — список 1-based номеров."""
+        notes = self._notes()
+        picked = []
+        for i in indices:
+            if 1 <= i <= len(notes):
+                picked.append(f"{i}. {notes[i - 1]}")
+        if not picked:
+            return ""
+        return "Мои заметки (используй их как контекст):\n" + "\n".join(picked)
+
     # ---------- media ----------
 
     @staticmethod
@@ -406,7 +454,8 @@ class GeminiAI(loader.Module):
         raise GeminiError(friendly_error(last_status or 429, err))
 
     async def _ask(self, parts: list, chat_id: int, key: str) -> str:
-        body: dict = {"model": self._model(), "input": parts}
+        body: dict = {"model": self._model(), "input": parts,
+                      "generation_config": {"thinking_level": self._think()}}
         si = self._system_instruction()
         if si:
             body["system_instruction"] = si
@@ -460,13 +509,8 @@ class GeminiAI(loader.Module):
 
     # ---------- commands ----------
 
-    @loader.command(
-        ru_doc="Спросить Gemini: .gemini <запрос> (можно ответом на фото/войс/видео/док)",
-        en_doc="Ask Gemini: .gemini <query> (works as reply to photo/voice/video/doc)",
-    )
-    async def gemini(self, message):
-        """Ask Gemini: .gemini <query>, reply to media, or media caption"""
-        args = utils.get_args_raw(message).strip()
+    async def _run(self, message, args: str, notes_text: Optional[str] = None):
+        """Общее ядро запроса для .gemini и .gnote."""
         key = self._api_key()
         if not key:
             await utils.answer(
@@ -538,6 +582,7 @@ class GeminiAI(loader.Module):
                     f"🤖 <b>GeminiAI</b>\n"
                     f"<b>Модель:</b> <code>{utils.escape_html(model)}</code>\n"
                     f"<b>Промпт:</b> <code>{utils.escape_html(str(active))}</code>\n"
+                    f"<b>Раздумья:</b> <code>{self._think()}</code>\n"
                     f"<b>Ключ:</b> <code>{self._mask(key)}</code>\n"
                     f"<b>Контекст чата:</b> {'вкл' if self._get('ctx', False) else 'выкл'}\n\n"
                     f"<b>Использование:</b> <code>.gemini &lt;запрос&gt;</code> — текстом, "
@@ -549,11 +594,15 @@ class GeminiAI(loader.Module):
 
         if reply_text:
             parts.append({"type": "text", "text": f"Сообщение, на которое я отвечаю:\n{reply_text}"})
+        if notes_text:
+            parts.append({"type": "text", "text": notes_text})
         parts.append({"type": "text", "text": query})
 
+        model = self._model()
+        m_esc = utils.escape_html(model)
         q_disp = query if len(query) <= 300 else query[:300] + "…"
         head = f"<b>{utils.escape_html(q_disp)}</b>\n{SEP}\n"
-        await show(head + "⏳ <i>Gemini думает…</i>")
+        await show(head + f"⏳ <i>{m_esc} думает…</i>")
         try:
             answer = await self._ask(parts, message.chat_id, key)
         except GeminiError as exc:
@@ -564,7 +613,15 @@ class GeminiAI(loader.Module):
             logger.exception("[GeminiAI] unexpected error")
             await show(head + f"❌ {utils.escape_html(type(exc).__name__)} (см. heroku logs)")
             return
-        await show(head + md_to_tg_html(self._fit(answer)))
+        await show(head + f"🤖 <b>{m_esc}</b> — ответ:\n{md_to_tg_html(self._fit(answer))}")
+
+    @loader.command(
+        ru_doc="Спросить Gemini: .gemini <запрос> (можно ответом на фото/войс/видео/док)",
+        en_doc="Ask Gemini: .gemini <query> (works as reply to photo/voice/video/doc)",
+    )
+    async def gemini(self, message):
+        """Ask Gemini: .gemini <query>, reply to media, or media caption"""
+        await self._run(message, utils.get_args_raw(message).strip())
 
     @loader.command(
         ru_doc="API-ключ Gemini: .gkey <ключ> (без аргумента — показать текущий)",
@@ -744,6 +801,118 @@ class GeminiAI(loader.Module):
         await utils.answer(message, "🧹 Контекст чата сброшен.")
 
     @loader.command(
+        ru_doc="Уровень раздумий: .gthink [minimal|low|medium|high] (ниже = быстрее)",
+        en_doc="Thinking level: .gthink [minimal|low|medium|high] (lower = faster)",
+    )
+    async def gthink(self, message):
+        """Show or set Gemini 3 thinking_level"""
+        arg = utils.get_args_raw(message).strip().lower()
+        if not arg:
+            await utils.answer(
+                message,
+                f"🧠 Уровень раздумий: <b>{self._think()}</b>\n"
+                "Сменить: <code>.gthink minimal|low|medium|high</code>\n"
+                "Чем ниже — тем быстрее ответ (high — максимум рассуждений, по умолчанию у Gemini 3).",
+            )
+            return
+        if arg not in THINK_LEVELS:
+            await utils.answer(
+                message,
+                "❌ Доступные уровни: <code>minimal</code>, <code>low</code>, "
+                "<code>medium</code>, <code>high</code>.",
+            )
+            return
+        self._set("think", arg)
+        await utils.answer(message, f"🧠 Уровень раздумий: <b>{arg}</b>.")
+
+    @loader.command(
+        ru_doc="Заметки: .notes <текст> — добавить, .notes — список по порядку",
+        en_doc="Notes: .notes <text> — add, .notes — list in order",
+    )
+    async def notes(self, message):
+        """Add a note or list all notes"""
+        text = utils.get_args_raw(message).strip()
+        if text:
+            n = self._add_note(text)
+            await utils.answer(message, f"📝 Заметка сохранена (<b>#{n}</b>).")
+            return
+        notes = self._notes()
+        if not notes:
+            await utils.answer(
+                message,
+                "ℹ️ Заметок пока нет.\nДобавить: <code>.notes &lt;текст&gt;</code>\n"
+                "Спросить с заметками: <code>.gnote all &lt;запрос&gt;</code>.",
+            )
+            return
+        lines = [f"<b>{i}.</b> {utils.escape_html(t)}" for i, t in enumerate(notes, 1)]
+        body = self._fit("\n".join(lines), 3_000)
+        await utils.answer(
+            message,
+            f"📝 <b>Заметки ({len(notes)}):</b>\n{body}\n\n"
+            "<code>.ndel N</code> — удалить по номеру\n"
+            "<code>.gnote 1,3 &lt;запрос&gt;</code> или <code>.gnote all &lt;запрос&gt;</code> — "
+            "спросить Gemini с этими заметками как контекстом.",
+        )
+
+    @loader.command(
+        ru_doc="Удалить заметку: .ndel <номер>",
+        en_doc="Delete a note: .ndel <number>",
+    )
+    async def ndel(self, message):
+        """Delete a note by its 1-based number"""
+        arg = utils.get_args_raw(message).strip()
+        if not arg.isdigit():
+            await utils.answer(
+                message,
+                "ℹ️ <code>.ndel &lt;номер&gt;</code> — номера смотри в <code>.notes</code>.",
+            )
+            return
+        removed = self._del_note(int(arg))
+        if removed is None:
+            await utils.answer(message, f"❌ Заметки <b>#{utils.escape_html(arg)}</b> нет.")
+            return
+        await utils.answer(message, f"🗑 Заметка <b>#{utils.escape_html(arg)}</b> удалена.")
+
+    @loader.command(
+        ru_doc="Спросить Gemini с заметками: .gnote <1,2,3|all> <запрос>",
+        en_doc="Ask Gemini with notes as context: .gnote <1,2,3|all> <query>",
+    )
+    async def gnote(self, message):
+        """Ask Gemini injecting selected notes as context"""
+        raw = utils.get_args_raw(message).strip()
+        if not raw:
+            await utils.answer(
+                message,
+                "ℹ️ <code>.gnote &lt;1,2,3|all&gt; &lt;запрос&gt;</code>\n"
+                "В промпт идёт глобальный промпт + выбранные заметки + запрос.\n"
+                "Пример: <code>.gnote 1,3 что я хотел купить?</code>",
+            )
+            return
+        notes = self._notes()
+        if not notes:
+            await utils.answer(message, "ℹ️ Заметок пока нет: <code>.notes &lt;текст&gt;</code>.")
+            return
+        sel, _, query = raw.partition(" ")
+        sel = sel.strip().lower()
+        query = query.strip()
+        if sel == "all":
+            idx = list(range(1, len(notes) + 1))
+        else:
+            idx = [int(t) for t in sel.split(",") if t.strip().isdigit()]
+            if not idx:
+                await utils.answer(
+                    message,
+                    "❌ Не понял номера заметок.\nПример: <code>.gnote 1,3 запрос</code> "
+                    "или <code>.gnote all запрос</code>.",
+                )
+                return
+        block = self._notes_block(idx)
+        if not block:
+            await utils.answer(message, "❌ Заметки с такими номерами не найдены.")
+            return
+        await self._run(message, query, notes_text=block)
+
+    @loader.command(
         ru_doc="Справка по командам GeminiAI",
         en_doc="GeminiAI commands help",
     )
@@ -761,7 +930,12 @@ class GeminiAI(loader.Module):
             "<code>.gdel &lt;имя&gt;</code> — удалить промпт\n"
             "<code>.gmodel [имя]</code> — модель (сейчас <code>"
             + utils.escape_html(self._model()) + "</code>)\n"
+            "<code>.gthink [minimal|low|medium|high]</code> — уровень раздумий (сейчас <code>"
+            + self._think() + "</code>, ниже = быстрее)\n"
             "<code>.gchat on|off</code> — память диалога на чат\n"
-            "<code>.gclear</code> — сбросить контекст чата\n\n"
+            "<code>.gclear</code> — сбросить контекст чата\n"
+            "<code>.notes &lt;текст&gt;</code> — заметка; <code>.notes</code> — список; "
+            "<code>.ndel N</code> — удалить\n"
+            "<code>.gnote &lt;1,3|all&gt; &lt;запрос&gt;</code> — спросить с заметками как контекстом\n\n"
             "Ответ редактирует твоё сообщение: запрос сверху, ответ ниже.",
         )
