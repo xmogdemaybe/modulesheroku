@@ -45,8 +45,9 @@
 #   /model [имя]         модель (по умолчанию gemini-3.8-flash)
 #   /think [уровень]     раздумья Gemini: minimal|low|medium|high (по умолч. medium)
 #   /backend [имя]       gemini | lmstudio | koboldcpp (локалка без ключа Gemini)
-#   /chat [on|off]       память диалога (Gemini помнит прошлые реплики)
-#   /clear               сбросить память в этом чате
+#   /chat [on|off]       память диалога: у Gemini — на серверах Google, у локальных
+#                        моделей — свои последние ~12 реплик в базе
+#   /clear               сбросить память в этом чате (+ кэш фото из media_cache)
 #
 # Только владелец (owner_id) — управление моделями LM Studio:
 #   /lmsmodels            список скачанных моделей (номера, в памяти / активная)
@@ -60,10 +61,14 @@
 # База: SQLite (gemini_bot.db рядом со скриптом — имя не меняем, там ключи
 # юзеров). Ключи, промпты, модель и
 # память — свои на каждого юзера (user_id). История переписки при /chat on
-# живёт на серверах Google (previous_interaction_id), локально только id.
+# у Gemini живёт на серверах Google (previous_interaction_id, локально только id),
+# а LM Studio/koboldcpp stateless — окно реплик крутим сами (таблица local_history),
+# фото при этом кладём в папку media_cache рядом со скриптом и подписываемся в
+# истории именем файла, чтобы модель понимала, о КАКОМ именно фото речь.
 # Логи — в терминал, в чат уходят только ответы и ошибки.
 
 import base64
+import hashlib
 import html
 import json
 import logging
@@ -109,6 +114,15 @@ LOCAL_DEFAULT_URL = {
     "koboldcpp": "http://localhost:5001/v1",
 }
 LOCAL_TIMEOUT = (10, 600)     # локальная генерация бывает очень долгой
+
+# Память диалога для локальных серверов. Gemini помнит сам (previous_interaction_id),
+# LM Studio/koboldcpp stateless — окно реплик крутим сами и держим его коротким:
+# контекст у локальных моделей маленький, а автосжатие старых реплик — это лишний код.
+LOCAL_CTX_TURNS = 12          # максимум сообщений в окне (~6 пар вопрос-ответ)
+LOCAL_CTX_CHARS = 8_000       # потолок по символам на всю историю
+LOCAL_CTX_ANSWER = 2_000      # длиннее ответ не пишем: он забивает окно целиком
+LOCAL_CTX_IMAGES = 2          # сколько самых свежих фото реально пересылаем из кэша
+MEDIA_CACHE_DIR = os.path.join(BASE_DIR, "media_cache")
 
 CONFIG = {}                   # заполняется в main() из config.json (+ env-фолбэк)
 
@@ -327,6 +341,11 @@ def db_init():
                 chat_id INTEGER, user_id INTEGER, interaction_id TEXT,
                 PRIMARY KEY(chat_id, user_id)
             );
+            CREATE TABLE IF NOT EXISTS local_history(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER, user_id INTEGER,
+                role TEXT, text TEXT, media TEXT, created REAL
+            );
             """
         )
         # миграция старой базы: докидываем недостающие колонки
@@ -397,8 +416,113 @@ def set_ctx(chat_id: int, user_id: int, iid: str):
 
 
 def clear_ctx(chat_id: int, user_id: int):
+    """Сброс памяти в чате: и цепочка Gemini, и локальное окно реплик (+ кэш фото)."""
     with db() as conn:
         conn.execute("DELETE FROM contexts WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        conn.execute("DELETE FROM local_history WHERE chat_id=? AND user_id=?",
+                     (chat_id, user_id))
+        _hist_prune_media(conn, chat_id, user_id)
+
+
+# ---------- память диалога для локальных бэкендов (LM Studio / koboldcpp) ----------
+
+def _hist_prune_media(conn, chat_id: int, user_id: int):
+    """Удаляет из кэша файлы, на которые больше ни одна строка истории не ссылается."""
+    keep = {os.path.basename(r["media"]) for r in conn.execute(
+        "SELECT media FROM local_history WHERE chat_id=? AND user_id=?",
+        (chat_id, user_id)).fetchall() if r["media"]}
+    prefix = f"{chat_id}-{user_id}-"
+    try:
+        names = os.listdir(MEDIA_CACHE_DIR)
+    except OSError:
+        return
+    for name in names:
+        if name.startswith(prefix) and name not in keep:
+            try:
+                os.remove(os.path.join(MEDIA_CACHE_DIR, name))
+            except OSError:
+                logger.debug("cache remove failed: %s", name, exc_info=True)
+
+
+def local_history_add(chat_id: int, user_id: int, role: str, text: str, media: str = ""):
+    """Пишет реплику в окно и тут же режет его: последние LOCAL_CTX_TURNS и не больше
+    LOCAL_CTX_CHARS символов. Отрезанное чистим и на диске, чтобы кэш не рос вечно."""
+    text = (text or "").strip()
+    if not text and not media:
+        return
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO local_history(chat_id,user_id,role,text,media,created) "
+            "VALUES(?,?,?,?,?,?)",
+            (chat_id, user_id, role, text, media, time.time()),
+        )
+        rows = conn.execute(
+            "SELECT id, length(text) AS n FROM local_history "
+            "WHERE chat_id=? AND user_id=? ORDER BY id DESC", (chat_id, user_id)).fetchall()
+        keep, total = set(), 0
+        for r in rows[:LOCAL_CTX_TURNS]:
+            keep.add(r["id"])
+            total += r["n"] or 0
+            if total > LOCAL_CTX_CHARS:
+                break
+        drop = [r["id"] for r in rows if r["id"] not in keep]
+        if drop:
+            conn.executemany("DELETE FROM local_history WHERE id=?", [(i,) for i in drop])
+            _hist_prune_media(conn, chat_id, user_id)
+
+
+def local_history_get(chat_id: int, user_id: int) -> list:
+    """Окно истории от старых реплик к свежим: [(role, text, media_path)]."""
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT role, text, media FROM local_history WHERE chat_id=? AND user_id=? "
+            "ORDER BY id", (chat_id, user_id)).fetchall()
+    return [(r["role"], r["text"], r["media"] or "") for r in rows]
+
+
+def cache_image(chat_id: int, user_id: int, raw: bytes, mime: str) -> str:
+    """Кладёт байты фото в media_cache и отдаёт путь — ссылка на КОНКРЕТНОЕ фото.
+
+    Имя по sha1: та же картинка второй раз не пишется, а «что за фото было в том
+    сообщении» модель (и юзер) определяют по имени файла.
+    """
+    sub = (mime or "image/jpeg").split("/")[-1].lower().replace("jpeg", "jpg")
+    name = f"{chat_id}-{user_id}-{hashlib.sha1(raw).hexdigest()[:10]}.{sub}"
+    path = os.path.join(MEDIA_CACHE_DIR, name)
+    if not os.path.exists(path):
+        os.makedirs(MEDIA_CACHE_DIR, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(raw)
+    return path
+
+
+def media_data_uri(path: str) -> str:
+    sub = "jpeg" if path.endswith(".jpg") else path.rsplit(".", 1)[-1].lower()
+    with open(path, "rb") as f:
+        return f"data:image/{sub};base64,{base64.b64encode(f.read()).decode()}"
+
+
+def local_turn_media(chat_id: int, user_id: int, parts: list) -> tuple:
+    """Готовит реплику к записи в окно: (текст для истории, путь к первому фото).
+
+    Фото текущего запроса сохраняем в кэш, а в тексте оставляем имя файла — так
+    в истории видно, какое именно фото имели в виду, без пересылки base64.
+    """
+    texts, first = [], ""
+    for p in parts:
+        if p.get("type") == "text":
+            texts.append(p.get("text", ""))
+        elif p.get("type") == "image":
+            try:
+                path = cache_image(chat_id, user_id, base64.b64decode(p.get("data", "")),
+                                   p.get("mime_type", "image/jpeg"))
+            except Exception as exc:
+                logger.warning("media cache failed: %r", exc)
+                texts.append("[фото]")
+                continue
+            texts.append(f"[фото: {os.path.basename(path)}]")
+            first = first or path
+    return "\n".join(t for t in texts if t), first
 
 
 # ---------- gemini ----------
@@ -686,6 +810,25 @@ def ask_local(backend: str, parts: list, user: dict, chat_id: int) -> tuple:
     si = system_instruction_for(user)
     if si:
         messages.append({"role": "system", "content": si})
+    ctx_on = bool(user.get("ctx"))
+    uid = user.get("user_id") or 0
+    turn_text, turn_media = ("", "")
+    if ctx_on:
+        turn_text, turn_media = local_turn_media(chat_id, uid, parts)
+        rows = local_history_get(chat_id, uid)
+        # фото пересылаем только у самых СВЕЖИХ реплик: base64 съедает маленькое
+        # локальное окно, а не-vision модель на картинке вообще падает
+        pics = [i for i, (role, _, path) in enumerate(rows)
+                if role == "user" and path and os.path.exists(path)]
+        keep = set(pics[-LOCAL_CTX_IMAGES:])
+        for i, (role, prev_text, prev_media) in enumerate(rows):
+            entry = {"role": role, "content": prev_text}
+            if i in keep:
+                entry["content"] = [
+                    {"type": "image_url", "image_url": {"url": media_data_uri(prev_media)}},
+                    {"type": "text", "text": prev_text},
+                ]
+            messages.append(entry)
     messages.append({"role": "user", "content": content})
     body = {"model": model_id, "messages": messages, "stream": False}
     try:
@@ -706,6 +849,9 @@ def ask_local(backend: str, parts: list, user: dict, chat_id: int) -> tuple:
         text = ((choices[0].get("message") or {}).get("content") or "").strip()
     if not text:
         raise GeminiError(f"{backend} вернул пустой ответ")
+    if ctx_on:
+        local_history_add(chat_id, uid, "user", turn_text, turn_media)
+        local_history_add(chat_id, uid, "assistant", text[:LOCAL_CTX_ANSWER])
     return text, (data.get("model") or status_label(user))
 
 
@@ -1041,6 +1187,16 @@ OWNER_HELP = (
 )
 
 
+def ctx_note(user: dict) -> str:
+    """Как именно у текущего бэкенда устроена память диалога (для /chat)."""
+    if backend_for(user) in LOCAL_BACKENDS:
+        return (f"локальная модель stateless, поэтому держим последние ~"
+                f"{LOCAL_CTX_TURNS} реплик у нас в базе; фото — из папки media_cache, "
+                f"пересылаем только {LOCAL_CTX_IMAGES} самых свежих. Сброс: /clear")
+    return ("Gemini помнит прошлые реплики сам (история хранится у Google). "
+            "Сброс: /clear")
+
+
 def create_bot(token: str) -> telebot.TeleBot:
     bot = telebot.TeleBot(token, threaded=True, parse_mode="HTML")
 
@@ -1308,15 +1464,15 @@ def create_bot(token: str) -> telebot.TeleBot:
             state = args.lower()
             if state in ("on", "1", "enable"):
                 set_user(uid, "ctx", 1)
-                bot.reply_to(message, "🟢 Память диалога включена: Gemini будет помнить "
-                             "прошлые реплики (история хранится у Google). Сброс: /clear")
+                bot.reply_to(message, "🟢 Память диалога включена: " + ctx_note(user))
             elif state in ("off", "0", "disable"):
                 set_user(uid, "ctx", 0)
                 bot.reply_to(message, "🔴 Память выключена, каждый вопрос с чистого листа.")
             else:
                 on = bool(user.get("ctx"))
                 bot.reply_to(message, f"ℹ️ Память диалога: <b>{'вкл' if on else 'выкл'}</b>\n"
-                             "/chat on|off")
+                             + (ctx_note(user) if on else "Каждый вопрос с чистого листа.")
+                             + "\n/chat on|off, сброс — /clear")
 
         elif cmd == "clear":
             clear_ctx(message.chat.id, uid)
