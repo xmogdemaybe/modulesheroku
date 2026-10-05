@@ -25,9 +25,13 @@
 #     "local_for_all": true,   # true — локальные бэкенды доступны ВСЕМ юзерам
 #     "owner_id": 123456789    # твой user_id: тебе локалка доступна всегда,
 #                              # даже когда local_for_all=false (чтобы тестить)
+#
+#     # --- GLM (z.ai), необязательно: ключ у каждого юзера СВОЙ (/glmkey) ---
+#     "glm_url": "https://api.z.ai/api/paas/v4",   # Китай: open.bigmodel.cn/api/paas/v4
+#     "glm_model": "glm-4.6"   # модель по умолчанию, если юзер не выбрал /glmmodel
 #   }
-#   Любое из этих полей также читается из env (LMSTUDIO_URL, LOCAL_FOR_ALL,
-#   OWNER_ID и т.д.) — env используется, если поля нет в config.json.
+#   Любое из этих полей также читается из env (LMSTUDIO_URL, GLM_URL, GLM_MODEL,
+#   LOCAL_FOR_ALL, OWNER_ID и т.д.) — env используется, если поля нет в config.json.
 #
 # ВАЖНО про гео: с российских IP api.telegram.org и generativelanguage.googleapis.com
 # могут не отвечать — тогда впиши "proxy" в config.json (VPN/прокси) или крути
@@ -41,10 +45,12 @@
 #   /prompts             список именованных промптов
 #   /use <имя>|default   активный промпт
 #   /del <имя>           удалить промпт
-#   /model [имя]         модель (по умолчанию gemini-3.8-flash)
+#   /model [имя]         модель Gemini (по умолчанию gemini-3.8-flash)
 #   /think [уровень]     раздумья Gemini: minimal|low|medium|high (по умолч. medium)
-#   /backend [имя]       gemini | lmstudio | koboldcpp (локалка без ключа Gemini)
-#   /chat [on|off]       память диалога (Gemini помнит прошлые реплики)
+#   /backend [имя]       gemini | glm | lmstudio | koboldcpp
+#   /glmkey <ключ>       свой GLM-ключ (z.ai) — нужен для бэкенда glm
+#   /glmmodel [имя]      GLM-модель (по умолчанию glm-4.6)
+#   /chat [on|off]       память диалога (только Gemini)
 #   /clear               сбросить память в этом чате
 #
 # Только владелец (owner_id) — управление моделями LM Studio:
@@ -105,6 +111,15 @@ LOCAL_DEFAULT_URL = {
 }
 LOCAL_TIMEOUT = (10, 600)     # локальная генерация бывает очень долгой
 
+# GLM (z.ai / Zhipu) — облачный OpenAI-совместимый бэкенд, ключ СВОЙ у каждого
+# юзера (как Gemini). Base URL и модель переопределяются в config.json / env:
+# glm_url (междунар. https://api.z.ai/api/paas/v4, Китай open.bigmodel.cn/api/paas/v4),
+# glm_model. Авторизация — заголовок Authorization: Bearer <ключ>.
+GLM_DEFAULT_URL = "https://api.z.ai/api/paas/v4"
+GLM_DEFAULT_MODEL = "glm-4.6"
+CLOUD_KEY_BACKENDS = ("gemini", "glm")   # облачные, нужен личный ключ
+ALL_BACKENDS = ("gemini", "glm", "lmstudio", "koboldcpp")
+
 CONFIG = {}                   # заполняется в main() из config.json (+ env-фолбэк)
 
 # Момент запуска процесса. Апдейты, отправленные РАНЬШЕ него, пришли пока бот был
@@ -141,6 +156,14 @@ NO_KEY_TEXT = (
 RESTART_NOTICE = (
     "🔄 <b>Я перезапустился</b> и не видел твои сообщения, пока был выключен — они "
     "не обработаны.\nПришли запрос ещё раз, пожалуйста."
+)
+
+GLM_NO_KEY_TEXT = (
+    "🔑 <b>Сначала привяжи свой GLM API-ключ (z.ai)</b> — просто отправь его следующим "
+    "сообщением или через <code>/glmkey &lt;ключ&gt;</code>.\n\n"
+    "Где взять: <code>z.ai</code> → войти → <b>API Keys</b> (или bigmodel.cn для Китая). "
+    "Ключ общий для OpenAI-совместимого API GLM, хранится только у тебя в базе.\n\n"
+    "Модель: <code>/glmmodel glm-4.6</code> (по умолчанию <code>" + GLM_DEFAULT_MODEL + "</code>)."
 )
 
 IMAGE_MIMES = {
@@ -314,7 +337,9 @@ def db_init():
                 active_prompt TEXT DEFAULT '',
                 ctx INTEGER DEFAULT 0,
                 think TEXT DEFAULT '',
-                backend TEXT DEFAULT 'gemini'
+                backend TEXT DEFAULT 'gemini',
+                glm_key TEXT DEFAULT '',
+                glm_model TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS prompts(
                 user_id INTEGER, name TEXT, text TEXT,
@@ -332,6 +357,10 @@ def db_init():
             conn.execute("ALTER TABLE users ADD COLUMN think TEXT DEFAULT ''")
         if "backend" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN backend TEXT DEFAULT 'gemini'")
+        if "glm_key" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN glm_key TEXT DEFAULT ''")
+        if "glm_model" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN glm_model TEXT DEFAULT ''")
 
 
 def get_user(user_id: int) -> dict:
@@ -342,7 +371,8 @@ def get_user(user_id: int) -> dict:
 
 
 def set_user(user_id: int, field: str, value):
-    assert field in ("api_key", "prompt", "model", "active_prompt", "ctx", "think", "backend")
+    assert field in ("api_key", "prompt", "model", "active_prompt", "ctx", "think",
+                     "backend", "glm_key", "glm_model")
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
         conn.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, user_id))
@@ -462,11 +492,11 @@ def local_for_all() -> bool:
 
 def backend_for(user: dict) -> str:
     be = (user.get("backend") or "gemini").strip().lower()
-    return be if (be in LOCAL_BACKENDS or be == "gemini") else "gemini"
+    return be if be in ALL_BACKENDS else "gemini"
 
 
 def backend_allowed(uid: int, be: str) -> bool:
-    if be == "gemini":
+    if be in CLOUD_KEY_BACKENDS:      # gemini/glm: свой ключ у каждого, доступны всем
         return True
     if be not in LOCAL_BACKENDS:
         return False
@@ -482,11 +512,46 @@ def local_model_id(backend: str) -> str:
     return cfg_get(f"{backend}_model") or "local-model"
 
 
+def glm_url() -> str:
+    return (cfg_get("glm_url") or GLM_DEFAULT_URL).rstrip("/")
+
+
+def glm_key_for(user: dict) -> str:
+    return (user.get("glm_key") or "").strip()
+
+
+def glm_model_for(user: dict) -> str:
+    return (user.get("glm_model") or "").strip() or (cfg_get("glm_model") or GLM_DEFAULT_MODEL)
+
+
+def needs_key(user: dict) -> bool:
+    """True, если текущий бэкенд юзера требует личный ключ, а его нет."""
+    be = backend_for(user)
+    if be == "gemini":
+        return not api_key_for(user)
+    if be == "glm":
+        return not glm_key_for(user)
+    return False
+
+
+def no_key_text(user: dict) -> str:
+    return GLM_NO_KEY_TEXT if backend_for(user) == "glm" else NO_KEY_TEXT
+
+
+def mask_key(key: str) -> str:
+    k = (key or "").strip()
+    if len(k) <= 12:
+        return k[:3] + "…"
+    return k[:8] + "…" + k[-4:]
+
+
 def status_label(user: dict) -> str:
     """Что показываем в статусе «…думает»: имя модели Gemini или локальный бэкенд."""
     be = backend_for(user)
     if be == "gemini":
         return model_for(user)
+    if be == "glm":
+        return glm_model_for(user)
     if be == "lmstudio":
         # конкретную модель знает только сервер (что сейчас загружено) — в статусе
         # пишем нейтрально, точное имя придёт в строке ответа из data['model']
@@ -641,13 +706,65 @@ def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
     return text
 
 
+# ---------- GLM (z.ai / Zhipu), OpenAI-совместимый облачный бэкенд ----------
+
+def ask_glm(parts: list, user: dict, chat_id: int) -> str:
+    """Запрос к GLM. Ключ свой у каждого юзера (glm_key). Stateless: память диалога
+    (/chat) здесь не работает — это фича Gemini (previous_interaction_id)."""
+    key = glm_key_for(user)
+    if not key:
+        raise GeminiError("GLM-ключ не задан: /glmkey <ключ>")
+    content, err = gemini_parts_to_openai(parts)
+    if err:
+        raise GeminiError(err)
+    messages = []
+    si = system_instruction_for(user)
+    if si:
+        messages.append({"role": "system", "content": si})
+    messages.append({"role": "user", "content": content})
+    body = {"model": glm_model_for(user), "messages": messages, "stream": False}
+    url = glm_url()
+    try:
+        resp = requests.post(f"{url}/chat/completions", json=body,
+                             headers={"Authorization": f"Bearer {key}",
+                                      "Content-Type": "application/json"},
+                             timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        raise GeminiError(f"не достучаться до GLM ({url}): {type(exc).__name__}: {exc}")
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    if resp.status_code != 200:
+        raise GeminiError(f"GLM {resp.status_code}: {_glm_err_text(data)}")
+    choices = data.get("choices") or []
+    text = ""
+    if choices:
+        text = ((choices[0].get("message") or {}).get("content") or "").strip()
+    if not text:
+        raise GeminiError("GLM вернул пустой ответ")
+    return text
+
+
+def _glm_err_text(data: dict) -> str:
+    """Достаёт человекочитаемую ошибку GLM (error.message / error строкой / code)."""
+    err = (data or {}).get("error")
+    if isinstance(err, dict):
+        msg = err.get("message") or err.get("code") or ""
+    elif isinstance(err, str):
+        msg = err
+    else:
+        msg = ""
+    return (msg or json.dumps(data, ensure_ascii=False))[:300]
+
+
 # ---------- локальные бэкенды (LM Studio / koboldcpp, OpenAI-совместимые) ----------
 
 def gemini_parts_to_openai(parts: list) -> tuple:
     """Gemini content-блоки → OpenAI 'content'. Возвращает (content, error).
 
-    Локальные серверы понимают текст и (LM Studio с vision-моделью) картинки как
-    data-URI. Аудио/видео/документы не поддерживаются — возвращаем понятную ошибку.
+    OpenAI-совместимые бэкенды (GLM, LM Studio с vision-моделью) понимают текст и
+    картинки как data-URI. Аудио/видео/документы не поддерживаются — понятная ошибка.
     """
     content = []
     for p in parts:
@@ -659,7 +776,7 @@ def gemini_parts_to_openai(parts: list) -> tuple:
             content.append({"type": "image_url",
                             "image_url": {"url": f"data:{mime};base64,{p.get('data', '')}"}})
         else:
-            return None, f"локальный бэкенд не поддерживает тип «{t}» (только текст и фото)"
+            return None, f"этот бэкенд не поддерживает тип «{t}» (только текст и фото)"
     return content, None
 
 
@@ -707,8 +824,10 @@ def ask_local(backend: str, parts: list, user: dict, chat_id: int) -> tuple:
 
 
 def dispatch_ask(parts: list, user: dict, chat_id: int) -> tuple:
-    """Единая точка: (answer_text, model_label). Выбирает Gemini или локальный бэкенд."""
+    """Единая точка: (answer_text, model_label). Gemini / GLM / локальный бэкенд."""
     be = backend_for(user)
+    if be == "glm":
+        return ask_glm(parts, user, chat_id), glm_model_for(user)
     if be in LOCAL_BACKENDS:
         return ask_local(be, parts, user, chat_id)
     return ask_gemini(parts, user, chat_id), model_for(user)
@@ -984,8 +1103,10 @@ HELP_TEXT = (
     "/del &lt;имя&gt; — удалить промпт\n"
     "/model [имя] — модель (сейчас по умолчанию <code>" + DEFAULT_MODEL + "</code>)\n"
     "/think [minimal|low|medium|high] — уровень раздумий (ниже = быстрее)\n"
-    "/backend [gemini|lmstudio|koboldcpp] — облако Gemini или локальный сервер\n"
-    "/chat [on|off] — память диалога\n"
+    "/backend [gemini|glm|lmstudio|koboldcpp] — облако (Gemini/GLM) или локальный сервер\n"
+    "/glmkey &lt;ключ&gt; — свой GLM-ключ (z.ai), нужен для бэкенда glm\n"
+    "/glmmodel [имя] — GLM-модель (по умолчанию <code>" + GLM_DEFAULT_MODEL + "</code>)\n"
+    "/chat [on|off] — память диалога (только Gemini)\n"
     "/clear — сбросить память в этом чате"
 )
 
@@ -1140,8 +1261,8 @@ def create_bot(token: str) -> telebot.TeleBot:
 
         if cmd in ("start", "help"):
             help_text = HELP_TEXT + (OWNER_HELP if is_owner(uid) else "")
-            if not api_key_for(user):
-                bot.reply_to(message, help_text + "\n\n" + NO_KEY_TEXT)
+            if needs_key(user):
+                bot.reply_to(message, help_text + "\n\n" + no_key_text(user))
             else:
                 bot.reply_to(message, help_text)
 
@@ -1234,13 +1355,14 @@ def create_bot(token: str) -> telebot.TeleBot:
             cur = backend_for(user)
             be = args.lower()
             if not be:
-                avail = ["gemini"] + [b for b in LOCAL_BACKENDS if backend_allowed(uid, b)]
+                avail = list(CLOUD_KEY_BACKENDS) + [b for b in LOCAL_BACKENDS if backend_allowed(uid, b)]
                 bot.reply_to(message, f"ℹ️ Бэкенд: <b>{esc(cur)}</b>\n"
                              f"Доступны тебе: {', '.join('<code>'+esc(a)+'</code>' for a in avail)}\n"
-                             "Сменить: /backend gemini|lmstudio|koboldcpp")
-            elif be not in LOCAL_BACKENDS and be != "gemini":
+                             "Сменить: /backend gemini|glm|lmstudio|koboldcpp")
+            elif be not in ALL_BACKENDS:
                 bot.reply_to(message, "❌ Не знаю такого бэкенда. Есть: "
-                             "<code>gemini</code>, <code>lmstudio</code>, <code>koboldcpp</code>.")
+                             "<code>gemini</code>, <code>glm</code>, "
+                             "<code>lmstudio</code>, <code>koboldcpp</code>.")
             elif not backend_allowed(uid, be):
                 bot.reply_to(message, "❌ Локальные бэкенды сейчас отключены для всех "
                              "(владелец бота не включил <code>local_for_all</code>).")
@@ -1248,9 +1370,38 @@ def create_bot(token: str) -> telebot.TeleBot:
                 set_user(uid, "backend", be)
                 if be == "gemini":
                     bot.reply_to(message, "✅ Бэкенд: <b>Gemini</b> (облако, нужен свой API-ключ).")
+                elif be == "glm":
+                    has = bool(glm_key_for(get_user(uid)))
+                    bot.reply_to(message, "✅ Бэкенд: <b>GLM (z.ai)</b>, модель "
+                                 f"<code>{esc(glm_model_for(get_user(uid)))}</code>.\n"
+                                 + ("Ключ уже привязан — можно писать." if has else
+                                    "Привяжи свой ключ: /glmkey &lt;ключ&gt; (или просто пришли его)."))
                 else:
                     bot.reply_to(message, f"✅ Бэкенд: <b>{esc(LOCAL_BACKENDS[be])}</b> "
-                                 f"(<code>{esc(local_url(be))}</code>). API-ключ Gemini не нужен.")
+                                 f"(<code>{esc(local_url(be))}</code>). API-ключ не нужен.")
+
+        elif cmd == "glmkey":
+            key = args.strip()
+            if key and looks_like_key(key):
+                set_user(uid, "glm_key", key)
+                bot.reply_to(message, f"✅ <b>GLM-ключ сохранён:</b> <code>{esc(mask_key(key))}</code>\n"
+                             "Проверю первым же запросом. Модель: /glmmodel [имя].")
+            elif key:
+                bot.reply_to(message, "❌ Это не похоже на ключ (без пробелов, 15+ символов).")
+            else:
+                has = bool(glm_key_for(user))
+                shown = mask_key(glm_key_for(user)) if has else "—"
+                bot.reply_to(message, f"🔑 GLM-ключ: {'привязан ✅ ' + shown if has else 'НЕ привязан ❌'}\n"
+                             "Задать: /glmkey &lt;ключ&gt; (z.ai → API Keys).")
+
+        elif cmd == "glmmodel":
+            name = args.strip()
+            if name:
+                set_user(uid, "glm_model", name)
+                bot.reply_to(message, f"✅ GLM-модель: <code>{esc(name)}</code>")
+            else:
+                bot.reply_to(message, f"ℹ️ GLM-модель: <code>{esc(glm_model_for(user))}</code>\n"
+                             "Сменить: /glmmodel glm-4.6 (или glm-4.5-air, glm-4.5-flash, glm-4.5v для фото).")
 
         elif cmd == "chat":
             state = args.lower()
@@ -1363,8 +1514,8 @@ def create_bot(token: str) -> telebot.TeleBot:
         chat_id = first.chat.id
         uid = first.from_user.id if first.from_user else 0
         user = get_user(uid)
-        if backend_for(user) == "gemini" and not api_key_for(user):
-            bot.reply_to(first, NO_KEY_TEXT)
+        if needs_key(user):
+            bot.reply_to(first, no_key_text(user))
             return
         media_msgs = [m for m in msgs if media_kind(m)]
         query = ""
@@ -1409,13 +1560,20 @@ def create_bot(token: str) -> telebot.TeleBot:
         chat_id = message.chat.id
 
         # нет ключа — любое текстовое сообщение считается попыткой его ввести
-        # (для локальных бэкендов ключ Gemini не нужен)
-        if backend_for(user) == "gemini" and not api_key_for(user):
+        # (для локальных бэкендов ключ не нужен вовсе)
+        if needs_key(user):
+            be = backend_for(user)
             text = (message.text or "").strip()
             if text and looks_like_key(text):
-                try_save_key(message, text)
+                if be == "glm":
+                    set_user(uid, "glm_key", text)
+                    bot.reply_to(message, f"✅ <b>GLM-ключ сохранён:</b> "
+                                 f"<code>{esc(mask_key(text))}</code>.\n"
+                                 "Теперь просто напиши вопрос или кинь фото/войс.")
+                else:
+                    try_save_key(message, text)
             else:
-                bot.reply_to(message, NO_KEY_TEXT)
+                bot.reply_to(message, no_key_text(user))
             return
 
         media_msgs = []
@@ -1455,6 +1613,7 @@ def create_bot(token: str) -> telebot.TeleBot:
     @bot.message_handler(commands=[
         "start", "help", "key", "prompt", "prompts", "save", "use", "del",
         "model", "think", "backend", "chat", "clear",
+        "glmkey", "glmmodel",
         "lmsmodels", "lmsload", "lmsunload", "lmsuse",
     ])
     def on_command(message):
