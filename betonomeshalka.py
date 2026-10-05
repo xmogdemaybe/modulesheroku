@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 # requires: aiohttp
-# GeminiAI — ответы Gemini прямо в сообщениях (Hikka / Heroku).
-#
 # Как работает: пишешь «.gemini <запрос>» — отдельным сообщением, ответом на
 # фото/войс/видео/док или в подписи к фото. Модуль РЕДАКТИРУЕТ твоё сообщение:
 # сверху остаётся запрос, ниже — ответ Gemini. Системный промпт, API-ключ,
@@ -53,7 +51,7 @@ from .. import loader, utils
 
 logger = logging.getLogger(__name__)
 
-MODNAME = "GeminiAI"
+MODNAME = "betonomeshalka"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-3.8-flash"
 
@@ -209,7 +207,7 @@ class GeminiError(Exception):
 
 
 @loader.tds
-class GeminiAI(loader.Module):
+class Betonomeshalka(loader.Module):
     """Ask Gemini from any message: text, photos, voice notes, videos, documents"""
 
     strings = {"name": MODNAME}
@@ -237,7 +235,7 @@ class GeminiAI(loader.Module):
         try:
             self.db.set(MODNAME, key, value)
         except Exception:
-            logger.exception("[GeminiAI] db.set failed for %s", key)
+            logger.exception("[betonomeshalka] db.set failed for %s", key)
 
     # ---------- http ----------
 
@@ -390,7 +388,7 @@ class GeminiAI(loader.Module):
                     try:
                         raw = await msg.download_media(bytes)
                     except Exception as exc:
-                        logger.error("[GeminiAI] download failed: %r", exc)
+                        logger.error("[betonomeshalka] download failed: %r", exc)
                         return [], "не смог скачать файл"
                     text = raw[:MAX_TEXT_DOC * 2].decode("utf-8", errors="replace")
                     cut = "\n…(обрезано)" if len(text) > MAX_TEXT_DOC else ""
@@ -410,7 +408,7 @@ class GeminiAI(loader.Module):
         try:
             data = await msg.download_media(bytes)
         except Exception as exc:
-            logger.error("[GeminiAI] download failed: %r", exc)
+            logger.error("[betonomeshalka] download failed: %r", exc)
             return [], "не смог скачать медиа"
         if not data:
             return [], "медиа пустое"
@@ -440,7 +438,7 @@ class GeminiAI(loader.Module):
             same.reverse()  # get_messages отдаёт свежие первыми → разворачиваем
             return same
         except Exception as exc:
-            logger.error("[GeminiAI] album gather failed: %r", exc)
+            logger.error("[betonomeshalka] album gather failed: %r", exc)
             return [msg]
 
     # ---------- api ----------
@@ -473,7 +471,7 @@ class GeminiAI(loader.Module):
                         retry = int(resp.headers.get("Retry-After", "5"))
                     except ValueError:
                         retry = 5
-                    logger.warning("[GeminiAI] %s, retry in %ss", resp.status, retry)
+                    logger.warning("[betonomeshalka] %s, retry in %ss", resp.status, retry)
                     await asyncio.sleep(min(max(retry, 1), 30))
                     continue
                 if resp.status != 200:
@@ -677,7 +675,7 @@ class GeminiAI(loader.Module):
             else:
                 active = self._get("active_prompt", "") or "глобальный"
                 info = (
-                    f"🤖 <b>GeminiAI</b>\n"
+                    f"🤖 <b>betonomeshalka</b>\n"
                     f"<b>Бэкенд:</b> <code>{utils.escape_html(backend)}</code>\n"
                     f"<b>Модель:</b> <code>{utils.escape_html(model)}</code>\n"
                     f"<b>Промпт:</b> <code>{utils.escape_html(str(active))}</code>\n"
@@ -717,11 +715,11 @@ class GeminiAI(loader.Module):
             else:
                 answer = await self._ask(parts, message.chat_id, key)
         except GeminiError as exc:
-            logger.error("[GeminiAI] api error: %s", exc)
+            logger.error("[betonomeshalka] api error: %s", exc)
             await show(head + f"❌ {utils.escape_html(str(exc))}")
             return
         except Exception as exc:
-            logger.exception("[GeminiAI] unexpected error")
+            logger.exception("[betonomeshalka] unexpected error")
             await show(head + f"❌ {utils.escape_html(type(exc).__name__)} (см. heroku logs)")
             return
         await show(head + f"🤖 <b>{m_esc}</b> — ответ:\n{md_to_tg_html(self._fit(answer))}")
@@ -1119,14 +1117,14 @@ class GeminiAI(loader.Module):
         await self._run(message, query, notes_text=block)
 
     @loader.command(
-        ru_doc="Справка по командам GeminiAI",
-        en_doc="GeminiAI commands help",
+        ru_doc="Справка по командам betonomeshalka",
+        en_doc="betonomeshalka commands help",
     )
     async def ghelp(self, message):
         """Show help"""
         await utils.answer(
             message,
-            "🤖 <b>GeminiAI</b>\n"
+            "🤖 <b>betonomeshalka</b>\n"
             f"Бэкенд: <code>{utils.escape_html(self._backend())}</code>\n\n"
             "<code>.gemini &lt;запрос&gt;</code> — спросить (текст, ответ на фото/войс/видео/док, подпись к фото)\n"
             "<code>.gkey &lt;ключ&gt;</code> — API-ключ (aistudio.google.com → API keys)\n"

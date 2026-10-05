@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-# Gemini Bot — Telegram-бот (Bot API, БЕЗ MTProto) с Gemini внутри.
+# xyetanapythonepidor — Telegram-бот (Bot API, БЕЗ MTProto): Gemini / GLM (z.ai)
+# / LM Studio / koboldcpp, ключ у каждого юзера свой.
 #
 # Каждый юзер привязывает СВОЙ Gemini API-ключ: при первом сообщении бот
 # просит ключ, проверяет его реальным тест-запросом к Gemini и сохраняет в
@@ -7,7 +8,7 @@
 #
 # Первый запуск (никаких export не нужно):
 #   pip install pyTelegramBotAPI requests
-#   python gemini_bot.py
+#   python xyetanapythonepidor.py
 # Бот сам спросит токен в терминале (получить у @BotFather → /newbot) и
 # сохранит его в config.json рядом со скриптом. Остановка — Ctrl+C (чистый
 # выход без трейсбеков).
@@ -59,8 +60,9 @@
 #   /lmsunload <id>      выгрузить модель
 #   /lmsuse <id>         приоритетная модель (чат берёт ту, что загружена)
 #
-# База: SQLite (gemini_bot.db рядом со скриптом). Ключи, промпты, модель и
-# память — свои на каждого юзера (user_id). История переписки при /chat on
+# База: SQLite (gemini_bot.db рядом со скриптом — имя не меняем, там ключи
+# юзеров). Ключи, промпты, модель и память — свои на каждого юзера (user_id).
+# История переписки при /chat on
 # живёт на серверах Google (previous_interaction_id), локально только id.
 # Логи — в терминал, в чат уходят только ответы и ошибки.
 
@@ -79,7 +81,7 @@ import time
 import requests
 import telebot
 
-logger = logging.getLogger("gemini_bot")
+logger = logging.getLogger("xyetanapythonepidor")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # telebot любит спамить «Warning: this message appearance will be changed...»
 # и служебным INFO — глушим, в консоли оставляем только своё и ошибки.
