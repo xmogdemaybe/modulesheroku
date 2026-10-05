@@ -107,6 +107,11 @@ LOCAL_TIMEOUT = (10, 600)     # локальная генерация бывае
 
 CONFIG = {}                   # заполняется в main() из config.json (+ env-фолбэк)
 
+# Момент запуска процесса. Апдейты, отправленные РАНЬШЕ него, пришли пока бот был
+# выключен — мы их не обрабатываем (иначе на старте в Gemini улетел бы весь накопившийся
+# флуд), а лишь один раз на чат пишем «перезапустился, пришли запрос ещё раз».
+START_TIME = time.time()
+
 SEP = "──────────"
 
 # «3.7» / «3.8-flash» → «gemini-3.7-flash» и т.п. Полные имена не трогаем.
@@ -130,6 +135,12 @@ NO_KEY_TEXT = (
     "Где взять: зайди с VPN на <code>aistudio.google.com</code> → <b>Get API key</b> → "
     "<b>Create API key</b> и скопируй его сюда.\n\n"
     "Ключ проверю тест-запросом и сохраню в базу — он твой личный, у каждого своя связка."
+)
+
+# Шлётся ОДИН раз на чат за пропущенные оффлайн-сообщения (см. START_TIME).
+RESTART_NOTICE = (
+    "🔄 <b>Я перезапустился</b> и не видел твои сообщения, пока был выключен — они "
+    "не обработаны.\nПришли запрос ещё раз, пожалуйста."
 )
 
 IMAGE_MIMES = {
@@ -917,6 +928,12 @@ def parse_command(text: str) -> tuple:
     return cmd, rest.strip()
 
 
+def is_stale(message) -> bool:
+    """True, если сообщение прислали ДО запуска бота (оно накопилось оффлайн)."""
+    d = getattr(message, "date", None)
+    return bool(d) and d < START_TIME
+
+
 HELP_TEXT = (
     "🤖 <b>Gemini Bot</b>\n\n"
     "Просто напиши текст, либо кинь фото/войс/видео/документ (можно с подписью-"
@@ -953,6 +970,21 @@ def create_bot(token: str) -> telebot.TeleBot:
             bot.reply_to(message, f"❌ {esc(text)}")
         except Exception:
             logger.exception("failed to send error")
+
+    # Пропущенные оффлайн-апдейты: одно уведомление на чат, без обработки запросов.
+    restart_notified = set()
+    restart_lock = threading.Lock()
+
+    def notify_restart(message):
+        chat_id = message.chat.id
+        with restart_lock:
+            if chat_id in restart_notified:
+                return
+            restart_notified.add(chat_id)
+        try:
+            bot.reply_to(message, RESTART_NOTICE)
+        except Exception:
+            logger.exception("failed to send restart notice")
 
     def try_save_key(message, key: str):
         """Валидирует ключ тест-запросом к Gemini и сохраняет на юзера.
@@ -1387,6 +1419,9 @@ def create_bot(token: str) -> telebot.TeleBot:
         "lmsmodels", "lmsload", "lmsunload", "lmsuse",
     ])
     def on_command(message):
+        if is_stale(message):
+            notify_restart(message)   # накопилось оффлайн — не выполняем, зовём повторить
+            return
         cmd, args = parse_command(message.text)
         try:
             handle_command(message, cmd, args)
@@ -1402,6 +1437,9 @@ def create_bot(token: str) -> telebot.TeleBot:
         # команды в группах могут прилетать как текст «/cmd@BotName» — фильтруем
         cmd, _ = parse_command(message.text or "")
         if cmd:
+            return
+        if is_stale(message):
+            notify_restart(message)   # пропущенные оффлайн-запросы — один раз зовём повторить
             return
         try:
             mgid = getattr(message, "media_group_id", None)
@@ -1440,9 +1478,10 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     try:
-        # skip_pending: после перезапуска не отвечать на старые сообщения
+        # Пропущенные оффлайн-апдейты забираем (skip_pending=False), но не обрабатываем:
+        # is_stale() отсечёт их и один раз на чат попросит повторить запрос.
         bot.infinity_polling(timeout=30, long_polling_timeout=25,
-                             skip_pending=True, logger_level=logging.ERROR)
+                             skip_pending=False, logger_level=logging.ERROR)
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
