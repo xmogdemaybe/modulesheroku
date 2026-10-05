@@ -51,7 +51,7 @@
 #   /lmsmodels           список скачанных моделей (в памяти / активная)
 #   /lmsload <id>        загрузить модель в память
 #   /lmsunload <id>      выгрузить модель
-#   /lmsuse <id>         активная модель для чата (backend=lmstudio)
+#   /lmsuse <id>         приоритетная модель (чат берёт ту, что загружена)
 #
 # База: SQLite (gemini_bot.db рядом со скриптом). Ключи, промпты, модель и
 # память — свои на каждого юзера (user_id). История переписки при /chat on
@@ -487,6 +487,10 @@ def status_label(user: dict) -> str:
     be = backend_for(user)
     if be == "gemini":
         return model_for(user)
+    if be == "lmstudio":
+        # конкретную модель знает только сервер (что сейчас загружено) — в статусе
+        # пишем нейтрально, точное имя придёт в строке ответа из data['model']
+        return LOCAL_BACKENDS["lmstudio"]
     return cfg_get(f"{be}_model") or LOCAL_BACKENDS[be]
 
 
@@ -667,12 +671,20 @@ def ask_local(backend: str, parts: list, user: dict, chat_id: int) -> tuple:
     content, err = gemini_parts_to_openai(parts)
     if err:
         raise GeminiError(err)
+    if backend == "lmstudio":
+        # целимся в реально загруженную модель, иначе LM Studio авто-загрузит
+        # дефолтную из конфига и словит OOM
+        model_id, merr = lmstudio_chat_model(cfg_get("lmstudio_model") or "")
+        if merr:
+            raise GeminiError(merr)
+    else:
+        model_id = local_model_id(backend)
     messages = []
     si = system_instruction_for(user)
     if si:
         messages.append({"role": "system", "content": si})
     messages.append({"role": "user", "content": content})
-    body = {"model": local_model_id(backend), "messages": messages, "stream": False}
+    body = {"model": model_id, "messages": messages, "stream": False}
     try:
         resp = requests.post(f"{url}/chat/completions", json=body, timeout=LOCAL_TIMEOUT)
     except requests.RequestException as exc:
@@ -802,6 +814,31 @@ def lms_unload(key: str) -> tuple:
     if resp.status_code != 200:
         return False, f"HTTP {resp.status_code}: {(resp.text or '')[:200]}"
     return True, "выгружена из памяти"
+
+
+def lmstudio_chat_model(prefer: str = "") -> tuple:
+    """Какая модель СЕЙЧАС загружена в LM Studio и пригодна для чата.
+
+    Возвращает (model_key, error). LM Studio АВТОМАТИЧЕСКИ грузит модель, если в
+    /v1/chat/completions попросить незагруженную, — отсюда OOM, когда бот слал дефолт
+    из конфига вместо реально загруженной модели. Поэтому всегда целимся в уже
+    загруженную (llm/vlm, не embeddings); если ничего не загружено — ошибка, а не
+    молчаливая автозагрузка.
+    """
+    try:
+        models = lms_list_models()
+    except GeminiError:
+        # не смогли спросить состояние — падаем на конфиг (прежнее поведение)
+        return (prefer or local_model_id("lmstudio")), None
+    loaded = [m.get("id") for m in models
+              if m.get("state") == "loaded" and m.get("type") in ("llm", "vlm") and m.get("id")]
+    if prefer and prefer in loaded:
+        return prefer, None
+    if loaded:
+        return loaded[0], None
+    return None, ("в LM Studio сейчас не загружено ни одной чат-модели — а автозагрузка "
+                  "может съесть всю память. Загрузи сам: <code>/lmsload &lt;id&gt;</code> "
+                  "(список: <code>/lmsmodels</code>) или кнопкой в LM Studio.")
 
 
 # ---------- медиа ----------
@@ -958,7 +995,7 @@ OWNER_HELP = (
     "/lmsmodels — список скачанных моделей (какая в памяти / активная)\n"
     "/lmsload &lt;id&gt; — загрузить модель в память\n"
     "/lmsunload &lt;id&gt; — выгрузить модель\n"
-    "/lmsuse &lt;id&gt; — сделать модель активной для чата"
+    "/lmsuse &lt;id&gt; — приоритетная модель (чат берёт ту, что ЗАГРУЖЕНА)"
 )
 
 
@@ -1075,10 +1112,12 @@ def create_bot(token: str) -> telebot.TeleBot:
                              "Сменить: /lmsuse &lt;id&gt; (список: /lmsmodels)")
                 return
             set_cfg("lmstudio_model", key)
-            bot.reply_to(message, f"✅ Активная модель LM Studio: <code>{esc(key)}</code>.\n"
-                         "Чат с ней — после <code>/backend lmstudio</code>. "
-                         "Если она не в памяти — сначала <code>/lmsload "
-                         + esc(key) + "</code>.")
+            bot.reply_to(message, f"✅ Приоритетная модель LM Studio: <code>{esc(key)}</code>.\n"
+                         "Чат всегда использует ту модель, что сейчас ЗАГРУЖЕНА в LM Studio "
+                         "(чтобы не авто-грузить лишнее и не словить OOM); эта — приоритет, "
+                         "когда загружено несколько.\n"
+                         "Загрузить: <code>/lmsload " + esc(key) + "</code>, "
+                         "бэкенд: <code>/backend lmstudio</code>.")
             return
 
         # load / unload
