@@ -1539,30 +1539,39 @@ def create_bot(token: str) -> telebot.TeleBot:
         """Статус реплаем на запрос юзера → качаем медиа → ОДИН вопрос → правим в ответ."""
         label = status_label(user)
         status_msg = bot.send_message(chat_id, initial_status, **reply_kwargs(trigger))
+        shown = initial_status
+
+        def set_status(text):
+            nonlocal shown
+            # на «такой же текст» Telegram отвечает 400 message is not modified,
+            # а на чисто текстовом запросе стартовый статус и есть «…думает…»
+            if text == shown:
+                return
+            bot.edit_message_text(text, chat_id, status_msg.message_id)
+            shown = text
+
         parts = []
         for m in media_msgs:
             media_parts, err = build_media_parts(bot, m)
             if err:
-                bot.edit_message_text(f"❌ {esc(err)}", chat_id, status_msg.message_id)
+                set_status(f"❌ {esc(err)}")
                 return
             parts.extend(media_parts)
         if reply_text:
             parts.append({"type": "text", "text": f"Сообщение, на которое я отвечаю:\n{reply_text}"})
         parts.append({"type": "text", "text": query})
-        bot.edit_message_text(f"⏳ <i>{esc(label)} думает…</i>", chat_id, status_msg.message_id)
+        set_status(f"⏳ <i>{esc(label)} думает…</i>")
         try:
             answer, used = dispatch_ask(parts, user, chat_id)
         except GeminiError as exc:
             logger.error("api error: %s", exc)
-            bot.edit_message_text(f"❌ {esc(exc)}", chat_id, status_msg.message_id)
+            set_status(f"❌ {esc(exc)}")
             return
         except Exception as exc:
             logger.exception("unexpected error")
-            bot.edit_message_text(f"❌ {esc(type(exc).__name__)} (см. логи)",
-                                  chat_id, status_msg.message_id)
+            set_status(f"❌ {esc(type(exc).__name__)} (см. логи)")
             return
-        bot.edit_message_text(f"🤖 <b>{esc(used)}</b>\n{md_to_tg_html(fit(answer))}",
-                              chat_id, status_msg.message_id)
+        set_status(f"🤖 <b>{esc(used)}</b>\n{md_to_tg_html(fit(answer))}")
 
     def handle_group(msgs):
         first = msgs[0]
