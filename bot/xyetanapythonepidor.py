@@ -49,10 +49,13 @@
 #   /clear               сбросить память в этом чате
 #
 # Только владелец (owner_id) — управление моделями LM Studio:
-#   /lmsmodels           список скачанных моделей (в памяти / активная)
-#   /lmsload <id>        загрузить модель в память
-#   /lmsunload <id>      выгрузить модель
-#   /lmsuse <id>         приоритетная модель (чат берёт ту, что загружена)
+#   /lmsmodels            список скачанных моделей (номера, в памяти / активная)
+#   /lmsload <номер|id>   загрузить модель в память
+#   /lmsunload <номер|id> выгрузить модель
+#   /lmsuse <номер|id>    приоритетная модель (чат берёт ту, что загружена)
+#
+# Ответ бот пишет реплием на сообщение юзера, а текст запроса не повторяет —
+# цитата в Telegram видна сама, в сообщении остаются только модель и ответ.
 #
 # База: SQLite (gemini_bot.db рядом со скриптом — имя не меняем, там ключи
 # юзеров). Ключи, промпты, модель и
@@ -113,8 +116,6 @@ CONFIG = {}                   # заполняется в main() из config.jso
 # выключен — мы их не обрабатываем (иначе на старте в Gemini улетел бы весь накопившийся
 # флуд), а лишь один раз на чат пишем «перезапустился, пришли запрос ещё раз».
 START_TIME = time.time()
-
-SEP = "──────────"
 
 # «3.7» / «3.8-flash» → «gemini-3.7-flash» и т.п. Полные имена не трогаем.
 _MODEL_BARE = re.compile(r"^\d+(?:\.\d+)?(?:-[a-z0-9]+)?$", re.I)
@@ -767,6 +768,27 @@ def lms_list_models() -> list:
     return data.get("data") or []
 
 
+def lms_ref_to_key(ref: str) -> str:
+    """«3» → id ТРЕТЬЕЙ модели из списка /lmsmodels — длинные id руками не пишутся.
+
+    Порядок берём ровно как его отдаёт LM Studio (тот же список, что и в /lmsmodels),
+    иначе номера разъедутся. Полный id проходит как есть, поэтому старые команды
+    не ломаются.
+    """
+    ref = (ref or "").strip()
+    if not ref.isdigit():
+        return ref
+    models = lms_list_models()
+    idx = int(ref)
+    if not 1 <= idx <= len(models):
+        raise GeminiError(f"в списке всего {len(models)} — под №{ref} никого нет, "
+                          f"свежий список: /lmsmodels")
+    key = models[idx - 1].get("id") or ""
+    if not key:
+        raise GeminiError(f"у модели №{ref} нет id — пришли полный id вручную")
+    return key
+
+
 def _lms_instance_id(key: str) -> str:
     """instance_id загруженной модели из /api/v1/models; при неудаче — сам ключ.
 
@@ -839,7 +861,7 @@ def lmstudio_chat_model(prefer: str = "") -> tuple:
     if loaded:
         return loaded[0], None
     return None, ("в LM Studio сейчас не загружено ни одной чат-модели — а автозагрузка "
-                  "может съесть всю память. Загрузи сам: <code>/lmsload &lt;id&gt;</code> "
+                  "может съесть всю память. Загрузи сам: <code>/lmsload &lt;номер&gt;</code> "
                   "(список: <code>/lmsmodels</code>) или кнопкой в LM Studio.")
 
 
@@ -973,6 +995,23 @@ def is_stale(message) -> bool:
     return bool(d) and d < START_TIME
 
 
+def reply_kwargs(message) -> dict:
+    """Ответ вешаем РЕПЛИЕМ на сообщение юзера — тогда цитата видна в TG и повторять
+    запрос текстом в ответе не нужно.
+
+    message_thread_id нужен в группах-форумах: ответ в тему без него не отправить,
+    а обычная отправка (как было раньше) всё равно падала бы в «General».
+    """
+    mid = getattr(message, "message_id", None)
+    if mid is None:
+        return {}
+    kw = {"reply_parameters": telebot.types.ReplyParameters(message_id=mid)}
+    thread = getattr(message, "message_thread_id", None)
+    if thread:
+        kw["message_thread_id"] = thread
+    return kw
+
+
 HELP_TEXT = (
     "🤖 <b>Gemini Bot</b>\n\n"
     "Просто напиши текст, либо кинь фото/войс/видео/документ (можно с подписью-"
@@ -995,9 +1034,10 @@ HELP_TEXT = (
 OWNER_HELP = (
     "\n\n<b>Управление LM Studio (только ты):</b>\n"
     "/lmsmodels — список скачанных моделей (какая в памяти / активная)\n"
-    "/lmsload &lt;id&gt; — загрузить модель в память\n"
-    "/lmsunload &lt;id&gt; — выгрузить модель\n"
-    "/lmsuse &lt;id&gt; — приоритетная модель (чат берёт ту, что ЗАГРУЖЕНА)"
+    "/lmsload &lt;номер|id&gt; — загрузить модель в память\n"
+    "/lmsunload &lt;номер|id&gt; — выгрузить модель\n"
+    "/lmsuse &lt;номер|id&gt; — приоритетная модель (чат берёт ту, что ЗАГРУЖЕНА)\n"
+    "Вместо длинного id можно просто номер из /lmsmodels."
 )
 
 
@@ -1089,21 +1129,21 @@ def create_bot(token: str) -> telebot.TeleBot:
                 return
             active = cfg_get("lmstudio_model") or ""
             lines = []
-            for m in models:
+            for i, m in enumerate(models, 1):
                 mid = m.get("id") or "?"
                 typ = m.get("type") or ""
                 loaded = (m.get("state") or "") == "loaded"
-                mark = "➤ " if mid == active else ("✅ " if loaded else "• ")
+                mark = "➤" if mid == active else ("✅" if loaded else "•")
                 tail = " — в памяти" if loaded else ""
-                lines.append(f"{mark}<code>{esc(mid)}</code>"
+                lines.append(f"{i}. {mark} <code>{esc(mid)}</code>"
                              + (f" <i>({esc(typ)})</i>" if typ else "") + tail)
             body = fit("\n".join(lines))
             bot.reply_to(
                 message,
                 "<b>Модели LM Studio:</b> (➤ активная, ✅ в памяти)\n" + body
-                + "\n\n<code>/lmsload &lt;id&gt;</code> — загрузить, "
-                  "<code>/lmsunload &lt;id&gt;</code> — выгрузить, "
-                  "<code>/lmsuse &lt;id&gt;</code> — сделать активной для чата.")
+                + "\n\nДальше можно просто номером — бот подставит полное имя сам: "
+                  "<code>/lmsload 2</code>, <code>/lmsunload 2</code>, "
+                  "<code>/lmsuse 2</code>.")
             return
 
         if cmd == "lmsuse":
@@ -1111,7 +1151,12 @@ def create_bot(token: str) -> telebot.TeleBot:
             if not key:
                 cur = cfg_get("lmstudio_model") or "(не задана — используется local-model)"
                 bot.reply_to(message, f"ℹ️ Активная модель LM Studio: <code>{esc(cur)}</code>\n"
-                             "Сменить: /lmsuse &lt;id&gt; (список: /lmsmodels)")
+                             "Сменить: /lmsuse &lt;номер или id&gt; (список: /lmsmodels)")
+                return
+            try:
+                key = lms_ref_to_key(key)
+            except GeminiError as exc:
+                bot.reply_to(message, f"❌ {esc(exc)}")
                 return
             set_cfg("lmstudio_model", key)
             bot.reply_to(message, f"✅ Приоритетная модель LM Studio: <code>{esc(key)}</code>.\n"
@@ -1125,7 +1170,12 @@ def create_bot(token: str) -> telebot.TeleBot:
         # load / unload
         key = args.strip()
         if not key:
-            bot.reply_to(message, f"ℹ️ /{cmd} &lt;id модели&gt; (список: /lmsmodels)")
+            bot.reply_to(message, f"ℹ️ /{cmd} &lt;номер или id модели&gt; (список: /lmsmodels)")
+            return
+        try:
+            key = lms_ref_to_key(key)
+        except GeminiError as exc:
+            bot.reply_to(message, f"❌ {esc(exc)}")
             return
         verb_load = cmd == "lmsload"
         status = bot.reply_to(message,
@@ -1329,10 +1379,10 @@ def create_bot(token: str) -> telebot.TeleBot:
             return DEFAULT_QUERY["document"]
         return "Опиши это."
 
-    def ask_and_reply(chat_id, media_msgs, query, reply_text, user, initial_status):
-        """Статус → качаем медиа → ОДИН вопрос (Gemini или локалка) → правим в ответ."""
+    def ask_and_reply(trigger, chat_id, media_msgs, query, reply_text, user, initial_status):
+        """Статус реплаем на запрос юзера → качаем медиа → ОДИН вопрос → правим в ответ."""
         label = status_label(user)
-        status_msg = bot.send_message(chat_id, initial_status)
+        status_msg = bot.send_message(chat_id, initial_status, **reply_kwargs(trigger))
         parts = []
         for m in media_msgs:
             media_parts, err = build_media_parts(bot, m)
@@ -1343,21 +1393,19 @@ def create_bot(token: str) -> telebot.TeleBot:
         if reply_text:
             parts.append({"type": "text", "text": f"Сообщение, на которое я отвечаю:\n{reply_text}"})
         parts.append({"type": "text", "text": query})
-        head = f"<b>{esc(query[:500])}</b>\n{SEP}\n"
-        bot.edit_message_text(head + f"⏳ <i>{esc(label)} думает…</i>",
-                              chat_id, status_msg.message_id)
+        bot.edit_message_text(f"⏳ <i>{esc(label)} думает…</i>", chat_id, status_msg.message_id)
         try:
             answer, used = dispatch_ask(parts, user, chat_id)
         except GeminiError as exc:
             logger.error("api error: %s", exc)
-            bot.edit_message_text(head + f"❌ {esc(exc)}", chat_id, status_msg.message_id)
+            bot.edit_message_text(f"❌ {esc(exc)}", chat_id, status_msg.message_id)
             return
         except Exception as exc:
             logger.exception("unexpected error")
-            bot.edit_message_text(head + f"❌ {esc(type(exc).__name__)} (см. логи)",
+            bot.edit_message_text(f"❌ {esc(type(exc).__name__)} (см. логи)",
                                   chat_id, status_msg.message_id)
             return
-        bot.edit_message_text(head + f"🤖 <b>{esc(used)}</b> — ответ:\n{md_to_tg_html(fit(answer))}",
+        bot.edit_message_text(f"🤖 <b>{esc(used)}</b>\n{md_to_tg_html(fit(answer))}",
                               chat_id, status_msg.message_id)
 
     def handle_group(msgs):
@@ -1370,16 +1418,18 @@ def create_bot(token: str) -> telebot.TeleBot:
             return
         media_msgs = [m for m in msgs if media_kind(m)]
         query = ""
+        trigger = first
         for m in msgs:
             cap = (getattr(m, "caption", "") or "").strip()
             if cap:
                 query = cap
+                trigger = m      # реплику вешаем на сообщение с подписью-вопросом
                 break
         if not media_msgs and not query:
             return
         if not query:
             query = default_group_query(media_msgs)
-        ask_and_reply(chat_id, media_msgs, query, "", user,
+        ask_and_reply(trigger, chat_id, media_msgs, query, "", user,
                       f"📷 Альбом получен: {len(media_msgs)} медиа — загружаю…")
 
     def flush_album(mgid):
@@ -1452,7 +1502,7 @@ def create_bot(token: str) -> telebot.TeleBot:
             initial = "📥 Медиа получено — загружаю…"
         else:
             initial = f"⏳ <i>{esc(status_label(user))} думает…</i>"
-        ask_and_reply(chat_id, media_msgs, query, reply_text, user, initial)
+        ask_and_reply(message, chat_id, media_msgs, query, reply_text, user, initial)
 
     @bot.message_handler(commands=[
         "start", "help", "key", "prompt", "prompts", "save", "use", "del",
