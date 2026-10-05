@@ -13,8 +13,6 @@
 #
 # API: Google Gemini Interactions API (POST /v1beta/interactions,
 # заголовок x-goog-api-key). По умолчанию gemini-3.8-flash.
-# Альтернативный бэкенд — GLM от z.ai (OpenAI-совместимый
-# POST {base}/chat/completions, Authorization: Bearer). Ключ свой, отдельный.
 #
 # Команды:
 #   .gemini <запрос>      спросить (можно ответом на медиа или в подписи)
@@ -27,15 +25,9 @@
 #   .gmodel [имя]         показать/сменить модель
 #   .gchat [on|off]       контекст диалога на чат (previous_interaction_id)
 #   .gclear               сбросить контекст текущего чата
-#   .gbackend [gemini|glm] бэкенд: Gemini или облачный GLM (z.ai)
-#   .glmkey [ключ]        ключ z.ai для GLM (отдельный от Gemini)
-#   .glmmodel [имя]       модель GLM (по умолчанию glm-4.6)
 #
 # Ключ также подхватывается из env GEMINI_API_KEY (Heroku config vars), если
-# в БД пусто; для GLM — env GLM_API_KEY (и GLM_API_BASE для своего url).
-# На GLM не работают память диалога (.gchat) и раздумья (.gthink) — запросы
-# шлются stateless; фото понимает только vision-модель (glm-4.5v).
-# Логи — только в терминал (heroku logs), в TG ничего не дублируется.
+# в БД пусто. Логи — только в терминал (heroku logs), в TG ничего не дублируется.
 
 import asyncio
 import base64
@@ -54,12 +46,6 @@ logger = logging.getLogger(__name__)
 MODNAME = "betonomeshalka"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-3.8-flash"
-
-# GLM (z.ai / Zhipu) — OpenAI-совместимый облачный бэкенд, ключ СВОЙ (в БД или env
-# GLM_API_KEY). Base URL переопределяется env GLM_API_BASE (Китай: open.bigmodel.cn).
-GLM_API_BASE = "https://api.z.ai/api/paas/v4"
-GLM_DEFAULT_MODEL = "glm-4.6"
-BACKENDS = ("gemini", "glm")
 MAX_INLINE = 20 * 1024 * 1024  # лимит inline-данных Gemini API
 MAX_TEXT_DOC = 100_000  # символы для текстовых файлов
 MAX_REPLY_CTX = 8_000  # символы текста сообщения-ответа
@@ -271,22 +257,6 @@ class Betonomeshalka(loader.Module):
     def _think(self) -> str:
         lvl = (self._get("think", "") or "").strip().lower()
         return lvl if lvl in THINK_LEVELS else DEFAULT_THINK
-
-    def _backend(self) -> str:
-        be = (self._get("backend", "") or "").strip().lower()
-        return be if be in BACKENDS else "gemini"
-
-    def _glm_key(self) -> str:
-        key = (self._get("glm_key", "") or "").strip()
-        if key:
-            return key
-        return (os.environ.get("GLM_API_KEY", "") or "").strip()
-
-    def _glm_model(self) -> str:
-        return (self._get("glm_model", "") or "").strip() or GLM_DEFAULT_MODEL
-
-    def _glm_url(self) -> str:
-        return (os.environ.get("GLM_API_BASE", "") or GLM_API_BASE).rstrip("/")
 
     # ---------- notes ----------
 
@@ -521,63 +491,6 @@ class Betonomeshalka(loader.Module):
             self._set(f"ctx_{chat_id}", iid)
         return text
 
-    # ---------- glm (z.ai), OpenAI-совместимый ----------
-
-    @staticmethod
-    def _parts_to_openai(parts: list) -> tuple:
-        """Gemini content-блоки → OpenAI 'content'. Возвращает (content, error)."""
-        content = []
-        for p in parts:
-            t = p.get("type")
-            if t == "text":
-                content.append({"type": "text", "text": p.get("text", "")})
-            elif t == "image":
-                mime = p.get("mime_type", "image/jpeg")
-                content.append({"type": "image_url",
-                                "image_url": {"url": f"data:{mime};base64,{p.get('data', '')}"}})
-            else:
-                return None, f"GLM не поддерживает тип «{t}» (только текст и фото; фото — на glm-4.5v)"
-        return content, None
-
-    async def _ask_glm(self, parts: list, chat_id: int, key: str) -> str:
-        """Запрос к GLM (stateless: память диалога .gchat тут не применяется)."""
-        content, err = self._parts_to_openai(parts)
-        if err:
-            raise GeminiError(err)
-        messages = []
-        si = self._system_instruction()
-        if si:
-            messages.append({"role": "system", "content": si})
-        messages.append({"role": "user", "content": content})
-        body = {"model": self._glm_model(), "messages": messages, "stream": False}
-        url = f"{self._glm_url()}/chat/completions"
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        session = await self._http()
-        try:
-            async with session.post(url, json=body, headers=headers) as resp:
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                if resp.status != 200:
-                    err_obj = data.get("error")
-                    if isinstance(err_obj, dict):
-                        msg = err_obj.get("message") or err_obj.get("code") or ""
-                    elif isinstance(err_obj, str):
-                        msg = err_obj
-                    else:
-                        msg = ""
-                    raise GeminiError(f"GLM {resp.status}: {(msg or 'запрос не удался')[:300]}")
-        except aiohttp.ClientError as exc:
-            raise GeminiError(f"не достучаться до GLM ({url}): {type(exc).__name__}: {exc}")
-        choices = data.get("choices") or []
-        text = ""
-        if choices:
-            text = ((choices[0].get("message") or {}).get("content") or "").strip()
-        if not text:
-            raise GeminiError("GLM вернул пустой ответ")
-        return text
-
     # ---------- helpers ----------
 
     @staticmethod
@@ -596,27 +509,14 @@ class Betonomeshalka(loader.Module):
 
     async def _run(self, message, args: str, notes_text: Optional[str] = None):
         """Общее ядро запроса для .gemini и .gnote."""
-        backend = self._backend()
-        if backend == "glm":
-            key = self._glm_key()
-            model = self._glm_model()
-            if not key:
-                await utils.answer(
-                    message,
-                    "❌ <b>GLM-ключ не задан.</b>\n<code>.glmkey &lt;ключ&gt;</code> — получить: "
-                    "z.ai → API Keys (или env <code>GLM_API_KEY</code>).",
-                )
-                return
-        else:
-            key = self._api_key()
-            model = self._model()
-            if not key:
-                await utils.answer(
-                    message,
-                    "❌ <b>API-ключ не задан.</b>\n<code>.gkey &lt;ключ&gt;</code> — получить: "
-                    "aistudio.google.com → API keys (нужен VPN с поддерживаемого региона).",
-                )
-                return
+        key = self._api_key()
+        if not key:
+            await utils.answer(
+                message,
+                "❌ <b>API-ключ не задан.</b>\n<code>.gkey &lt;ключ&gt;</code> — получить: "
+                "aistudio.google.com → API keys (нужен VPN с поддерживаемого региона).",
+            )
+            return
 
         # медиа: либо в самом сообщении (подпись к фото), либо в том, на что отвечаем
         media_msg = message if self._media_kind(message) else None
@@ -674,25 +574,16 @@ class Betonomeshalka(loader.Module):
                 query = "Ответь на это сообщение."
             else:
                 active = self._get("active_prompt", "") or "глобальный"
-                info = (
-                    f"🤖 <b>betonomeshalka</b>\n"
-                    f"<b>Бэкенд:</b> <code>{utils.escape_html(backend)}</code>\n"
-                    f"<b>Модель:</b> <code>{utils.escape_html(model)}</code>\n"
-                    f"<b>Промпт:</b> <code>{utils.escape_html(str(active))}</code>\n"
-                    f"<b>Ключ:</b> <code>{self._mask(key)}</code>\n"
-                )
-                if backend == "gemini":
-                    info += (
-                        f"<b>Раздумья:</b> <code>{self._think()}</code>\n"
-                        f"<b>Контекст чата:</b> {'вкл' if self._get('ctx', False) else 'выкл'}\n"
-                    )
-                else:
-                    info += "<b>Контекст чата:</b> <code>нет (только Gemini)</code>\n"
+                model = self._model()
                 await utils.answer(
                     message,
-                    info
-                    + "\n"
-                    + f"<b>Использование:</b> <code>.gemini &lt;запрос&gt;</code> — текстом, "
+                    f"🤖 <b>betonomeshalka</b>\n"
+                    f"<b>Модель:</b> <code>{utils.escape_html(model)}</code>\n"
+                    f"<b>Промпт:</b> <code>{utils.escape_html(str(active))}</code>\n"
+                    f"<b>Раздумья:</b> <code>{self._think()}</code>\n"
+                    f"<b>Ключ:</b> <code>{self._mask(key)}</code>\n"
+                    f"<b>Контекст чата:</b> {'вкл' if self._get('ctx', False) else 'выкл'}\n\n"
+                    f"<b>Использование:</b> <code>.gemini &lt;запрос&gt;</code> — текстом, "
                     f"ответом на фото/войс/видео/док или в подписи к фото.\n"
                     f"Ответ появится прямо в этом сообщении, под запросом.\n"
                     f"<code>.ghelp</code> — все команды.",
@@ -705,15 +596,13 @@ class Betonomeshalka(loader.Module):
             parts.append({"type": "text", "text": notes_text})
         parts.append({"type": "text", "text": query})
 
+        model = self._model()
         m_esc = utils.escape_html(model)
         q_disp = query if len(query) <= 300 else query[:300] + "…"
         head = f"<b>{utils.escape_html(q_disp)}</b>\n{SEP}\n"
         await show(head + f"⏳ <i>{m_esc} думает…</i>")
         try:
-            if backend == "glm":
-                answer = await self._ask_glm(parts, message.chat_id, key)
-            else:
-                answer = await self._ask(parts, message.chat_id, key)
+            answer = await self._ask(parts, message.chat_id, key)
         except GeminiError as exc:
             logger.error("[betonomeshalka] api error: %s", exc)
             await show(head + f"❌ {utils.escape_html(str(exc))}")
@@ -935,101 +824,6 @@ class Betonomeshalka(loader.Module):
         await utils.answer(message, f"🧠 Уровень раздумий: <b>{arg}</b>.")
 
     @loader.command(
-        ru_doc="Бэкенд: .gbackend [gemini|glm] (glm — облачный z.ai, свой ключ)",
-        en_doc="Backend: .gbackend [gemini|glm] (glm = z.ai cloud, own key)",
-    )
-    async def gbackend(self, message):
-        """Show or set the backend (gemini | glm)"""
-        arg = utils.get_args_raw(message).strip().lower()
-        if not arg:
-            await utils.answer(
-                message,
-                f"ℹ️ Бэкенд: <b>{utils.escape_html(self._backend())}</b>\n"
-                "Сменить: <code>.gbackend gemini</code> или <code>.gbackend glm</code>.\n"
-                "glm — облачные модели z.ai (GLM) через OpenAI-совместимый API, "
-                "нужен свой ключ <code>.glmkey</code>. Память диалога (<code>.gchat</code>) "
-                "и раздумья (<code>.gthink</code>) работают только на gemini.",
-            )
-            return
-        if arg not in BACKENDS:
-            await utils.answer(
-                message,
-                f"❌ Доступные бэкенды: <code>{', '.join(BACKENDS)}</code>.",
-            )
-            return
-        self._set("backend", arg)
-        if arg == "glm":
-            has_key = bool(self._glm_key())
-            await utils.answer(
-                message,
-                "🟢 <b>Бэкенд:</b> <code>glm</code> "
-                f"(модель <code>{utils.escape_html(self._glm_model())}</code>)\n"
-                + (
-                    f"Ключ: <code>{self._mask(self._glm_key())}</code> — можно спрашивать через <code>.gemini</code>."
-                    if has_key
-                    else "❗ Привяжи ключ: <code>.glmkey &lt;ключ&gt;</code> (z.ai → API Keys)."
-                ),
-            )
-        else:
-            await utils.answer(
-                message,
-                "🟢 <b>Бэкенд:</b> <code>gemini</code> "
-                f"(модель <code>{utils.escape_html(self._model())}</code>).",
-            )
-
-    @loader.command(
-        ru_doc="Ключ z.ai (GLM): .glmkey <ключ> (без аргумента — показать)",
-        en_doc="z.ai key (GLM): .glmkey <key> (no args — show current)",
-    )
-    async def glmkey(self, message):
-        """Set or show the z.ai (GLM) API key"""
-        args = utils.get_args_raw(message).strip()
-        if args:
-            self._set("glm_key", args)
-            await utils.answer(
-                message,
-                f"🔑 <b>GLM-ключ сохранён:</b> <code>{self._mask(args)}</code>",
-            )
-        else:
-            db_key = (self._get("glm_key", "") or "").strip()
-            env_key = (os.environ.get("GLM_API_KEY", "") or "").strip()
-            if db_key:
-                src, shown = "БД", self._mask(db_key)
-            elif env_key:
-                src, shown = "env GLM_API_KEY", self._mask(env_key)
-            else:
-                await utils.answer(
-                    message,
-                    "❌ GLM-ключ не задан: <code>.glmkey &lt;ключ&gt;</code>\n"
-                    "Получить: z.ai → API Keys (или env <code>GLM_API_KEY</code>).",
-                )
-                return
-            await utils.answer(
-                message,
-                f"🔑 GLM-ключ ({src}): <code>{shown}</code>\n"
-                "Сменить: <code>.glmkey &lt;ключ&gt;</code>",
-            )
-
-    @loader.command(
-        ru_doc="Модель GLM: .glmmodel [имя] (по умолчанию glm-4.6)",
-        en_doc="GLM model: .glmmodel [name] (default glm-4.6)",
-    )
-    async def glmmodel(self, message):
-        """Show or set the GLM model"""
-        args = utils.get_args_raw(message).strip().lower()
-        if args:
-            self._set("glm_model", args)
-            await utils.answer(message, f"✅ Модель GLM: <code>{utils.escape_html(args)}</code>")
-        else:
-            await utils.answer(
-                message,
-                f"ℹ️ Модель GLM: <code>{utils.escape_html(self._glm_model())}</code>\n"
-                "Сменить: <code>.glmmodel glm-4.5-air</code> "
-                "(или <code>glm-4.5-flash</code>, <code>glm-4.6</code>; "
-                "фото понимает только <code>glm-4.5v</code>).",
-            )
-
-    @loader.command(
         ru_doc="Заметки: .notes <текст> — добавить, .notes — список по порядку",
         en_doc="Notes: .notes <text> — add, .notes — list in order",
     )
@@ -1124,8 +918,7 @@ class Betonomeshalka(loader.Module):
         """Show help"""
         await utils.answer(
             message,
-            "🤖 <b>betonomeshalka</b>\n"
-            f"Бэкенд: <code>{utils.escape_html(self._backend())}</code>\n\n"
+            "🤖 <b>betonomeshalka</b>\n\n"
             "<code>.gemini &lt;запрос&gt;</code> — спросить (текст, ответ на фото/войс/видео/док, подпись к фото)\n"
             "<code>.gkey &lt;ключ&gt;</code> — API-ключ (aistudio.google.com → API keys)\n"
             "<code>.gprompt &lt;текст&gt;</code> — глобальный системный промпт\n"
@@ -1133,20 +926,14 @@ class Betonomeshalka(loader.Module):
             "<code>.gprompts</code> — список промптов\n"
             "<code>.guse &lt;имя&gt;|default</code> — активный промпт\n"
             "<code>.gdel &lt;имя&gt;</code> — удалить промпт\n"
-            "<code>.gmodel [имя]</code> — модель Gemini (сейчас <code>"
+            "<code>.gmodel [имя]</code> — модель (сейчас <code>"
             + utils.escape_html(self._model()) + "</code>)\n"
             "<code>.gthink [minimal|low|medium|high]</code> — уровень раздумий (сейчас <code>"
             + self._think() + "</code>, ниже = быстрее)\n"
-            "<code>.gchat on|off</code> — память диалога на чат (только gemini)\n"
+            "<code>.gchat on|off</code> — память диалога на чат\n"
             "<code>.gclear</code> — сбросить контекст чата\n"
             "<code>.notes &lt;текст&gt;</code> — заметка; <code>.notes</code> — список; "
             "<code>.ndel N</code> — удалить\n"
             "<code>.gnote &lt;1,3|all&gt; &lt;запрос&gt;</code> — спросить с заметками как контекстом\n\n"
-            "<b>GLM (z.ai)</b>\n"
-            "<code>.gbackend [gemini|glm]</code> — куда слать запросы (сейчас <code>"
-            + utils.escape_html(self._backend()) + "</code>)\n"
-            "<code>.glmkey &lt;ключ&gt;</code> — ключ z.ai (z.ai → API Keys)\n"
-            "<code>.glmmodel [имя]</code> — модель GLM (сейчас <code>"
-            + utils.escape_html(self._glm_model()) + "</code>, фото — только glm-4.5v)\n\n"
             "Ответ редактирует твоё сообщение: запрос сверху, ответ ниже.",
         )
