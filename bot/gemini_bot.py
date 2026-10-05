@@ -47,6 +47,12 @@
 #   /chat [on|off]       память диалога (Gemini помнит прошлые реплики)
 #   /clear               сбросить память в этом чате
 #
+# Только владелец (owner_id) — управление моделями LM Studio:
+#   /lmsmodels           список скачанных моделей (в памяти / активная)
+#   /lmsload <id>        загрузить модель в память
+#   /lmsunload <id>      выгрузить модель
+#   /lmsuse <id>         активная модель для чата (backend=lmstudio)
+#
 # База: SQLite (gemini_bot.db рядом со скриптом). Ключи, промпты, модель и
 # память — свои на каждого юзера (user_id). История переписки при /chat on
 # живёт на серверах Google (previous_interaction_id), локально только id.
@@ -685,6 +691,108 @@ def dispatch_ask(parts: list, user: dict, chat_id: int) -> tuple:
     return ask_gemini(parts, user, chat_id), model_for(user)
 
 
+# ---------- управление моделями LM Studio (только владелец бота) ----------
+# Чат идёт по OpenAI-совместимому адресу {host}/v1, а управление — по корню хоста
+# в /api/v0/* и /api/v1/*. Поэтому host root = local_url('lmstudio') без «/v1».
+
+LMS_LIST_TIMEOUT = (10, 30)   # listing быстрый; load/unload — LOCAL_TIMEOUT
+
+
+def is_owner(uid) -> bool:
+    own = owner_id()
+    return own is not None and uid == own
+
+
+def lms_mgmt_base() -> str:
+    """Корень хоста LM Studio для management-API (chat base без хвоста «/v1»)."""
+    base = local_url("lmstudio")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base.rstrip("/")
+
+
+def set_cfg(key: str, value):
+    """Меняет значение в памяти (CONFIG) и сохраняет в config.json."""
+    CONFIG[key] = value
+    try:
+        cfg = load_config()
+        cfg[key] = value
+        save_config(cfg)
+    except Exception:
+        logger.exception("failed to persist config key %s", key)
+
+
+def lms_list_models() -> list:
+    """GET /api/v0/models → [{id,type,state,...}]. Кидает GeminiError при сбое."""
+    base = lms_mgmt_base()
+    if not base:
+        raise GeminiError("не задан адрес lmstudio (поле lmstudio_url в config.json)")
+    try:
+        resp = requests.get(f"{base}/api/v0/models", timeout=LMS_LIST_TIMEOUT)
+    except requests.RequestException as exc:
+        raise GeminiError(
+            f"не достучаться до LM Studio ({base}): {type(exc).__name__}: {exc}\n"
+            f"Сервер запущен и адрес верный?")
+    if resp.status_code != 200:
+        raise GeminiError(f"LM Studio вернул HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise GeminiError("LM Studio: ответ не JSON")
+    return data.get("data") or []
+
+
+def _lms_instance_id(key: str) -> str:
+    """instance_id загруженной модели из /api/v1/models; при неудаче — сам ключ.
+
+    У «дефолтных» инстансов instance_id совпадает с ключом модели, но если модель
+    грузили с кастомным конфигом — id отличается, поэтому сначала пробуем уточнить.
+    """
+    base = lms_mgmt_base()
+    try:
+        resp = requests.get(f"{base}/api/v1/models", timeout=LMS_LIST_TIMEOUT)
+        if resp.status_code == 200:
+            for m in (resp.json() or {}).get("models") or []:
+                if m.get("key") == key:
+                    insts = m.get("loaded_instances") or []
+                    if insts and insts[0].get("id"):
+                        return insts[0]["id"]
+    except Exception:
+        logger.debug("instance_id lookup failed for %s", key, exc_info=True)
+    return key
+
+
+def lms_load(key: str) -> tuple:
+    """POST /api/v1/models/load {model:key}. Возвращает (ok, message)."""
+    base = lms_mgmt_base()
+    if not base:
+        return False, "не задан адрес lmstudio (поле lmstudio_url в config.json)"
+    try:
+        resp = requests.post(f"{base}/api/v1/models/load", json={"model": key},
+                             timeout=LOCAL_TIMEOUT)
+    except requests.RequestException as exc:
+        return False, f"не достучаться до LM Studio ({base}): {type(exc).__name__}: {exc}"
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+    return True, "загружена в память"
+
+
+def lms_unload(key: str) -> tuple:
+    """POST /api/v1/models/unload {instance_id}. Возвращает (ok, message)."""
+    base = lms_mgmt_base()
+    if not base:
+        return False, "не задан адрес lmstudio (поле lmstudio_url в config.json)"
+    iid = _lms_instance_id(key)
+    try:
+        resp = requests.post(f"{base}/api/v1/models/unload", json={"instance_id": iid},
+                             timeout=LOCAL_TIMEOUT)
+    except requests.RequestException as exc:
+        return False, f"не достучаться до LM Studio ({base}): {type(exc).__name__}: {exc}"
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+    return True, "выгружена из памяти"
+
+
 # ---------- медиа ----------
 
 def media_kind(msg) -> str:
@@ -827,6 +935,15 @@ HELP_TEXT = (
     "/clear — сбросить память в этом чате"
 )
 
+# Только для владельца бота (owner_id) — управление моделями LM Studio.
+OWNER_HELP = (
+    "\n\n<b>Управление LM Studio (только ты):</b>\n"
+    "/lmsmodels — список скачанных моделей (какая в памяти / активная)\n"
+    "/lmsload &lt;id&gt; — загрузить модель в память\n"
+    "/lmsunload &lt;id&gt; — выгрузить модель\n"
+    "/lmsuse &lt;id&gt; — сделать модель активной для чата"
+)
+
 
 def create_bot(token: str) -> telebot.TeleBot:
     bot = telebot.TeleBot(token, threaded=True, parse_mode="HTML")
@@ -888,15 +1005,74 @@ def create_bot(token: str) -> telebot.TeleBot:
                 f"Если модель задана криво — поправь: <code>/model &lt;имя&gt;</code>.",
                 message.chat.id, status.message_id)
 
+    def handle_lms(message, cmd, args):
+        """Управление моделями LM Studio (только владелец). list/load/unload/use."""
+        if cmd == "lmsmodels":
+            try:
+                models = lms_list_models()
+            except GeminiError as exc:
+                bot.reply_to(message, f"❌ {esc(exc)}")
+                return
+            if not models:
+                bot.reply_to(message, "ℹ️ В LM Studio нет скачанных моделей.")
+                return
+            active = cfg_get("lmstudio_model") or ""
+            lines = []
+            for m in models:
+                mid = m.get("id") or "?"
+                typ = m.get("type") or ""
+                loaded = (m.get("state") or "") == "loaded"
+                mark = "➤ " if mid == active else ("✅ " if loaded else "• ")
+                tail = " — в памяти" if loaded else ""
+                lines.append(f"{mark}<code>{esc(mid)}</code>"
+                             + (f" <i>({esc(typ)})</i>" if typ else "") + tail)
+            body = fit("\n".join(lines))
+            bot.reply_to(
+                message,
+                "<b>Модели LM Studio:</b> (➤ активная, ✅ в памяти)\n" + body
+                + "\n\n<code>/lmsload &lt;id&gt;</code> — загрузить, "
+                  "<code>/lmsunload &lt;id&gt;</code> — выгрузить, "
+                  "<code>/lmsuse &lt;id&gt;</code> — сделать активной для чата.")
+            return
+
+        if cmd == "lmsuse":
+            key = args.strip()
+            if not key:
+                cur = cfg_get("lmstudio_model") or "(не задана — используется local-model)"
+                bot.reply_to(message, f"ℹ️ Активная модель LM Studio: <code>{esc(cur)}</code>\n"
+                             "Сменить: /lmsuse &lt;id&gt; (список: /lmsmodels)")
+                return
+            set_cfg("lmstudio_model", key)
+            bot.reply_to(message, f"✅ Активная модель LM Studio: <code>{esc(key)}</code>.\n"
+                         "Чат с ней — после <code>/backend lmstudio</code>. "
+                         "Если она не в памяти — сначала <code>/lmsload "
+                         + esc(key) + "</code>.")
+            return
+
+        # load / unload
+        key = args.strip()
+        if not key:
+            bot.reply_to(message, f"ℹ️ /{cmd} &lt;id модели&gt; (список: /lmsmodels)")
+            return
+        verb_load = cmd == "lmsload"
+        status = bot.reply_to(message,
+                              f"⏳ <i>{'Загружаю' if verb_load else 'Выгружаю'} "
+                              f"<code>{esc(key)}</code>…</i>")
+        ok, detail = (lms_load(key) if verb_load else lms_unload(key))
+        icon = "✅" if ok else "❌"
+        bot.edit_message_text(f"{icon} <code>{esc(key)}</code>: {esc(detail)}",
+                              message.chat.id, status.message_id)
+
     def handle_command(message, cmd, args):
         uid = message.from_user.id
         user = get_user(uid)
 
         if cmd in ("start", "help"):
+            help_text = HELP_TEXT + (OWNER_HELP if is_owner(uid) else "")
             if not api_key_for(user):
-                bot.reply_to(message, HELP_TEXT + "\n\n" + NO_KEY_TEXT)
+                bot.reply_to(message, help_text + "\n\n" + NO_KEY_TEXT)
             else:
-                bot.reply_to(message, HELP_TEXT)
+                bot.reply_to(message, help_text)
 
         elif cmd == "key":
             if args and looks_like_key(args):
@@ -1022,6 +1198,12 @@ def create_bot(token: str) -> telebot.TeleBot:
         elif cmd == "clear":
             clear_ctx(message.chat.id, uid)
             bot.reply_to(message, "🧹 Память в этом чате сброшена.")
+
+        elif cmd in ("lmsmodels", "lmsload", "lmsunload", "lmsuse"):
+            if not is_owner(uid):
+                bot.reply_to(message, "❌ Управление моделями LM Studio — только для владельца бота.")
+                return
+            handle_lms(message, cmd, args)
 
         else:
             bot.reply_to(message, "Не знаю такой команды. /help")
@@ -1202,6 +1384,7 @@ def create_bot(token: str) -> telebot.TeleBot:
     @bot.message_handler(commands=[
         "start", "help", "key", "prompt", "prompts", "save", "use", "del",
         "model", "think", "backend", "chat", "clear",
+        "lmsmodels", "lmsload", "lmsunload", "lmsuse",
     ])
     def on_command(message):
         cmd, args = parse_command(message.text)
