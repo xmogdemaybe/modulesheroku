@@ -46,8 +46,9 @@
 #   /think [уровень]     раздумья Gemini: minimal|low|medium|high (по умолч. medium)
 #   /backend [имя]       gemini | lmstudio | koboldcpp (локалка без ключа Gemini)
 #   /chat [on|off]       память диалога: у Gemini — на серверах Google, у локальных
-#                        моделей — свои последние ~12 реплик в базе
+#                        моделей — своё окно реплик в базе (бюджет по контексту модели)
 #   /clear               сбросить память в этом чате (+ кэш фото из media_cache)
+#   /compact             сжать историю локальной модели в короткий конспект
 #
 # Только владелец (owner_id) — управление моделями LM Studio:
 #   /lmsmodels            список скачанных моделей (номера, в памяти / активная)
@@ -57,14 +58,19 @@
 #
 # Ответ бот пишет реплием на сообщение юзера, а текст запроса не повторяет —
 # цитата в Telegram видна сама, в сообщении остаются только модель и ответ.
+# Локальные бэкенды стримятся (stream=True), поэтому статус честно показывает
+# стадии: «обрабатываю запрос» → «генерирует (N ток.)» по первому токену → ответ.
 #
 # База: SQLite (gemini_bot.db рядом со скриптом — имя не меняем, там ключи
 # юзеров). Ключи, промпты, модель и
 # память — свои на каждого юзера (user_id). История переписки при /chat on
 # у Gemini живёт на серверах Google (previous_interaction_id, локально только id),
-# а LM Studio/koboldcpp stateless — окно реплик крутим сами (таблица local_history),
-# фото при этом кладём в папку media_cache рядом со скриптом и подписываемся в
-# истории именем файла, чтобы модель понимала, о КАКОМ именно фото речь.
+# а LM Studio/koboldcpp stateless — окно реплик крутим сами (таблица local_history).
+# Размер окна считаем из длины контекста модели (LM Studio отдаёт loadedContextLength),
+# а не жёстко: сколько влезет — держим. /compact суммаризирует окно в конспект
+# (таблица local_summary) и инжектит его system-сообщением. Фото кладём в папку
+# media_cache рядом со скриптом и подписываемся в истории именем файла, чтобы
+# модель понимала, о КАКОМ именно фото речь.
 # Логи — в терминал, в чат уходят только ответы и ошибки.
 
 import base64
@@ -119,9 +125,16 @@ LOCAL_TIMEOUT = (10, 600)     # локальная генерация бывае
 # LM Studio/koboldcpp stateless — окно реплик крутим сами и держим его коротким:
 # контекст у локальных моделей маленький, а автосжатие старых реплик — это лишний код.
 LOCAL_CTX_TURNS = 12          # максимум сообщений в окне (~6 пар вопрос-ответ)
-LOCAL_CTX_CHARS = 8_000       # потолок по символам на всю историю
+LOCAL_CTX_CHARS = 8_000       # потолок по символам на всю историю (когда контекст неизвестен)
 LOCAL_CTX_ANSWER = 2_000      # длиннее ответ не пишем: он забивает окно целиком
 LOCAL_CTX_IMAGES = 2          # сколько самых свежих фото реально пересылаем из кэша
+# Динамический бюджет истории: если знаем длину контекста модели (LM Studio отдаёт
+# loadedContextLength), держим историю в доле от него, а не в жёстких 8k знаков.
+CTX_HISTORY_FRACTION = 0.4    # какую долю контекста отводим под прошлые реплики
+CHARS_PER_TOKEN = 3           # грубо 1 токен ≈ 3 символа (кириллица токенизируется хуже)
+LOCAL_CTX_CHARS_MAX = 60_000  # абсолютный потолок бюджета истории (защита от 128k+)
+LOCAL_CTX_TURNS_MAX = 60      # и потолок по числу реплик, когда контекст огромный
+LOCAL_STREAM_INTERVAL = 2.0   # как часто правим статус-счётчик токенов (лимиты Телеги)
 MEDIA_CACHE_DIR = os.path.join(BASE_DIR, "media_cache")
 
 CONFIG = {}                   # заполняется в main() из config.json (+ env-фолбэк)
@@ -346,6 +359,10 @@ def db_init():
                 chat_id INTEGER, user_id INTEGER,
                 role TEXT, text TEXT, media TEXT, created REAL
             );
+            CREATE TABLE IF NOT EXISTS local_summary(
+                chat_id INTEGER, user_id INTEGER, summary TEXT, updated REAL,
+                PRIMARY KEY(chat_id, user_id)
+            );
             """
         )
         # миграция старой базы: докидываем недостающие колонки
@@ -421,7 +438,66 @@ def clear_ctx(chat_id: int, user_id: int):
         conn.execute("DELETE FROM contexts WHERE chat_id=? AND user_id=?", (chat_id, user_id))
         conn.execute("DELETE FROM local_history WHERE chat_id=? AND user_id=?",
                      (chat_id, user_id))
+        conn.execute("DELETE FROM local_summary WHERE chat_id=? AND user_id=?",
+                     (chat_id, user_id))
         _hist_prune_media(conn, chat_id, user_id)
+
+
+def local_summary_get(chat_id: int, user_id: int) -> str:
+    """Конспект прошлой беседы после /compact (пусто, если не сжимали)."""
+    with db() as conn:
+        row = conn.execute("SELECT summary FROM local_summary WHERE chat_id=? AND user_id=?",
+                           (chat_id, user_id)).fetchone()
+    return (row["summary"] or "").strip() if row else ""
+
+
+def local_summary_set(chat_id: int, user_id: int, summary: str):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO local_summary(chat_id,user_id,summary,updated) VALUES(?,?,?,?) "
+            "ON CONFLICT(chat_id,user_id) DO UPDATE SET summary=excluded.summary, "
+            "updated=excluded.updated",
+            (chat_id, user_id, (summary or "").strip(), time.time()))
+
+
+COMPACT_PROMPT = (
+    "Сожми этот диалог в короткий структурированный конспект на русском: ключевые факты, "
+    "имена, числа, принятые решения, незакрытые вопросы. Не отвечай на вопросы из диалога "
+    "— только конспект, без пояснений.\n\nДиалог:\n"
+)
+
+
+def compact_history(chat_id: int, user: dict, user_id: int) -> tuple:
+    """/compact: суммаризировать окно истории в конспект и очистить окно.
+
+    Возвращает (ok, text). Конспект потом инжектится system-сообщением в ask_local,
+    так что модель помнит суть, но окно реплик снова короткое. Только для локалок:
+    память Gemini живёт на серверах Google, бот её переписать не может.
+    """
+    be = backend_for(user)
+    if be not in LOCAL_BACKENDS:
+        return False, ("память Gemini хранится у Google — бот её не сжимает. "
+                       "Сброс: /clear")
+    rows = local_history_get(chat_id, user_id)
+    transcript = "\n".join(
+        f"{'Юзер' if role == 'user' else 'Бот'}: {text}"
+        for role, text, _ in rows if (text or "").strip())
+    if not transcript.strip():
+        return False, "история пуста — сжимать нечего"
+    # саммаризация тем же бэкендом, но с ctx=0: иначе конспект попал бы сам в себя
+    summary, _ = ask_local(be, [{"type": "text",
+                                 "text": COMPACT_PROMPT + transcript[:24_000]}],
+                           dict(user, ctx=0), chat_id)
+    summary = (summary or "").strip()
+    if not summary:
+        return False, "модель вернула пустой конспект — история не тронута"
+    local_summary_set(chat_id, user_id, summary)
+    with db() as conn:
+        conn.execute("DELETE FROM local_history WHERE chat_id=? AND user_id=?",
+                     (chat_id, user_id))
+        _hist_prune_media(conn, chat_id, user_id)
+    return True, (f"История сжата в конспект ({len(summary)} зн., было {len(rows)} реплик). "
+                  "Дальше модель опирается на него; /clear — сбросить и конспект.")
 
 
 # ---------- память диалога для локальных бэкендов (LM Studio / koboldcpp) ----------
@@ -444,12 +520,16 @@ def _hist_prune_media(conn, chat_id: int, user_id: int):
                 logger.debug("cache remove failed: %s", name, exc_info=True)
 
 
-def local_history_add(chat_id: int, user_id: int, role: str, text: str, media: str = ""):
-    """Пишет реплику в окно и тут же режет его: последние LOCAL_CTX_TURNS и не больше
-    LOCAL_CTX_CHARS символов. Отрезанное чистим и на диске, чтобы кэш не рос вечно."""
+def local_history_add(chat_id: int, user_id: int, role: str, text: str, media: str = "",
+                      max_chars: int = None, max_turns: int = None):
+    """Пишет реплику в окно и тут же режет его: последние max_turns и не больше
+    max_chars символов (по умолчанию LOCAL_CTX_*). Отрезанное чистим и на диске,
+    чтобы кэш не рос вечно."""
     text = (text or "").strip()
     if not text and not media:
         return
+    max_chars = LOCAL_CTX_CHARS if max_chars is None else max_chars
+    max_turns = LOCAL_CTX_TURNS if max_turns is None else max_turns
     with db() as conn:
         conn.execute(
             "INSERT INTO local_history(chat_id,user_id,role,text,media,created) "
@@ -460,10 +540,10 @@ def local_history_add(chat_id: int, user_id: int, role: str, text: str, media: s
             "SELECT id, length(text) AS n FROM local_history "
             "WHERE chat_id=? AND user_id=? ORDER BY id DESC", (chat_id, user_id)).fetchall()
         keep, total = set(), 0
-        for r in rows[:LOCAL_CTX_TURNS]:
+        for r in rows[:max_turns]:
             keep.add(r["id"])
             total += r["n"] or 0
-            if total > LOCAL_CTX_CHARS:
+            if total > max_chars:
                 break
         drop = [r["id"] for r in rows if r["id"] not in keep]
         if drop:
@@ -790,8 +870,84 @@ def gemini_parts_to_openai(parts: list) -> tuple:
     return content, None
 
 
-def ask_local(backend: str, parts: list, user: dict, chat_id: int) -> tuple:
-    """Запрос к LM Studio / koboldcpp. Возвращает (text, label)."""
+def _local_chat_blocking(backend: str, resp) -> tuple:
+    """Разбор обычного (не-стрим) ответа /chat/completions → (text, model_label)."""
+    try:
+        data = resp.json()
+    except ValueError:
+        raise GeminiError(f"{backend}: ответ не JSON")
+    choices = data.get("choices") or []
+    text = ""
+    if choices:
+        text = ((choices[0].get("message") or {}).get("content") or "").strip()
+    if not text:
+        raise GeminiError(f"{backend} вернул пустой ответ")
+    return text, data.get("model")
+
+
+def _local_chat_stream(backend: str, resp, on_stage) -> tuple:
+    """Разбор SSE-стрима → (text, model_label).
+
+    Первый содержательный кусок = модель начала генерацию (префилл/обработка промпта
+    позади) — сигнал on_stage("generating", 0). Дальше счётчик каждые несколько кусков.
+    Если сервер проигнорировал stream и отдал единый JSON — подбираем его из строк
+    без префикса «data:» как фолбэк.
+    """
+    pieces, raw_fallback = [], []
+    model_label, n, started = "", 0, False
+    for line in resp.iter_lines():
+        if not line:
+            continue
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", "replace")
+        line = line.strip()
+        if not line.startswith("data:"):
+            raw_fallback.append(line)
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+        except ValueError:
+            continue
+        if not model_label and chunk.get("model"):
+            model_label = chunk["model"]
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        piece = (choices[0].get("delta") or {}).get("content")
+        if piece:
+            if not started:
+                started = True
+                if on_stage:
+                    on_stage("generating", 0)
+            pieces.append(piece)
+            n += 1
+            if on_stage and n % 8 == 0:
+                on_stage("generating", n)
+    text = "".join(pieces).strip()
+    if not text and raw_fallback:
+        try:
+            data = json.loads("".join(raw_fallback))
+        except ValueError:
+            data = {}
+        choices = data.get("choices") or []
+        if choices:
+            text = ((choices[0].get("message") or {}).get("content") or "").strip()
+        model_label = model_label or data.get("model")
+    if not text:
+        raise GeminiError(f"{backend} вернул пустой ответ")
+    return text, model_label
+
+
+def ask_local(backend: str, parts: list, user: dict, chat_id: int, on_stage=None) -> tuple:
+    """Запрос к LM Studio / koboldcpp. Возвращает (text, label).
+
+    on_stage(stage, tokens) — необязательный колбэк статусов: сейчас единственная
+    стадия "generating" (первый токен + счётчик). Стримим по умолчанию, чтобы её
+    вообще было видно; отключается local_stream=false в config.json.
+    """
     url = local_url(backend)
     if not url:
         raise GeminiError(f"не задан адрес {backend} (поле {backend}_url в config.json)")
@@ -813,7 +969,13 @@ def ask_local(backend: str, parts: list, user: dict, chat_id: int) -> tuple:
     ctx_on = bool(user.get("ctx"))
     uid = user.get("user_id") or 0
     turn_text, turn_media = ("", "")
+    budget = (LOCAL_CTX_CHARS, LOCAL_CTX_TURNS)
     if ctx_on:
+        summary = local_summary_get(chat_id, uid)
+        if summary:
+            # конспект от /compact идёт вторым system — до скользящего окна реплик
+            messages.append({"role": "system",
+                             "content": f"Конспект предыдущей беседы:\n{summary}"})
         turn_text, turn_media = local_turn_media(chat_id, uid, parts)
         rows = local_history_get(chat_id, uid)
         # фото пересылаем только у самых СВЕЖИХ реплик: base64 съедает маленькое
@@ -829,37 +991,37 @@ def ask_local(backend: str, parts: list, user: dict, chat_id: int) -> tuple:
                     {"type": "text", "text": prev_text},
                 ]
             messages.append(entry)
+        budget = history_budget(backend, model_id)
     messages.append({"role": "user", "content": content})
-    body = {"model": model_id, "messages": messages, "stream": False}
+
+    stream = cfg_get("local_stream")
+    stream = True if stream is None else bool(stream)
+    body = {"model": model_id, "messages": messages, "stream": stream}
     try:
-        resp = requests.post(f"{url}/chat/completions", json=body, timeout=LOCAL_TIMEOUT)
+        resp = requests.post(f"{url}/chat/completions", json=body,
+                             timeout=LOCAL_TIMEOUT, stream=stream)
     except requests.RequestException as exc:
         raise GeminiError(
             f"не достучаться до {LOCAL_BACKENDS.get(backend, backend)} ({url}): "
             f"{type(exc).__name__}: {exc}\nСервер запущен и адрес верный?")
     if resp.status_code != 200:
         raise GeminiError(f"{backend} вернул HTTP {resp.status_code}: {(resp.text or '')[:300]}")
-    try:
-        data = resp.json()
-    except ValueError:
-        raise GeminiError(f"{backend}: ответ не JSON")
-    choices = data.get("choices") or []
-    text = ""
-    if choices:
-        text = ((choices[0].get("message") or {}).get("content") or "").strip()
-    if not text:
-        raise GeminiError(f"{backend} вернул пустой ответ")
+    if stream:
+        text, used = _local_chat_stream(backend, resp, on_stage)
+    else:
+        text, used = _local_chat_blocking(backend, resp)
     if ctx_on:
-        local_history_add(chat_id, uid, "user", turn_text, turn_media)
-        local_history_add(chat_id, uid, "assistant", text[:LOCAL_CTX_ANSWER])
-    return text, (data.get("model") or status_label(user))
+        local_history_add(chat_id, uid, "user", turn_text, turn_media, budget[0], budget[1])
+        local_history_add(chat_id, uid, "assistant", text[:LOCAL_CTX_ANSWER], "",
+                          budget[0], budget[1])
+    return text, (used or status_label(user))
 
 
-def dispatch_ask(parts: list, user: dict, chat_id: int) -> tuple:
+def dispatch_ask(parts: list, user: dict, chat_id: int, on_stage=None) -> tuple:
     """Единая точка: (answer_text, model_label). Выбирает Gemini или локальный бэкенд."""
     be = backend_for(user)
     if be in LOCAL_BACKENDS:
-        return ask_local(be, parts, user, chat_id)
+        return ask_local(be, parts, user, chat_id, on_stage=on_stage)
     return ask_gemini(parts, user, chat_id), model_for(user)
 
 
@@ -1009,6 +1171,46 @@ def lmstudio_chat_model(prefer: str = "") -> tuple:
     return None, ("в LM Studio сейчас не загружено ни одной чат-модели — а автозагрузка "
                   "может съесть всю память. Загрузи сам: <code>/lmsload &lt;номер&gt;</code> "
                   "(список: <code>/lmsmodels</code>) или кнопкой в LM Studio.")
+
+
+def context_length_for(backend: str, model_id: str):
+    """Длина контекста модели в токенах или None, если узнать не удалось.
+
+    Приоритет: явный оверрайд в config.json ({backend}_context) → у LM Studio
+    loadedContextLength реально загруженного инстанса (то, что юзер выставил в UI,
+    например 32k), иначе maxContextLength. У koboldcpp без оверрайда — None.
+    """
+    override = cfg_get(f"{backend}_context")
+    if override:
+        try:
+            return max(0, int(override))
+        except (TypeError, ValueError):
+            logger.warning("bad %s_context override: %r", backend, override)
+    if backend == "lmstudio":
+        try:
+            for m in lms_list_models():
+                if m.get("id") == model_id and m.get("state") == "loaded":
+                    ctx = m.get("loadedContextLength") or m.get("maxContextLength")
+                    if ctx:
+                        return int(ctx)
+        except (GeminiError, ValueError, TypeError):
+            return None
+    return None
+
+
+def history_budget(backend: str, model_id: str) -> tuple:
+    """(max_chars, max_turns) для окна истории под текущую модель.
+
+    Если контекст неизвестен — прежние жёсткие LOCAL_CTX_*. Если известен, держим
+    под историю CTX_HISTORY_FRACTION контекста (остальное — system, текущий запрос,
+    ответ и запас), в символах через грубую оценку CHARS_PER_TOKEN.
+    """
+    ctx = context_length_for(backend, model_id)
+    if not ctx:
+        return LOCAL_CTX_CHARS, LOCAL_CTX_TURNS
+    tokens = max(512, int(ctx * CTX_HISTORY_FRACTION))
+    chars = min(LOCAL_CTX_CHARS_MAX, tokens * CHARS_PER_TOKEN)
+    return chars, LOCAL_CTX_TURNS_MAX
 
 
 # ---------- медиа ----------
@@ -1173,7 +1375,8 @@ HELP_TEXT = (
     "/think [minimal|low|medium|high] — уровень раздумий (ниже = быстрее)\n"
     "/backend [gemini|lmstudio|koboldcpp] — облако Gemini или локальный сервер\n"
     "/chat [on|off] — память диалога\n"
-    "/clear — сбросить память в этом чате"
+    "/clear — сбросить память в этом чате\n"
+    "/compact — сжать историю локальной модели в короткий конспект"
 )
 
 # Только для владельца бота (owner_id) — управление моделями LM Studio.
@@ -1190,9 +1393,10 @@ OWNER_HELP = (
 def ctx_note(user: dict) -> str:
     """Как именно у текущего бэкенда устроена память диалога (для /chat)."""
     if backend_for(user) in LOCAL_BACKENDS:
-        return (f"локальная модель stateless, поэтому держим последние ~"
-                f"{LOCAL_CTX_TURNS} реплик у нас в базе; фото — из папки media_cache, "
-                f"пересылаем только {LOCAL_CTX_IMAGES} самых свежих. Сброс: /clear")
+        return ("локальная модель stateless, поэтому окно реплик крутим сами: бюджет "
+                "считаем из длины контекста модели (сколько влезет — держим), фото — из "
+                f"папки media_cache, пересылаем только {LOCAL_CTX_IMAGES} самых свежих. "
+                "Сжать историю в конспект: /compact, сброс: /clear")
     return ("Gemini помнит прошлые реплики сам (история хранится у Google). "
             "Сброс: /clear")
 
@@ -1478,6 +1682,22 @@ def create_bot(token: str) -> telebot.TeleBot:
             clear_ctx(message.chat.id, uid)
             bot.reply_to(message, "🧹 Память в этом чате сброшена.")
 
+        elif cmd == "compact":
+            if backend_for(user) not in LOCAL_BACKENDS:
+                bot.reply_to(message, "ℹ️ Память Gemini живёт у Google — бот её не сжимает. "
+                             "Сброс: /clear")
+                return
+            if not local_history_get(message.chat.id, uid):
+                bot.reply_to(message, "ℹ️ История пуста — сжимать нечего.")
+                return
+            status = bot.reply_to(message, f"🗜️ Сжимаю историю ({esc(status_label(user))})…")
+            try:
+                ok, text = compact_history(message.chat.id, user, uid)
+            except GeminiError as exc:
+                ok, text = False, f"не удалось сжать: {exc}"
+            bot.edit_message_text(f"{'✅' if ok else 'ℹ️'} {esc(text)}",
+                                  message.chat.id, status.message_id)
+
         elif cmd in ("lmsmodels", "lmsload", "lmsunload", "lmsuse"):
             if not is_owner(uid):
                 bot.reply_to(message, "❌ Управление моделями LM Studio — только для владельца бота.")
@@ -1544,7 +1764,7 @@ def create_bot(token: str) -> telebot.TeleBot:
         def set_status(text):
             nonlocal shown
             # на «такой же текст» Telegram отвечает 400 message is not modified,
-            # а на чисто текстовом запросе стартовый статус и есть «…думает…»
+            # а на чисто текстовом запросе стартовый статус и есть «обрабатываю запрос…»
             if text == shown:
                 return
             bot.edit_message_text(text, chat_id, status_msg.message_id)
@@ -1560,9 +1780,27 @@ def create_bot(token: str) -> telebot.TeleBot:
         if reply_text:
             parts.append({"type": "text", "text": f"Сообщение, на которое я отвечаю:\n{reply_text}"})
         parts.append({"type": "text", "text": query})
-        set_status(f"⏳ <i>{esc(label)} думает…</i>")
+        # медиа закачано, запрос уходит в модель. На чисто текстовом запросе этот
+        # статус уже показан стартовым сообщением — set_status его не продублирует.
+        set_status(f"⏳ <i>{esc(label)}: обрабатываю запрос…</i>")
+
+        last_edit = [0.0]
+
+        def on_stage(stage, tokens=0):
+            if stage != "generating":
+                return
+            now = time.time()
+            # первый токен = модель начала отвечать (обработка промпта позади) —
+            # показываем сразу; дальше счётчик не чаще раза в LOCAL_STREAM_INTERVAL,
+            # иначе Телега порежет частые правки одного сообщения
+            if tokens and now - last_edit[0] < LOCAL_STREAM_INTERVAL:
+                return
+            last_edit[0] = now
+            suffix = f" ({tokens} ток.)" if tokens else "…"
+            set_status(f"✍️ <i>{esc(label)} генерирует{suffix}</i>")
+
         try:
-            answer, used = dispatch_ask(parts, user, chat_id)
+            answer, used = dispatch_ask(parts, user, chat_id, on_stage=on_stage)
         except GeminiError as exc:
             logger.error("api error: %s", exc)
             set_status(f"❌ {esc(exc)}")
@@ -1666,12 +1904,12 @@ def create_bot(token: str) -> telebot.TeleBot:
         elif n == 1:
             initial = "📥 Медиа получено — загружаю…"
         else:
-            initial = f"⏳ <i>{esc(status_label(user))} думает…</i>"
+            initial = f"⏳ <i>{esc(status_label(user))}: обрабатываю запрос…</i>"
         ask_and_reply(message, chat_id, media_msgs, query, reply_text, user, initial)
 
     @bot.message_handler(commands=[
         "start", "help", "key", "prompt", "prompts", "save", "use", "del",
-        "model", "think", "backend", "chat", "clear",
+        "model", "think", "backend", "chat", "clear", "compact",
         "lmsmodels", "lmsload", "lmsunload", "lmsuse",
     ])
     def on_command(message):
