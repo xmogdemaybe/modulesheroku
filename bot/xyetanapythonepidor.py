@@ -43,7 +43,8 @@
 #   /use <имя>|default   активный промпт
 #   /del <имя>           удалить промпт
 #   /model [имя]         модель (по умолчанию gemini-3.8-flash)
-#   /think [уровень]     раздумья Gemini: minimal|low|medium|high (по умолч. medium)
+#   /think [уровень]     раздумья Gemini: minimal|low|medium|high (по умолч. medium);
+#                        модели без поддержки уровней (gemma и пр.) — автоматически без него
 #   /backend [имя]       gemini | lmstudio | koboldcpp (локалка без ключа Gemini)
 #   /chat [on|off]       память диалога: у Gemini — на серверах Google, у локальных
 #                        моделей — своё окно реплик в базе (бюджет по контексту модели)
@@ -111,6 +112,9 @@ TEST_POLL_TIMEOUT = 60
 # отсюда и задержки. medium — баланс; ниже = быстрее.
 DEFAULT_THINK = "medium"
 THINK_LEVELS = ("minimal", "low", "medium", "high")
+# Модели, ответившие «Thinking level is not supported» (gemma и пр.) — им уровень
+# не шлём вовсе. Кэш живёт до рестарта бота: цена промаха — один лишний запрос.
+THINK_UNSUPPORTED = set()
 
 # Локальные OpenAI-совместимые бэкенды. Адреса и доступ настраиваются в
 # config.json / env: <backend>_url, <backend>_model, local_for_all, owner_id.
@@ -798,24 +802,13 @@ def looks_like_key(text: str) -> bool:
     return 15 <= len(t) <= 200 and not any(c.isspace() for c in t)
 
 
-def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
-    key = api_key_for(user)
-    if not key:
-        raise GeminiError("API-ключ не задан: пришли его сообщением или /key <ключ>")
+def _think_rejected(msg: str) -> bool:
+    return "thinking level is not supported" in (msg or "").lower()
 
-    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    body = {"model": model_for(user), "input": parts,
-            "generation_config": {"thinking_level": think_for(user)}}
-    si = system_instruction_for(user)
-    if si:
-        body["system_instruction"] = si
-    ctx_on = bool(user.get("ctx"))
-    body["store"] = ctx_on  # без контекста запрос не сохраняется у Google
-    if ctx_on:
-        prev = get_ctx(chat_id, user["user_id"])
-        if prev:
-            body["previous_interaction_id"] = prev
 
+def _gemini_request(key: str, headers: dict, body: dict,
+                    ctx_on: bool, chat_id: int, user_id: int) -> str:
+    """Один полный цикл: POST /interactions (ретрай на перегруз) + опрос + контекст."""
     data = None
     resp = None
     for attempt in (1, 2):
@@ -844,8 +837,41 @@ def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
     data = _poll_interaction(key, data.get("id", ""), data.get("status", ""), data, POLL_TIMEOUT)
     text = _check_status(data)
     if ctx_on and data.get("id"):
-        set_ctx(chat_id, user["user_id"], data["id"])
+        set_ctx(chat_id, user_id, data["id"])
     return text
+
+
+def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
+    key = api_key_for(user)
+    if not key:
+        raise GeminiError("API-ключ не задан: пришли его сообщением или /key <ключ>")
+
+    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    model = model_for(user)
+    body = {"model": model, "input": parts}
+    # thinking_level понимают только Gemini 3; gemma и компания отвечают ошибкой —
+    # для известных неподдерживающих моделей уровень не шлём сразу
+    if model.lower() not in THINK_UNSUPPORTED:
+        body["generation_config"] = {"thinking_level": think_for(user)}
+    si = system_instruction_for(user)
+    if si:
+        body["system_instruction"] = si
+    ctx_on = bool(user.get("ctx"))
+    body["store"] = ctx_on  # без контекста запрос не сохраняется у Google
+    if ctx_on:
+        prev = get_ctx(chat_id, user["user_id"])
+        if prev:
+            body["previous_interaction_id"] = prev
+
+    try:
+        return _gemini_request(key, headers, body, ctx_on, chat_id, user["user_id"])
+    except GeminiError as exc:
+        if not _think_rejected(str(exc)) or "generation_config" not in body:
+            raise
+        THINK_UNSUPPORTED.add(model.lower())
+        del body["generation_config"]
+        logger.warning("%s: thinking_level не поддерживается — повторяю без него", model)
+        return _gemini_request(key, headers, body, ctx_on, chat_id, user["user_id"])
 
 
 # ---------- локальные бэкенды (LM Studio / koboldcpp, OpenAI-совместимые) ----------
@@ -1634,7 +1660,9 @@ def create_bot(token: str) -> telebot.TeleBot:
                 bot.reply_to(message, f"🧠 Уровень раздумий: <b>{think_for(user)}</b>\n"
                              "Сменить: /think minimal|low|medium|high\n"
                              "Чем ниже — тем быстрее ответ (high — максимум рассуждений, "
-                             "по умолчанию у Gemini 3).")
+                             "по умолчанию у Gemini 3).\n"
+                             "Модели без поддержки уровней (gemma и пр.) думают как хотят — "
+                             "настройка на них просто не отправляется.")
             elif lvl not in THINK_LEVELS:
                 bot.reply_to(message, "❌ Доступно: <code>minimal</code>, <code>low</code>, "
                              "<code>medium</code>, <code>high</code>.")
