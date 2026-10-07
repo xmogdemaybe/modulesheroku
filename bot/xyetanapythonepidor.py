@@ -247,6 +247,80 @@ def latex_to_text(s: str) -> str:
     return s.replace("{", "").replace("}", "").replace("\\", "").strip()
 
 
+_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$")
+
+
+def _split_row(line: str) -> list:
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|"):
+        line = line[:-1]
+    return [c.strip() for c in line.split("|")]
+
+
+def _clean_cell(c: str) -> str:
+    c = re.sub(r"\*\*(.+?)\*\*", r"\1", c)
+    c = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", c)
+    c = re.sub(r"~~(.+?)~~", r"\1", c)
+    return c.replace("`", "").strip()
+
+
+def _row_aligns(sep_cells: list) -> list:
+    aligns = []
+    for s in sep_cells:
+        s = s.strip()
+        left, right = s.startswith(":"), s.endswith(":")
+        aligns.append("^" if left and right else ">" if right else "<")
+    return aligns
+
+
+def _render_table(header: list, aligns: list, rows: list) -> str:
+    """Строки таблицы → выровненный по колонкам моноширинный текст."""
+    ncol = len(header)
+    aligns = (aligns + ["<"] * ncol)[:ncol]
+    header = [_clean_cell(c) for c in header]
+    rows = [[_clean_cell(c) for c in (r + [""] * ncol)[:ncol]] for r in rows]
+    widths = [len(h) for h in header]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt(cells):
+        parts = []
+        for i, cell in enumerate(cells):
+            a, w = aligns[i], widths[i]
+            parts.append(cell.rjust(w) if a == ">" else cell.center(w) if a == "^" else cell.ljust(w))
+        return " | ".join(parts)
+
+    out = [fmt(header), "-+-".join("-" * w for w in widths)]
+    out += [fmt(r) for r in rows]
+    return "\n".join(out)
+
+
+def _extract_tables(text: str, blocks: list) -> str:
+    """Markdown-таблицы → placeholder блока (в конце станет <pre>). Telegram
+    не рендерит | --- |, поэтому ровняем таблицу сами моноширинным текстом."""
+    lines = text.split("\n")
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        if "|" in lines[i] and i + 1 < n and _TABLE_SEP.match(lines[i + 1]):
+            header = _split_row(lines[i])
+            if len(header) >= 2:
+                aligns = _row_aligns(_split_row(lines[i + 1]))
+                rows, j = [], i + 2
+                while j < n and lines[j].strip() and "|" in lines[j]:
+                    rows.append(_split_row(lines[j]))
+                    j += 1
+                blocks.append(_render_table(header, aligns, rows))
+                out.append(f"\x00B{len(blocks)-1}\x00")
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def md_to_tg_html(text: str) -> str:
     """Markdown+LaTeX от Gemini → Telegram-HTML. Нераспознанное экранируется."""
     if not text:
@@ -255,6 +329,7 @@ def md_to_tg_html(text: str) -> str:
     text = re.sub(r"```[^\n]*\n?(.*?)```",
                   lambda m: (blocks.append(m.group(1)), f"\x00B{len(blocks)-1}\x00")[1],
                   text, flags=re.S)
+    text = _extract_tables(text, blocks)
     text = re.sub(r"`([^`\n]+)`",
                   lambda m: (inlines.append(m.group(1)), f"\x00I{len(inlines)-1}\x00")[1],
                   text)
