@@ -4,7 +4,8 @@
 #
 # Sources (tried in random order, then fallbacks):
 #   Safebooru / Konachan             -> boorus (safe-only)
-#   Reddit (r/Fumofumo)              -> fallback, anonymous or OAuth (.fumoredditauth)
+#   Reddit (r/Fumofumo)              -> fallback; listing via direct JSON or the
+#                                       Arctic Shift archive (.fumoredditmode)
 #
 # Commands:
 #   .fumo on|off                 toggle autoposting
@@ -20,6 +21,7 @@
 #   .fumoredditmedia pics|videos|all   what to fetch from Reddit
 #   .fumoredditauth <id> <secret>      Reddit OAuth app credentials (403 fallback)
 #   .fumoredditcookie <cookie>         browser cookie for Reddit (403 fallback)
+#   .fumoredditmode auto|json|arctic   listing via direct JSON or Arctic Shift archive
 #   .fumosub <subreddit>         set subreddit (default Fumofumo)
 #   .fumotest [source] [count]   post fumo now (optionally from one source)
 #   .fumoreset                   clear sent-images history (settings are kept)
@@ -233,40 +235,13 @@ class FumoQoder(loader.Module):
         self._rd_token_exp = now + int(payload.get("expires_in", 3600))
         return self._rd_token
 
-    async def _src_reddit(self) -> list:
-        sub = self._get("subreddit", DEFAULT_SUBREDDIT) or DEFAULT_SUBREDDIT
+    def _reddit_parse(self, items: list, sub: str) -> list:
+        """Shared parser for reddit post dicts (listing JSON children data or Arctic Shift rows)."""
         media = self._get("reddit_media", "pics")
-        params = {"limit": "50", "raw_json": "1"}
-        payload = None
-
-        # OAuth first when credentials are set: anonymous JSON is 403-blocked on
-        # some networks (e.g. RU), an app-only token goes through oauth.reddit.com.
-        if self._get("reddit_id", "") and self._get("reddit_secret", ""):
-            try:
-                token = await self._reddit_token()
-                payload = await self._json(
-                    f"https://oauth.reddit.com/r/{sub}/hot", params,
-                    headers={
-                        "User-Agent": REDDIT_USER_AGENT,
-                        "Authorization": f"Bearer {token}",
-                    },
-                )
-            except Exception as exc:
-                logger.warning("[FumoQoder] reddit oauth failed: %r", exc)
-
-        if payload is None:
-            headers = {"User-Agent": REDDIT_USER_AGENT}
-            cookie = (self._get("reddit_cookie", "") or "").strip()
-            if cookie:
-                headers["Cookie"] = cookie
-            payload = await self._json(
-                f"https://www.reddit.com/r/{sub}/hot.json", params, headers=headers,
-            )
-
-        children = (payload or {}).get("data", {}).get("children", []) if isinstance(payload, dict) else []
         posts = []
-        for c in children:
-            d = c.get("data", {}) if isinstance(c, dict) else {}
+        for d in items:
+            if not isinstance(d, dict):
+                continue
             img = d.get("url_overridden_by_dest") or d.get("url") or ""
             video = ((d.get("secure_media") or {}).get("reddit_video") or {}).get("fallback_url") or ""
             is_video = bool(video) and media in ("videos", "all")
@@ -285,6 +260,66 @@ class FumoQoder(loader.Module):
                 "tags": f"r/{sub}",
             })
         return posts
+
+    async def _src_reddit_json(self, sub: str) -> list:
+        """Direct Reddit listing: OAuth if credentials are set, else anonymous www JSON (+cookie)."""
+        params = {"limit": "50", "raw_json": "1"}
+        payload = None
+        if self._get("reddit_id", "") and self._get("reddit_secret", ""):
+            try:
+                token = await self._reddit_token()
+                payload = await self._json(
+                    f"https://oauth.reddit.com/r/{sub}/hot", params,
+                    headers={
+                        "User-Agent": REDDIT_USER_AGENT,
+                        "Authorization": f"Bearer {token}",
+                    },
+                )
+            except Exception as exc:
+                logger.warning("[FumoQoder] reddit oauth failed: %r", exc)
+        if payload is None:
+            headers = {"User-Agent": REDDIT_USER_AGENT}
+            cookie = (self._get("reddit_cookie", "") or "").strip()
+            if cookie:
+                headers["Cookie"] = cookie
+            payload = await self._json(
+                f"https://www.reddit.com/r/{sub}/hot.json", params, headers=headers,
+            )
+        children = (payload or {}).get("data", {}).get("children", []) if isinstance(payload, dict) else []
+        items = [c.get("data", {}) for c in children if isinstance(c, dict)]
+        return self._reddit_parse(items, sub)
+
+    async def _src_reddit_arctic(self, sub: str) -> list:
+        """Arctic Shift (arctic-shift.photon-reddit.com): a third-party Reddit archive.
+
+        Reddit blocks its own listing endpoints (.json/.rss/old) by IP reputation in
+        some networks, but this archive is a different host, and the image CDN
+        (i.redd.it) is not blocked at all — so listing via archive + download via
+        CDN works where direct Reddit does not. Data is newest-first, slightly delayed.
+        """
+        payload = await self._json(
+            "https://arctic-shift.photon-reddit.com/api/posts/search",
+            {"subreddit": sub, "limit": "100", "sort": "desc"},
+            headers={"User-Agent": USER_AGENT},
+        )
+        items = payload.get("data", []) if isinstance(payload, dict) else []
+        return self._reddit_parse(items, sub)
+
+    async def _src_reddit(self) -> list:
+        sub = self._get("subreddit", DEFAULT_SUBREDDIT) or DEFAULT_SUBREDDIT
+        mode = self._get("reddit_mode", "auto")
+        if mode == "arctic":
+            return await self._src_reddit_arctic(sub)
+        try:
+            posts = await self._src_reddit_json(sub)
+        except Exception as exc:
+            if mode == "json":
+                raise
+            logger.warning("[FumoQoder] reddit json failed (%r), trying Arctic Shift", exc)
+            posts = []
+        if posts:
+            return posts
+        return await self._src_reddit_arctic(sub)
 
     @staticmethod
     def _dapi_parse(payload: Any) -> list:
@@ -759,6 +794,25 @@ class FumoQoder(loader.Module):
         )
 
     @loader.command(
+        ru_doc="Способ брать список постов Reddit: .fumoredditmode auto|json|arctic",
+        en_doc="Reddit listing method: .fumoredditmode auto|json|arctic",
+    )
+    async def fumoredditmode(self, message):
+        """Where to get the Reddit post list: json (direct), arctic (archive mirror), auto"""
+        args = utils.get_args_raw(message).strip().lower()
+        if args not in ("auto", "json", "arctic"):
+            state = self._get("reddit_mode", "auto")
+            await utils.answer(
+                message, f"<b>Reddit mode:</b> {state}\n"
+                "<code>.fumoredditmode auto|json|arctic</code>\n"
+                "<i>auto = direct JSON, on failure Arctic Shift archive;\n"
+                "arctic = archive only (works where Reddit listings are IP-blocked)</i>"
+            )
+            return
+        self._set("reddit_mode", args)
+        await utils.answer(message, f"\U0001F4E1 <b>Reddit mode:</b> <code>{args}</code>")
+
+    @loader.command(
         ru_doc="Домен Konachan: .fumokonachan net|com (net — safe, com — R-18 с фильтром)",
         en_doc="Konachan domain: .fumokonachan net|com (net = safe, com = R-18 filtered)",
     )
@@ -857,6 +911,7 @@ class FumoQoder(loader.Module):
             f"<b>Per send:</b> <code>{self._get('count', 1)}</code>\n"
             f"<b>Sources:</b> <code>{utils.escape_html(', '.join(active))}</code>\n"
             f"<b>Reddit media:</b> <code>{utils.escape_html(self._get('reddit_media', 'pics'))}</code>\n"
+            f"<b>Reddit mode:</b> <code>{utils.escape_html(self._get('reddit_mode', 'auto'))}</code>\n"
             f"<b>Reddit auth:</b> {'set' if self._get('reddit_id', '') else 'anonymous'}\n"
             f"<b>Reddit cookie:</b> {'set' if (self._get('reddit_cookie', '') or '').strip() else 'none'}\n"
             f"<b>Meta footer:</b> {'on' if self._get('meta', True) else 'off'}\n"
@@ -896,7 +951,9 @@ class FumoQoder(loader.Module):
             "<code>.fumoredditauth &lt;client_id&gt; &lt;client_secret&gt;</code> — OAuth app "
             "(saves you when anonymous access is 403-blocked); empty = clear\n"
             "<code>.fumoredditcookie &lt;cookie&gt;</code> — browser cookie fallback "
-            "(dev tools → Network → any reddit request → Cookie header); empty = clear\n\n"
+            "(dev tools → Network → any reddit request → Cookie header); empty = clear\n"
+            "<code>.fumoredditmode auto|json|arctic</code> — listing source: direct JSON "
+            "or Arctic Shift archive (works where Reddit listings are IP-blocked)\n\n"
             "<b>Misc</b>\n"
             "<code>.fumotest</code> — post now\n"
             "<code>.fumotest reddit 2</code> — post 2 from a specific source\n"
