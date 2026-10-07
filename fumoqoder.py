@@ -58,6 +58,25 @@ DEFAULT_INTERVAL = 3600
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FumoQoder/1.2"
 # Reddit blocks browser-like UAs; it requires a distinct bot-style one.
 REDDIT_USER_AGENT = "linux:FumoQoder:1.2 (by /u/xmogdemaybe)"
+# 2026: Reddit 403s non-browser clients on listing endpoints even with valid
+# cookies (anti-AI-scraper), so the JSON path mimics a real Chrome navigation.
+REDDIT_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+              "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Cache-Control": "max-age=0",
+    "Priority": "u=0, i",
+    "Sec-Ch-Ua": '"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 SAFE_EXTS = {
     ".jpg": "image/jpeg",
@@ -262,7 +281,7 @@ class FumoQoder(loader.Module):
         return posts
 
     async def _src_reddit_json(self, sub: str) -> list:
-        """Direct Reddit listing: OAuth if credentials are set, else anonymous www JSON (+cookie)."""
+        """Direct Reddit listing: OAuth if creds are set, else www JSON with full browser headers (+cookie)."""
         params = {"limit": "50", "raw_json": "1"}
         payload = None
         if self._get("reddit_id", "") and self._get("reddit_secret", ""):
@@ -278,7 +297,7 @@ class FumoQoder(loader.Module):
             except Exception as exc:
                 logger.warning("[FumoQoder] reddit oauth failed: %r", exc)
         if payload is None:
-            headers = {"User-Agent": REDDIT_USER_AGENT}
+            headers = dict(REDDIT_BROWSER_HEADERS)
             cookie = (self._get("reddit_cookie", "") or "").strip()
             if cookie:
                 headers["Cookie"] = cookie
