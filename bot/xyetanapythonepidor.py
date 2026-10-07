@@ -56,6 +56,7 @@
 #   /lmsload <номер|id>   загрузить модель в память
 #   /lmsunload <номер|id> выгрузить модель
 #   /lmsuse <номер|id>    приоритетная модель (чат берёт ту, что загружена)
+#   /debug on|off         дамп Gemini-запроса/ответа с таймингами к своим ответам
 #
 # Ответ бот пишет реплием на сообщение юзера, а текст запроса не повторяет —
 # цитата в Telegram видна сама, в сообщении остаются только модель и ответ.
@@ -348,6 +349,7 @@ def db_init():
                 active_prompt TEXT DEFAULT '',
                 ctx INTEGER DEFAULT 0,
                 think TEXT DEFAULT '',
+                debug INTEGER DEFAULT 0,
                 backend TEXT DEFAULT 'gemini'
             );
             CREATE TABLE IF NOT EXISTS prompts(
@@ -356,6 +358,7 @@ def db_init():
             );
             CREATE TABLE IF NOT EXISTS contexts(
                 chat_id INTEGER, user_id INTEGER, interaction_id TEXT,
+                model TEXT DEFAULT '',
                 PRIMARY KEY(chat_id, user_id)
             );
             CREATE TABLE IF NOT EXISTS local_history(
@@ -375,6 +378,13 @@ def db_init():
             conn.execute("ALTER TABLE users ADD COLUMN think TEXT DEFAULT ''")
         if "backend" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN backend TEXT DEFAULT 'gemini'")
+        if "debug" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN debug INTEGER DEFAULT 0")
+        ctx_cols = {r["name"] for r in conn.execute("PRAGMA table_info(contexts)").fetchall()}
+        if "model" not in ctx_cols:
+            # цепочка interaction_id принадлежит конкретной модели; у старых строк
+            # model='' — они просто не подхватятся (начнётся новая цепочка)
+            conn.execute("ALTER TABLE contexts ADD COLUMN model TEXT DEFAULT ''")
 
 
 def get_user(user_id: int) -> dict:
@@ -385,7 +395,8 @@ def get_user(user_id: int) -> dict:
 
 
 def set_user(user_id: int, field: str, value):
-    assert field in ("api_key", "prompt", "model", "active_prompt", "ctx", "think", "backend")
+    assert field in ("api_key", "prompt", "model", "active_prompt", "ctx", "think",
+                     "debug", "backend")
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
         conn.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, user_id))
@@ -418,21 +429,24 @@ def del_prompt(user_id: int, name: str) -> bool:
     return deleted
 
 
-def get_ctx(chat_id: int, user_id: int) -> str:
+def get_ctx(chat_id: int, user_id: int, model: str) -> str:
+    """interaction_id последней цепочки ЭТОЙ модели: чужие цепочки несовместимы
+    (Google отвечает «Request contains an invalid argument»)."""
     with db() as conn:
         row = conn.execute(
-            "SELECT interaction_id FROM contexts WHERE chat_id=? AND user_id=?",
-            (chat_id, user_id),
+            "SELECT interaction_id FROM contexts WHERE chat_id=? AND user_id=? AND model=?",
+            (chat_id, user_id, model),
         ).fetchone()
     return row["interaction_id"] if row else ""
 
 
-def set_ctx(chat_id: int, user_id: int, iid: str):
+def set_ctx(chat_id: int, user_id: int, iid: str, model: str):
     with db() as conn:
         conn.execute(
-            "INSERT INTO contexts(chat_id,user_id,interaction_id) VALUES(?,?,?) "
-            "ON CONFLICT(chat_id,user_id) DO UPDATE SET interaction_id=excluded.interaction_id",
-            (chat_id, user_id, iid),
+            "INSERT INTO contexts(chat_id,user_id,interaction_id,model) VALUES(?,?,?,?) "
+            "ON CONFLICT(chat_id,user_id) DO UPDATE SET "
+            "interaction_id=excluded.interaction_id, model=excluded.model",
+            (chat_id, user_id, iid, model),
         )
 
 
@@ -806,9 +820,11 @@ def _think_rejected(msg: str) -> bool:
     return "thinking level is not supported" in (msg or "").lower()
 
 
-def _gemini_request(key: str, headers: dict, body: dict,
-                    ctx_on: bool, chat_id: int, user_id: int) -> str:
-    """Один полный цикл: POST /interactions (ретрай на перегруз) + опрос + контекст."""
+def _gemini_request(key: str, headers: dict, body: dict, model: str,
+                    ctx_on: bool, chat_id: int, user_id: int, dbg: dict = None) -> str:
+    """Один полный цикл: POST /interactions (ретрай на перегруз) + опрос + контекст.
+    dbg (если передан) наполняется таймингами и фактами для /debug."""
+    t0 = time.monotonic()
     data = None
     resp = None
     for attempt in (1, 2):
@@ -827,18 +843,48 @@ def _gemini_request(key: str, headers: dict, body: dict,
             time.sleep(wait)
             continue
         break
+    t_post = time.monotonic() - t0
 
     if resp is None or resp.status_code != 200:
         kind, err = classify_error(resp.status_code if resp is not None else 0, data or {})
+        if dbg is not None:
+            dbg["attempts"].append(f"HTTP {resp.status_code if resp is not None else '???'} "
+                                   f"за {t_post:.1f}с → {err[:200]}")
         if kind == "transient":
             err += "\n\n⚠️ Модель перегружена/лимит — попробуй позже или смени: /model <имя>."
         raise GeminiError(err)
 
-    data = _poll_interaction(key, data.get("id", ""), data.get("status", ""), data, POLL_TIMEOUT)
+    iid = data.get("id", "")
+    status0 = data.get("status", "")
+    data = _poll_interaction(key, iid, status0, data, POLL_TIMEOUT)
     text = _check_status(data)
-    if ctx_on and data.get("id"):
-        set_ctx(chat_id, user_id, data["id"])
+    if dbg is not None:
+        usage = data.get("usage") or data.get("usage_metadata") or {}
+        dbg["attempts"].append(
+            f"HTTP 200 за {t_post:.1f}с (id={iid or '-'}, статус сразу: {status0 or '-'})\n"
+            f"опрос до «{data.get('status', '?')}»: {time.monotonic() - t0 - t_post:.1f}с\n"
+            f"ответ: {len(text)} симв"
+            + (f", токены: {json.dumps(usage, ensure_ascii=False)}" if usage else ""))
+    if ctx_on and iid:
+        set_ctx(chat_id, user_id, iid, model)
     return text
+
+
+def _describe_body(body: dict) -> str:
+    """Человеческий дамп запроса для /debug: без ключей, текст обрезан."""
+    inp = []
+    for p in body.get("input") or []:
+        t = p.get("type")
+        if t == "text":
+            s = p.get("text", "")
+            inp.append(f"text[{len(s)}]:{s[:80]!r}")
+        else:
+            inp.append(f"{t}[{len(p.get('data', '')) // 1024}КБ base64]")
+    gen = body.get("generation_config") or {}
+    return (f"model={body.get('model')} thinking={gen.get('thinking_level', 'НЕТ')}\n"
+            f"store={body.get('store')} prev={body.get('previous_interaction_id') or 'НЕТ'} "
+            f"sys_instr={len(body.get('system_instruction') or '')} симв\n"
+            f"input: {'; '.join(inp) or 'пусто'}")
 
 
 def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
@@ -859,19 +905,48 @@ def ask_gemini(parts: list, user: dict, chat_id: int) -> str:
     ctx_on = bool(user.get("ctx"))
     body["store"] = ctx_on  # без контекста запрос не сохраняется у Google
     if ctx_on:
-        prev = get_ctx(chat_id, user["user_id"])
+        prev = get_ctx(chat_id, user["user_id"], model)
         if prev:
             body["previous_interaction_id"] = prev
 
-    try:
-        return _gemini_request(key, headers, body, ctx_on, chat_id, user["user_id"])
-    except GeminiError as exc:
-        if not _think_rejected(str(exc)) or "generation_config" not in body:
+    dbg = {"req": _describe_body(body), "attempts": []} if user.get("debug") else None
+    t0 = time.monotonic()
+    while True:
+        try:
+            text = _gemini_request(key, headers, body, model, ctx_on,
+                                   chat_id, user["user_id"], dbg)
+            break
+        except GeminiError as exc:
+            msg = str(exc).lower()
+            # каждый ретрай чем-то жертвует и больше не повторится: уровни и чужой
+            # interaction_id удаляются из body, поэтому цикл конечен
+            if _think_rejected(msg) and "generation_config" in body:
+                THINK_UNSUPPORTED.add(model.lower())
+                del body["generation_config"]
+                logger.warning("%s: thinking_level не поддерживается — повторяю без него", model)
+                continue
+            if "invalid argument" in msg and "previous_interaction_id" in body:
+                # цепочка от другой модели или истекла — начинаем заново
+                body.pop("previous_interaction_id")
+                logger.warning("%s: previous_interaction_id отброшен (invalid argument)", model)
+                continue
+            if dbg is not None:
+                dbg["attempts"].append(f"ИТОГ: ошибка через {time.monotonic() - t0:.1f}с")
+                text = _render_debug(dbg)
+                raise GeminiError(f"{exc}\n\n{text}")
             raise
-        THINK_UNSUPPORTED.add(model.lower())
-        del body["generation_config"]
-        logger.warning("%s: thinking_level не поддерживается — повторяю без него", model)
-        return _gemini_request(key, headers, body, ctx_on, chat_id, user["user_id"])
+    if dbg is not None:
+        dbg["attempts"].append(f"ИТОГ: {time.monotonic() - t0:.1f}с")
+        block = _render_debug(dbg)
+        # сначала урезаем ответ, чтобы дамп гарантированно влез в сообщение
+        text = fit(text, max(500, ANSWER_LIMIT - len(block) - 100)) + "\n\n" + block
+    return text
+
+
+def _render_debug(dbg: dict) -> str:
+    lines = ["🐞 debug (gemini)", "─ запрос ─", dbg["req"], "─ попытки ─"]
+    lines += [f"• {a}" for a in dbg["attempts"]]
+    return "\n".join(lines)
 
 
 # ---------- локальные бэкенды (LM Studio / koboldcpp, OpenAI-совместимые) ----------
@@ -1412,7 +1487,10 @@ OWNER_HELP = (
     "/lmsload &lt;номер|id&gt; — загрузить модель в память\n"
     "/lmsunload &lt;номер|id&gt; — выгрузить модель\n"
     "/lmsuse &lt;номер|id&gt; — приоритетная модель (чат берёт ту, что ЗАГРУЖЕНА)\n"
-    "Вместо длинного id можно просто номер из /lmsmodels."
+    "Вместо длинного id можно просто номер из /lmsmodels.\n\n"
+    "<b>Отладка (только ты):</b>\n"
+    "/debug on|off — к ответам Gemini прикладывать дамп запроса и тайминги "
+    "(что уходит в API, что приходит, сколько заняло)"
 )
 
 
@@ -1669,6 +1747,25 @@ def create_bot(token: str) -> telebot.TeleBot:
             else:
                 set_user(uid, "think", lvl)
                 bot.reply_to(message, f"🧠 Уровень раздумий: <b>{lvl}</b>.")
+
+        elif cmd == "debug":
+            if not is_owner(uid):
+                bot.reply_to(message, "❌ Только владелец бота.")
+                return
+            arg = args.lower()
+            if arg in ("on", "1", "вкл"):
+                set_user(uid, "debug", 1)
+                bot.reply_to(message, "🐞 Дебаг включён: к ответам Gemini буду прикладывать "
+                             "дамп запроса и тайминги. Выключить: /debug off")
+            elif arg in ("off", "0", "выкл"):
+                set_user(uid, "debug", 0)
+                bot.reply_to(message, "🐞 Дебаг выключен.")
+            else:
+                on = bool(user.get("debug"))
+                bot.reply_to(message, f"🐞 Дебаг: <b>{'включён' if on else 'выключен'}</b>\n"
+                             "Вкл/выкл: /debug on|off (только владелец). "
+                             "Показывает, что уходит в Gemini API и что приходит обратно, "
+                             "с таймингами.")
 
         elif cmd == "backend":
             cur = backend_for(user)
@@ -1937,7 +2034,7 @@ def create_bot(token: str) -> telebot.TeleBot:
 
     @bot.message_handler(commands=[
         "start", "help", "key", "prompt", "prompts", "save", "use", "del",
-        "model", "think", "backend", "chat", "clear", "compact",
+        "model", "think", "debug", "backend", "chat", "clear", "compact",
         "lmsmodels", "lmsload", "lmsunload", "lmsuse",
     ])
     def on_command(message):

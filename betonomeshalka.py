@@ -25,6 +25,7 @@
 #   .gmodel [имя]         показать/сменить модель
 #   .gchat [on|off]       контекст диалога на чат (previous_interaction_id)
 #   .gclear               сбросить контекст текущего чата
+#   .gdebug [on|off]      дебаг: дамп запроса/ответа Gemini с таймингами к ответам
 #
 # Ключ также подхватывается из env GEMINI_API_KEY (Heroku config vars), если
 # в БД пусто. Логи — только в терминал (heroku logs), в TG ничего не дублируется.
@@ -35,6 +36,7 @@ import html
 import logging
 import os
 import re
+import time
 from typing import Any, Optional
 
 import aiohttp
@@ -57,6 +59,9 @@ POLL_TIMEOUT = 240
 # high — отсюда и задержки. medium — баланс; ниже = быстрее.
 DEFAULT_THINK = "medium"
 THINK_LEVELS = ("minimal", "low", "medium", "high")
+# Модели, ответившие «Thinking level is not supported» (gemma и пр.) — им уровень
+# не шлём вовсе. Кэш живёт до перезагрузки модуля.
+THINK_UNSUPPORTED = set()
 MAX_NOTES = 200          # потолок числа заметок
 MAX_NOTE_LEN = 4_000     # потолок длины одной заметки
 
@@ -451,44 +456,118 @@ class Betonomeshalka(loader.Module):
         err = (last_data.get("error") or {}).get("message") or f"HTTP {last_status or 429}"
         raise GeminiError(friendly_error(last_status or 429, err))
 
+    def _debug_on(self) -> bool:
+        return bool(self._get("debug", False))
+
+    @staticmethod
+    def _describe_body(body: dict) -> str:
+        """Человеческий дамп запроса для .gdebug: без ключей, текст обрезан."""
+        inp = []
+        for p in body.get("input") or []:
+            t = p.get("type")
+            if t == "text":
+                s = p.get("text", "")
+                inp.append(f"text[{len(s)}]:{s[:80]!r}")
+            else:
+                inp.append(f"{t}[{len(p.get('data', '')) // 1024}КБ base64]")
+        gen = body.get("generation_config") or {}
+        return (f"model={body.get('model')} thinking={gen.get('thinking_level', 'НЕТ')}\n"
+                f"store={body.get('store')} prev={body.get('previous_interaction_id') or 'НЕТ'} "
+                f"sys_instr={len(body.get('system_instruction') or '')} симв\n"
+                f"input: {'; '.join(inp) or 'пусто'}")
+
+    @staticmethod
+    def _render_debug(dbg: dict) -> str:
+        lines = ["🐞 debug (gemini)", "─ запрос ─", dbg["req"], "─ попытки ─"]
+        lines += [f"• {a}" for a in dbg["attempts"]]
+        return "\n".join(lines)
+
     async def _ask(self, parts: list, chat_id: int, key: str) -> str:
-        body: dict = {"model": self._model(), "input": parts,
-                      "generation_config": {"thinking_level": self._think()}}
+        model = self._model()
+        body: dict = {"model": model, "input": parts}
+        # thinking_level понимают только Gemini 3; gemma и компания отвечают ошибкой
+        if model.lower() not in THINK_UNSUPPORTED:
+            body["generation_config"] = {"thinking_level": self._think()}
         si = self._system_instruction()
         if si:
             body["system_instruction"] = si
         ctx_on = bool(self._get("ctx", False))
         body["store"] = ctx_on  # без контекста запросы не хранятся на сервере
         if ctx_on:
-            prev = self._get(f"ctx_{chat_id}", "")
-            if prev:
+            # цепочка хранится как «модель|id»: чужой interaction_id Google бракует
+            saved = self._get(f"ctx_{chat_id}", "") or ""
+            m, _, prev = saved.partition("|")
+            if prev and m == model:
                 body["previous_interaction_id"] = prev
 
-        data = await self._post(f"{API_BASE}/interactions", key, body)
+        dbg = ({"req": self._describe_body(body), "attempts": []}
+               if self._debug_on() else None)
+        t0 = time.monotonic()
+        while True:
+            try:
+                t1 = time.monotonic()
+                data = await self._post(f"{API_BASE}/interactions", key, body)
+                t_post = time.monotonic() - t1
 
-        status = data.get("status", "")
-        iid = data.get("id", "")
-        waited = 0
-        headers = {"x-goog-api-key": key}
-        while status in ("in_progress", "queued") and iid and waited < POLL_TIMEOUT:
-            await asyncio.sleep(3)
-            waited += 3
-            session = await self._http()
-            async with session.get(f"{API_BASE}/interactions/{iid}", headers=headers) as resp:
-                data = await resp.json()
-                status = data.get("status", status)
+                status = data.get("status", "")
+                iid = data.get("id", "")
+                waited = 0
+                headers = {"x-goog-api-key": key}
+                while status in ("in_progress", "queued") and iid and waited < POLL_TIMEOUT:
+                    await asyncio.sleep(3)
+                    waited += 3
+                    session = await self._http()
+                    async with session.get(f"{API_BASE}/interactions/{iid}",
+                                           headers=headers) as resp:
+                        data = await resp.json()
+                        status = data.get("status", status)
 
-        if status == "failed":
-            errors = data.get("errors") or []
-            msg = (errors[0].get("message") if errors and isinstance(errors[0], dict) else "") \
-                or "запрос не удался"
-            raise GeminiError(friendly_error(0, msg))
+                if status == "failed":
+                    errors = data.get("errors") or []
+                    msg = (errors[0].get("message")
+                           if errors and isinstance(errors[0], dict) else "") \
+                        or "запрос не удался"
+                    raise GeminiError(friendly_error(0, msg))
 
-        text = self._extract_text(data)
-        if not text:
-            raise GeminiError("Gemini вернул пустой ответ (возможно, сработал фильтр)")
+                text = self._extract_text(data)
+                if not text:
+                    raise GeminiError("Gemini вернул пустой ответ (возможно, сработал фильтр)")
+                if dbg is not None:
+                    usage = data.get("usage") or data.get("usage_metadata") or {}
+                    dbg["attempts"].append(
+                        f"HTTP 200 за {t_post:.1f}с (id={iid or '-'}, "
+                        f"статус сразу: {status or '-'})\n"
+                        f"опрос до «{data.get('status', '?')}»: {waited}с\n"
+                        f"ответ: {len(text)} симв"
+                        + (f", токены: {usage}" if usage else ""))
+                break
+            except GeminiError as exc:
+                msg = str(exc).lower()
+                # каждый ретрай удаляет из body то, на что ругнулись, — цикл конечен
+                if "thinking level is not supported" in msg and "generation_config" in body:
+                    THINK_UNSUPPORTED.add(model.lower())
+                    del body["generation_config"]
+                    logger.warning("[betonomeshalka] %s: thinking_level не поддержан — "
+                                   "повторяю без него", model)
+                    continue
+                if "invalid argument" in msg and "previous_interaction_id" in body:
+                    body.pop("previous_interaction_id")
+                    logger.warning("[betonomeshalka] %s: previous_interaction_id отброшен",
+                                   model)
+                    continue
+                if dbg is not None:
+                    dbg["attempts"].append(f"ошибка: {str(exc)[:200]}")
+                    dbg["attempts"].append(f"ИТОГ: ошибка через {time.monotonic() - t0:.1f}с")
+                    raise GeminiError(f"{exc}\n\n{self._render_debug(dbg)}")
+                raise
+
         if ctx_on and iid:
-            self._set(f"ctx_{chat_id}", iid)
+            self._set(f"ctx_{chat_id}", f"{model}|{iid}")
+        if dbg is not None:
+            dbg["attempts"].append(f"ИТОГ: {time.monotonic() - t0:.1f}с")
+            block = self._render_debug(dbg)
+            # сначала урезаем ответ, чтобы дамп гарантированно влез в сообщение
+            text = self._fit(text, max(500, ANSWER_LIMIT - len(block) - 100)) + "\n\n" + block
         return text
 
     # ---------- helpers ----------
@@ -824,6 +903,31 @@ class Betonomeshalka(loader.Module):
         await utils.answer(message, f"🧠 Уровень раздумий: <b>{arg}</b>.")
 
     @loader.command(
+        ru_doc="Дебаг: .gdebug on|off — дамп запроса/ответа Gemini с таймингами",
+        en_doc="Debug: .gdebug on|off — dump Gemini request/response with timings",
+    )
+    async def gdebug(self, message):
+        """Toggle Gemini request/response debug dump"""
+        arg = utils.get_args_raw(message).strip().lower()
+        if arg in ("on", "1", "вкл", "enable"):
+            self._set("debug", True)
+            await utils.answer(
+                message,
+                "🐞 <b>Дебаг включён</b> — к ответам Gemini прикладываю дамп запроса "
+                "и тайминги. Выкл: <code>.gdebug off</code>",
+            )
+        elif arg in ("off", "0", "выкл", "disable"):
+            self._set("debug", False)
+            await utils.answer(message, "🐞 <b>Дебаг выключен.</b>")
+        else:
+            state = "вкл" if self._debug_on() else "выкл"
+            await utils.answer(
+                message,
+                f"🐞 Дебаг: <b>{state}</b>\n<code>.gdebug on|off</code> — показывать, "
+                "что уходит в Gemini API и что приходит обратно (с таймингами).",
+            )
+
+    @loader.command(
         ru_doc="Заметки: .notes <текст> — добавить, .notes — список по порядку",
         en_doc="Notes: .notes <text> — add, .notes — list in order",
     )
@@ -932,6 +1036,7 @@ class Betonomeshalka(loader.Module):
             + self._think() + "</code>, ниже = быстрее)\n"
             "<code>.gchat on|off</code> — память диалога на чат\n"
             "<code>.gclear</code> — сбросить контекст чата\n"
+            "<code>.gdebug on|off</code> — дебаг: дамп запроса/ответа Gemini с таймингами\n"
             "<code>.notes &lt;текст&gt;</code> — заметка; <code>.notes</code> — список; "
             "<code>.ndel N</code> — удалить\n"
             "<code>.gnote &lt;1,3|all&gt; &lt;запрос&gt;</code> — спросить с заметками как контекстом\n\n"
