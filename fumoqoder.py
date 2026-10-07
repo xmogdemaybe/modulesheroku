@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# requires: aiohttp
+# requires: aiohttp curl_cffi
 # FumoQoder — random Touhou fumo autoposter for Hikka / Heroku.
 #
 # Sources (tried in random order, then fallbacks):
@@ -39,6 +39,13 @@ from io import BytesIO
 from typing import Any, Optional
 
 import aiohttp
+
+try:
+    # Reddit's anti-scraper checks the TLS fingerprint (JA3) + HTTP/2, which
+    # aiohttp cannot fake; curl_cffi impersonates a real Chrome down to TLS.
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    cffi_requests = None
 
 from telethon.errors import (
     ChatAdminRequiredError,
@@ -280,15 +287,34 @@ class FumoQoder(loader.Module):
             })
         return posts
 
+    async def _reddit_listing(self, sub: str) -> Any:
+        """www hot.json via curl_cffi (real Chrome TLS fingerprint) or aiohttp fallback."""
+        url = f"https://www.reddit.com/r/{sub}/hot.json"
+        params = {"limit": "50", "raw_json": "1"}
+        cookie = (self._get("reddit_cookie", "") or "").strip()
+        if cffi_requests is not None:
+            # impersonate supplies its own consistent Chrome headers; only add the cookie.
+            async with cffi_requests.AsyncSession(impersonate="chrome") as session:
+                resp = await session.get(
+                    url, params=params,
+                    headers={"Cookie": cookie} if cookie else None,
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                return resp.json()
+        headers = dict(REDDIT_BROWSER_HEADERS)
+        if cookie:
+            headers["Cookie"] = cookie
+        return await self._json(url, params, headers=headers)
+
     async def _src_reddit_json(self, sub: str) -> list:
         """Direct Reddit listing: OAuth if creds are set, else www JSON with full browser headers (+cookie)."""
-        params = {"limit": "50", "raw_json": "1"}
         payload = None
         if self._get("reddit_id", "") and self._get("reddit_secret", ""):
             try:
                 token = await self._reddit_token()
                 payload = await self._json(
-                    f"https://oauth.reddit.com/r/{sub}/hot", params,
+                    f"https://oauth.reddit.com/r/{sub}/hot", {"limit": "50", "raw_json": "1"},
                     headers={
                         "User-Agent": REDDIT_USER_AGENT,
                         "Authorization": f"Bearer {token}",
@@ -297,13 +323,7 @@ class FumoQoder(loader.Module):
             except Exception as exc:
                 logger.warning("[FumoQoder] reddit oauth failed: %r", exc)
         if payload is None:
-            headers = dict(REDDIT_BROWSER_HEADERS)
-            cookie = (self._get("reddit_cookie", "") or "").strip()
-            if cookie:
-                headers["Cookie"] = cookie
-            payload = await self._json(
-                f"https://www.reddit.com/r/{sub}/hot.json", params, headers=headers,
-            )
+            payload = await self._reddit_listing(sub)
         children = (payload or {}).get("data", {}).get("children", []) if isinstance(payload, dict) else []
         items = [c.get("data", {}) for c in children if isinstance(c, dict)]
         return self._reddit_parse(items, sub)
@@ -931,6 +951,7 @@ class FumoQoder(loader.Module):
             f"<b>Sources:</b> <code>{utils.escape_html(', '.join(active))}</code>\n"
             f"<b>Reddit media:</b> <code>{utils.escape_html(self._get('reddit_media', 'pics'))}</code>\n"
             f"<b>Reddit mode:</b> <code>{utils.escape_html(self._get('reddit_mode', 'auto'))}</code>\n"
+            f"<b>Reddit client:</b> <code>{'curl_cffi (chrome TLS)' if cffi_requests else 'aiohttp (install curl_cffi!)'}</code>\n"
             f"<b>Reddit auth:</b> {'set' if self._get('reddit_id', '') else 'anonymous'}\n"
             f"<b>Reddit cookie:</b> {'set' if (self._get('reddit_cookie', '') or '').strip() else 'none'}\n"
             f"<b>Meta footer:</b> {'on' if self._get('meta', True) else 'off'}\n"
