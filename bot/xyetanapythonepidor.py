@@ -106,6 +106,11 @@ MAX_FILE = 20 * 1024 * 1024   # лимит скачивания Bot API = лим
 MAX_TEXT_DOC = 100_000        # символы для текстовых файлов
 ANSWER_LIMIT = 3_800          # лимит сообщения TG 4096, с запасом на оформление
 TG_MSG_LIMIT = 4096           # жёсткий потолок Telegram на длину сообщения
+RICH_TEXT_LIMIT = 32_000      # лимит rich-сообщения 32768, с запасом
+# rich-ответы доступны, только если pyTelegramBotAPI свежий (sendRichMessage
+# появился в Bot API 10.1); на старом telebot молча остаётся HTML-путь
+RICH_OK = (hasattr(telebot.TeleBot, "send_rich_message")
+           and hasattr(telebot.types, "InputRichMessage"))
 REQUEST_TIMEOUT = (15, 300)   # (connect, read): thinking-модели отвечают долго
 POLL_TIMEOUT = 240
 TEST_POLL_TIMEOUT = 60
@@ -2026,6 +2031,24 @@ def create_bot(token: str) -> telebot.TeleBot:
             logger.exception("unexpected error")
             set_status(f"❌ {esc(type(exc).__name__)} (см. логи)")
             return
+        # Rich messages (Bot API 10.1+): сырой маркдаун модели → нативные таблицы,
+        # заголовки, списки и формулы. Любой сбой → старый путь HTML + <pre>.
+        if (RICH_OK and cfg_get("rich_answers", True)
+                and len(answer) <= RICH_TEXT_LIMIT):
+            md = f"🤖 **{used}**\n\n{answer}"
+            try:
+                sent = bot.send_rich_message(
+                    chat_id,
+                    telebot.types.InputRichMessage(markdown=md),
+                    **reply_kwargs(trigger))
+            except Exception as exc:
+                logger.warning("rich-ответ не отправлен, фолбэк HTML: %s", exc)
+            else:
+                try:
+                    bot.delete_message(chat_id, status_msg.message_id)
+                except Exception:
+                    pass
+                return
         header = f"🤖 <b>{esc(used)}</b>\n"
         pieces = split_answer(answer, TG_MSG_LIMIT - len(header) - 60)
         set_status(header + pieces[0])
