@@ -121,12 +121,16 @@ def normalize_model(name: str) -> str:
 
 
 def friendly_error(status: int, msg: str) -> str:
-    """Добавляет RU-подсказку к временным ошибкам (перегруз/лимит)."""
+    """Добавляет RU-подсказку к временным ошибкам (перегруз/лимит).
+
+    Текст БЕЗ HTML-тегов: показ идёт через utils.escape_html, который экранирует
+    любой <...>, поэтому <code> здесь превратился бы в видимый «&lt;code&gt;».
+    """
     blob = f"{status} {msg}".lower()
     if status in (429, 500, 503, 504) or any(w in blob for w in _TRANSIENT_WORDS):
         return (f"{msg}\n\n⚠️ Модель перегружена или исчерпан лимит запросов — это "
                 f"временно, ключ тут ни при чём. Попробуй позже или смени модель: "
-                f"<code>.gmodel &lt;имя&gt;</code>.")
+                f".gmodel <имя>.")
     return msg
 
 
