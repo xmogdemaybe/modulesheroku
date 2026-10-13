@@ -811,6 +811,11 @@ def extract_text(data: dict) -> str:
     return "\n".join(chunks).strip()
 
 
+def _as_dict(data) -> dict:
+    """Google изредка отдаёт JSON-массив вместо объекта — .get на нём валит бота."""
+    return data if isinstance(data, dict) else {}
+
+
 def _poll_interaction(key: str, iid: str, status: str, data: dict, timeout: int) -> dict:
     waited = 0
     while status in ("in_progress", "queued") and iid and waited < timeout:
@@ -818,7 +823,7 @@ def _poll_interaction(key: str, iid: str, status: str, data: dict, timeout: int)
         waited += 3 if timeout > 60 else 2
         r = requests.get(f"{API_BASE}/interactions/{iid}",
                          headers={"x-goog-api-key": key}, timeout=REQUEST_TIMEOUT)
-        data = r.json()
+        data = _as_dict(r.json())
         status = data.get("status", status)
     return data
 
@@ -829,7 +834,7 @@ def classify_error(status_code: int, data: dict) -> tuple:
     'transient' (429/500/503/504, high demand, quota) = авторизация прошла, ключ
     валиден, просто модель перегружена/лимит. 'invalid_key' — ключ реально плохой.
     """
-    err = (data or {}).get("error") or {}
+    err = _as_dict(_as_dict(data).get("error"))
     message = err.get("message") or f"HTTP {status_code}"
     status = str(err.get("status") or "").upper()
     blob = f"{message} {status}".lower()
@@ -845,6 +850,7 @@ def classify_error(status_code: int, data: dict) -> tuple:
 
 def _check_status(data: dict) -> str:
     """Возвращает текст ответа или кидает GeminiError по статусу interaction."""
+    data = _as_dict(data)
     status = data.get("status", "")
     if status == "failed":
         errors = data.get("errors") or []
@@ -881,6 +887,7 @@ def test_key(key: str, model: str = "") -> tuple:
         data = resp.json()
     except ValueError:
         data = {}
+    data = _as_dict(data)
     if resp.status_code != 200:
         return classify_error(resp.status_code, data)
     data = _poll_interaction(key, data.get("id", ""), data.get("status", ""), data, TEST_POLL_TIMEOUT)
@@ -915,6 +922,7 @@ def _gemini_request(key: str, headers: dict, body: dict, model: str,
             data = resp.json()
         except ValueError:
             data = {}
+        data = _as_dict(data)
         if resp.status_code in (429, 500, 503, 504) and attempt == 1:
             try:
                 wait = min(max(int(resp.headers.get("Retry-After", "5")), 1), 30)
