@@ -105,6 +105,7 @@ DB_PATH = os.path.join(BASE_DIR, "gemini_bot.db")
 MAX_FILE = 20 * 1024 * 1024   # лимит скачивания Bot API = лимит инлайн-данных Gemini
 MAX_TEXT_DOC = 100_000        # символы для текстовых файлов
 ANSWER_LIMIT = 3_800          # лимит сообщения TG 4096, с запасом на оформление
+TG_MSG_LIMIT = 4096           # жёсткий потолок Telegram на длину сообщения
 REQUEST_TIMEOUT = (15, 300)   # (connect, read): thinking-модели отвечают долго
 POLL_TIMEOUT = 240
 TEST_POLL_TIMEOUT = 60
@@ -1501,6 +1502,22 @@ def fit(text: str, limit: int = ANSWER_LIMIT) -> str:
     return text[:limit] + f"\n…(обрезано, всего {len(text)} симв.)"
 
 
+def split_answer(answer: str, limit: int) -> list:
+    """Длинный ответ → список готовых HTML-кусков, каждый ≤ limit (Telegram не
+    даёт отправить/отредактировать сообщение длиннее 4096). Режем сырой текст по
+    границам абзацев/строк/слов и рендерим каждый кусок md_to_tg_html отдельно,
+    поэтому вместо «…(обрезано)» юзер получает продолжение следующим сообщением."""
+    rendered = md_to_tg_html(answer)
+    if len(rendered) <= limit or len(answer) <= 1:
+        return [rendered]
+    mid = len(answer) // 2
+    cut = max(answer.rfind("\n\n", 0, mid), answer.rfind("\n", 0, mid),
+              answer.rfind(" ", 0, mid))
+    if cut < 1:
+        cut = mid
+    return split_answer(answer[:cut], limit) + split_answer(answer[cut:].lstrip(), limit)
+
+
 # ---------- бот ----------
 
 def parse_command(text: str) -> tuple:
@@ -2009,7 +2026,21 @@ def create_bot(token: str) -> telebot.TeleBot:
             logger.exception("unexpected error")
             set_status(f"❌ {esc(type(exc).__name__)} (см. логи)")
             return
-        set_status(f"🤖 <b>{esc(used)}</b>\n{md_to_tg_html(fit(answer))}")
+        header = f"🤖 <b>{esc(used)}</b>\n"
+        pieces = split_answer(answer, TG_MSG_LIMIT - len(header) - 60)
+        set_status(header + pieces[0])
+        # длинный ответ не режем, а досылаем продолжением цепочкой реплаев
+        prev_id = status_msg.message_id
+        thread = getattr(trigger, "message_thread_id", None)
+        total = len(pieces)
+        for i, extra in enumerate(pieces[1:], start=2):
+            time.sleep(0.6)   # Телега режет слишком частые сообщения в один чат
+            kw = {"reply_parameters": telebot.types.ReplyParameters(message_id=prev_id)}
+            if thread:
+                kw["message_thread_id"] = thread
+            sent = bot.send_message(
+                chat_id, f"↪️ <i>продолжение {i}/{total}</i>\n{extra}", **kw)
+            prev_id = sent.message_id
 
     def handle_group(msgs):
         first = msgs[0]
