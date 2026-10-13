@@ -935,10 +935,17 @@ def _gemini_request(key: str, headers: dict, body: dict, model: str,
     t_post = time.monotonic() - t0
 
     if resp is None or resp.status_code != 200:
-        kind, err = classify_error(resp.status_code if resp is not None else 0, data or {})
+        code = resp.status_code if resp is not None else 0
+        kind, err = classify_error(code, data or {})
+        if kind == "invalid_key":
+            err += (f"\n\n🔑 Gemini отклонил API-ключ (HTTP {code}): невалиден или истёк. "
+                    f"Замени: пришли новый сообщением или /key <ключ>.")
         if dbg is not None:
-            dbg["attempts"].append(f"HTTP {resp.status_code if resp is not None else '???'} "
-                                   f"за {t_post:.1f}с → {err[:200]}")
+            # тело пишем, только когда JSON не распарсился: иначе и так видно err
+            snip = f" | тело: {resp.text[:200]}" if (resp is not None and not data) else ""
+            dbg["attempts"].append(f"HTTP {code} за {t_post:.1f}с → {err[:200]}{snip}")
+        if resp is not None and not data:
+            logger.warning("gemini HTTP %s, тело не JSON: %.200s", code, resp.text)
         if kind == "transient":
             err += "\n\n⚠️ Модель перегружена/лимит — попробуй позже или смени: /model <имя>."
         raise GeminiError(err)
@@ -2209,6 +2216,41 @@ def create_bot(token: str) -> telebot.TeleBot:
                 answer_error(message, "внутренняя ошибка (см. логи)")
             except Exception:
                 pass
+
+    @bot.inline_handler(lambda q: True)
+    def gemini_inline(q):
+        """@бот <запрос> — ответ прямо в инлайн-выдаче.
+
+        Инлайн-результаты Телега рендерит обычным текстом с parse_mode: нативных
+        таблиц и rich-блоков там не бывает (ограничение API), поэтому ответ даём
+        markdown-текстом, а при кривых символах — простым.
+        """
+        query = (q.query or "").strip()
+        if not query:
+            bot.answer_inline_query(q.id, [], cache_time=1)
+            return
+        # чата у инлайна нет — контекст диалога отключаем, ключ/модель юзера те же
+        user = dict(get_user(q.from_user.id), ctx=False)
+        try:
+            text = ask_gemini([{"type": "text", "text": query}], user, q.from_user.id)
+        except GeminiError as exc:
+            text = f"❌ {exc}"
+        except Exception as exc:
+            logger.exception("inline error")
+            text = f"❌ {type(exc).__name__} (см. логи)"
+        text = fit(text, 4096)
+        article = telebot.types.InlineQueryResultArticle(
+            id="gemini",
+            title=query[:60] + ("…" if len(query) > 60 else ""),
+            description=text[:200].replace("\n", " "),
+            input_message_content=telebot.types.InputTextMessageContent(
+                message_text=text, parse_mode="Markdown"))
+        try:
+            bot.answer_inline_query(q.id, [article], cache_time=1, is_personal=True)
+        except Exception:
+            # несбалансированные * _ ` ломают Markdown — отдаём простым текстом
+            article.input_message_content.parse_mode = None
+            bot.answer_inline_query(q.id, [article], cache_time=1, is_personal=True)
 
     return bot
 
