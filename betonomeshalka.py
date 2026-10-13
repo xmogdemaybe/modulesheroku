@@ -26,8 +26,8 @@
 #   .gchat [on|off]       контекст диалога на чат (previous_interaction_id)
 #   .gclear               сбросить контекст текущего чата
 #   .gdebug [on|off]      дебаг: дамп запроса/ответа Gemini с таймингами к ответам
-#   .gbot <запрос>        спросить через TG-бота (rich-ответ: нативные таблицы/маркдаун)
-#   .gbotset [@username]  бот-ретранслятор; .gbotset auto on|off — авто-реле таблиц
+#   .gbot <запрос>        то же, но ответ принудительно rich-ом через heroku-бота
+#   .gbotset [auto on|off] статус rich-доставки; авто = таблицы/код/заголовки сами
 #
 # Ключ также подхватывается из env GEMINI_API_KEY (Heroku config vars), если
 # в БД пусто. Логи — только в терминал (heroku logs), в TG ничего не дублируется.
@@ -56,7 +56,6 @@ MAX_REPLY_CTX = 8_000  # символы текста сообщения-отве
 ANSWER_LIMIT = 3_700  # ответ Telegram на сообщение — 4096, оставляем запас
 REQUEST_TIMEOUT = 300
 POLL_TIMEOUT = 240
-BOT_RELAY_TIMEOUT = 300  # сколько ждём ответ бота-ретранслятора
 
 # Уровень «раздумий» Gemini 3 (thinking_level). По умолчанию модель думает на
 # high — отсюда и задержки. medium — баланс; ниже = быстрее.
@@ -666,10 +665,9 @@ class Betonomeshalka(loader.Module):
             return key[:3] + "…"
         return key[:8] + "…" + key[-4:]
 
-    # ---------- реле через TG-бота (rich-ответы с нативными таблицами) ----------
+    # ---------- доставка rich-ответа через heroku-бота (инлайн-бот юзербота) ----------
 
-    @staticmethod
-    def _has_table(text: str) -> bool:
+    def _has_table(self, text: str) -> bool:
         """Есть ли в ответе markdown-таблица (её бот отрендерит нативно)."""
         lines = text.splitlines()
         for i in range(len(lines) - 1):
@@ -677,55 +675,60 @@ class Betonomeshalka(loader.Module):
                 return True
         return False
 
-    def _relay_bot(self) -> str:
-        return (self._get("relay_bot", "") or "").strip()
+    def _rich_worthy(self, text: str) -> bool:
+        """Стоит ли ответ доставлять rich-ом: таблицы/код-блоки/заголовки."""
+        if self._has_table(text) or "```" in text:
+            return True
+        return any(re.match(r"^#{1,6}\s", ln) for ln in text.splitlines())
 
-    async def _bot_relay(self, fwd_msg, query: str) -> tuple:
-        """Шлёт запрос боту-ретранслятору и ждёт его ответ.
+    def _heroku_bot(self) -> tuple:
+        """(токен, @username) инлайн-бота юзербота — того, что «via @…» у форм.
 
-        Возвращает (текст, None) или (None, ошибка). Медиа пересылаем форвардом
-        (группа и подпись сохраняются), текст — обычным сообщением: бот читает
-        запрос из подписи/текста. Ответ бота приходит отдельным сообщением
-        (статус он удаляет сам), поэтому ждём любое новое сообщение от бота.
+        Токен Hikka держит в БД («heroku.inline»/«bot_token»), дублируем доступ
+        через self.inline._token на случай другой структуры.
         """
-        uname = self._relay_bot()
-        if not uname:
-            return None, "бот-ретранслятор не задан: .gbotset <@username>"
+        inline = getattr(self, "inline", None)
+        token = (getattr(inline, "_token", "") or "").strip()
+        uname = (getattr(inline, "bot_username", "") or "").strip()
+        if not token:
+            token = (self.db.get("heroku.inline", "bot_token", "") or "").strip()
+        return token, uname
+
+    async def _rich_deliver(self, message, md: str) -> tuple:
+        """Шлёт ответ rich-сообщением ОТ heroku-бота (sendRichMessage, Bot API 10.1+).
+
+        Нативные таблицы/маркдаун возможны только в сообщении бота: у MTProto
+        rich-блоков нет. Бот должен быть участником чата, иначе Телега ответит
+        ошибкой — тогда вызывающий код показывает обычный <pre>-ответ.
+        """
+        token, uname = self._heroku_bot()
+        if not token:
+            return False, "нет токена инлайн-бота"
+        payload = {
+            "chat_id": message.chat_id,
+            "rich_message": {"markdown": md},
+            "reply_parameters": {"message_id": message.id},
+        }
+        thread = getattr(message, "message_thread_id", None)
+        if thread:
+            payload["message_thread_id"] = thread
         try:
-            bot = await self.client.get_entity(uname)
-        except Exception:
-            return None, f"не нашёл бота {uname}"
-        try:
-            if fwd_msg is not None:
-                sent = await self.client.forward_messages(bot, [fwd_msg])
-            else:
-                if not query.strip():
-                    return None, "пустой запрос"
-                sent = await self.client.send_message(bot, query)
+            session = await self._http()
+            async with session.post(
+                    f"https://api.telegram.org/bot{token}/sendRichMessage",
+                    json=payload) as resp:
+                data = await resp.json()
         except Exception as exc:
-            return None, f"не отправил боту: {exc}"
-        ids = [m.id for m in (sent if isinstance(sent, list) else [sent])]
-        last = max(ids)
-        deadline = time.monotonic() + BOT_RELAY_TIMEOUT
-        reply = None
-        while time.monotonic() < deadline:
-            msgs = await self.client.get_messages(bot, limit=5, min_id=last)
-            reply = next((m for m in msgs if (m.raw_text or "").strip()), None)
-            if reply is not None:
-                break
-            await asyncio.sleep(2)
-        for mid in ids:  # прибрать пересланное за собой
-            try:
-                await self.client.delete_messages(bot, [mid], revoke=True)
-            except Exception:
-                pass
-        if reply is None:
-            return None, f"бот молчит > {BOT_RELAY_TIMEOUT}с (не запущен или нет ключа)"
-        return (reply.raw_text or "").strip(), None
+            return False, str(exc)
+        if isinstance(data, dict) and data.get("ok"):
+            return True, uname or "бот"
+        desc = (data or {}).get("description") if isinstance(data, dict) else ""
+        return False, desc or "sendRichMessage не удался"
 
     # ---------- commands ----------
 
-    async def _run(self, message, args: str, notes_text: Optional[str] = None):
+    async def _run(self, message, args: str, notes_text: Optional[str] = None,
+                   force_rich: bool = False):
         """Общее ядро запроса для .gemini и .gnote."""
         key = self._api_key()
         if not key:
@@ -819,15 +822,6 @@ class Betonomeshalka(loader.Module):
         q_disp = query if len(query) <= 300 else query[:300] + "…"
         head = f"<b>{utils.escape_html(q_disp)}</b>\n{SEP}\n"
         await show(head + f"⏳ <i>{m_esc} думает…</i>")
-        # авто-реле: если включено и бот задан, параллельно с Gemini пингуем бота —
-        # при его успехе показываем rich-ответ (нативные таблицы), иначе свой
-        relay_task = None
-        t_ask = time.monotonic()
-        if self._relay_bot() and bool(self._get("relay_auto", True)):
-            fwd = media_msg if (media_msg is not None
-                                and self._media_kind(message) is not None) else None
-            src = fwd if fwd is not None else (reply_text or query)
-            relay_task = asyncio.ensure_future(self._bot_relay(src, query))
         try:
             answer = await self._ask(parts, message.chat_id, key)
         except GeminiError as exc:
@@ -838,20 +832,15 @@ class Betonomeshalka(loader.Module):
             logger.exception("[betonomeshalka] unexpected error")
             await show(head + f"❌ {utils.escape_html(type(exc).__name__)} (см. heroku logs)")
             return
-        if relay_task is not None and self._has_table(answer):
-            try:
-                bot_text, bot_err = await asyncio.wait_for(
-                    asyncio.shield(relay_task),
-                    max(1.0, BOT_RELAY_TIMEOUT - (time.monotonic() - t_ask)))
-            except Exception:
-                bot_text, bot_err = None, "timeout"
-            if bot_text and "🐞" not in bot_text:
-                await show(head + f"🤖 <b>бот-relay</b> — ответ:\n"
-                                  f"{md_to_tg_html(self._fit(bot_text))}")
+        # rich-доставка: ответ с таблицами/кодом/заголовками уходит сообщением ОТ
+        # heroku-бота (sendRichMessage) — только так в TG бывают нативные таблицы.
+        if force_rich or (self._get("relay_auto", True) and self._rich_worthy(answer)):
+            ok, info = await self._rich_deliver(message, f"🤖 **{model}**\n\n{answer}")
+            if ok:
+                await show(head + f"📨 <i>ответ с оформлением ушёл через "
+                                  f"@{utils.escape_html(str(info))}</i>")
                 return
-            logger.warning("[betonomeshalka] авто-реле не сработало: %s", bot_err)
-        elif relay_task is not None:
-            relay_task.cancel()
+            logger.warning("[betonomeshalka] rich-доставка не удалась: %s", info)
         await show(head + f"🤖 <b>{m_esc}</b> — ответ:\n{md_to_tg_html(self._fit(answer))}")
 
     @loader.command(
@@ -1090,83 +1079,42 @@ class Betonomeshalka(loader.Module):
             )
 
     @loader.command(
-        ru_doc="Спросить через TG-бота (rich-маркдаун): .gbot <запрос> или ответом на медиа",
-        en_doc="Ask via the relay bot (rich markdown): .gbot <query> or reply to media",
+        ru_doc="Спросить Gemini и доставить ответ rich-ом через heroku-бота: .gbot <запрос>",
+        en_doc="Ask Gemini and deliver the answer as a rich message via the heroku bot",
     )
     async def gbot(self, message):
-        """Ask through the relay bot which answers with native markdown (rich messages)"""
-        args = utils.get_args_raw(message).strip()
-        src = None
-        if self._media_kind(message) is not None:
-            src = message          # команда подписью к медиа — форвардим вместе с ней
-        elif getattr(message, "is_reply", False):
-            reply = await message.get_reply_message()
-            if reply is not None and (self._media_kind(reply)
-                                      or (reply.raw_text or "").strip()):
-                src = reply
-        if src is None and not args:
-            await utils.answer(
-                message,
-                "ℹ️ <code>.gbot &lt;запрос&gt;</code> или ответом на медиа/сообщение.\n"
-                "Вопрос уходит TG-боту, ответ приходит rich-сообщением "
-                "(нативные таблицы/заголовки — в новых клиентах TG).\n"
-                "<code>.gbotset &lt;@username&gt;</code> — задать бота.",
-            )
-            return
-        status_box = {}
-
-        async def show(text):
-            if "m" in status_box:
-                await status_box["m"].edit(text)
-            else:
-                status_box["m"] = await message.respond(text)
-
-        await show(f"⏳ <i>спрашиваю бота {utils.escape_html(self._relay_bot() or '…')}…</i>")
-        text, err = await self._bot_relay(src, args)
-        if err:
-            await show(f"❌ {utils.escape_html(err)}")
-            return
-        await show(f"🤖 <b>бот</b> — ответ:\n{md_to_tg_html(self._fit(text))}")
+        """Same as .gemini but forces rich delivery (native tables/markdown) via the bot"""
+        await self._run(message, utils.get_args_raw(message).strip(), force_rich=True)
 
     @loader.command(
-        ru_doc="Бот-ретранслятор: .gbotset <@username>; .gbotset auto on|off — авто-реле таблиц",
-        en_doc="Relay bot: .gbotset <@username>; .gbotset auto on|off — auto-relay tables",
+        ru_doc="Rich-доставка: .gbotset — статус; .gbotset auto on|off — авто-реле таблиц",
+        en_doc="Rich delivery: .gbotset — status; .gbotset auto on|off — auto-relay tables",
     )
     async def gbotset(self, message):
-        """Configure the relay bot (username) and auto-relay for table answers"""
-        raw = utils.get_args_raw(message).strip()
-        low = raw.lower()
-        if not raw:
-            bot = self._relay_bot() or "не задан"
-            auto = "вкл" if self._get("relay_auto", True) else "выкл"
-            await utils.answer(
-                message,
-                f"📡 Бот-ретранслятор: <code>{utils.escape_html(str(bot))}</code>\n"
-                f"Авто-реле таблиц: <b>{auto}</b>\n\n"
-                "<code>.gbotset &lt;@username&gt;</code> — задать бота\n"
-                "<code>.gbotset auto on|off</code> — при таблицах в ответе Gemini "
-                "автоматически просить бота ответить rich-маркдауном\n"
-                "<code>.gbot &lt;запрос&gt;</code> — спросить через бота вручную",
-            )
-            return
-        if low.split()[0] in ("auto", "авто"):
-            parts = low.split()
+        """Show/configure rich delivery through the heroku inline bot"""
+        raw = utils.get_args_raw(message).strip().lower()
+        if raw.split()[:1] == ["auto"]:
+            parts = raw.split()
             if len(parts) > 1 and parts[1] in ("on", "off", "вкл", "выкл"):
                 on = parts[1] in ("on", "вкл")
                 self._set("relay_auto", on)
                 await utils.answer(
-                    message, f"📡 Авто-реле таблиц: <b>{'вкл' if on else 'выкл'}</b>")
+                    message, f"📨 Авто-доставка rich-ом: <b>{'вкл' if on else 'выкл'}</b>")
             else:
                 await utils.answer(message, "ℹ️ <code>.gbotset auto on|off</code>")
             return
-        uname = raw.split()[0]
-        if not uname.startswith("@"):
-            uname = "@" + uname.lstrip("/")
-        self._set("relay_bot", uname)
+        token, uname = self._heroku_bot()
         await utils.answer(
             message,
-            f"📡 Бот-ретранслятор: <code>{utils.escape_html(uname)}</code>\n"
-            "Проверка: <code>.gbot привет</code>",
+            f"📨 Rich-доставка через heroku-бота: "
+            f"<code>@{utils.escape_html(uname or '?')}</code> "
+            f"({'токен есть' if token else '❌ токен не найден'})\n"
+            f"Авто (таблицы/код/заголовки в ответе): "
+            f"<b>{'вкл' if self._get('relay_auto', True) else 'выкл'}</b> — "
+            "<code>.gbotset auto on|off</code>\n"
+            "<code>.gbot &lt;запрос&gt;</code> — принудительно rich-ом\n\n"
+            "Ответ приходит сообщением ОТ бота реплием на твой запрос. "
+            "Бот должен быть участником чата, иначе покажу обычный ответ.",
         )
 
     @loader.command(
@@ -1279,9 +1227,9 @@ class Betonomeshalka(loader.Module):
             "<code>.gchat on|off</code> — память диалога на чат\n"
             "<code>.gclear</code> — сбросить контекст чата\n"
             "<code>.gdebug on|off</code> — дебаг: дамп запроса/ответа Gemini с таймингами\n"
-            "<code>.gbot &lt;запрос&gt;</code> — спросить через TG-бота (rich-маркдаун, нативные таблицы)\n"
-            "<code>.gbotset &lt;@username&gt;</code> — бот-ретранслятор; "
-            "<code>.gbotset auto on|off</code> — авто-реле таблиц\n"
+            "<code>.gbot &lt;запрос&gt;</code> — как .gemini, но ответ rich-ом через heroku-бота\n"
+            "<code>.gbotset</code> — статус rich-доставки; "
+            "<code>.gbotset auto on|off</code> — авто-доставка таблиц/кода rich-ом\n"
             "<code>.notes &lt;текст&gt;</code> — заметка; <code>.notes</code> — список; "
             "<code>.ndel N</code> — удалить\n"
             "<code>.gnote &lt;1,3|all&gt; &lt;запрос&gt;</code> — спросить с заметками как контекстом\n\n"
