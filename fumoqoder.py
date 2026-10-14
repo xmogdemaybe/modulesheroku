@@ -34,6 +34,7 @@
 # Caption placeholders: {source} {post} {url} {tags} {id} {num} {date} {time}
 
 import asyncio
+import json
 import logging
 import random
 import time
@@ -181,7 +182,11 @@ class FumoQoder(loader.Module):
         session = await self._http()
         async with session.get(url, params=params, headers=headers) as resp:
             resp.raise_for_status()
-            return await resp.json(content_type=None)
+            # Boorus return HTTP 200 with an EMPTY body (not "[]") when a page is
+            # out of range; json.loads("") would raise and kill the whole source,
+            # so treat a blank response as an empty result.
+            raw = await resp.text()
+            return json.loads(raw) if raw.strip() else []
 
     # ---------- tag config ----------
 
@@ -453,13 +458,17 @@ class FumoQoder(loader.Module):
             pool.extend(res)
         random.shuffle(pool)
 
+        # An album can't contain stickers (.webp) or GIFs, so when picking several
+        # posts only accept album-safe extensions up front — otherwise _send would
+        # drop them afterwards and the album could come out far smaller than asked.
+        allowed = ALBUM_OK_EXTS if count > 1 else EXT_MIME
         chosen_ids = set()
         for p in pool:
             if len(picked) >= count:
                 break
             ext = self._ext(p["url"])
             pid = p["id"]
-            if not ext or pid in history or pid in chosen_ids or pid in self._inflight:
+            if not ext or ext not in allowed or pid in history or pid in chosen_ids or pid in self._inflight:
                 continue
             p["ext"] = ext
             chosen_ids.add(pid)
@@ -484,24 +493,28 @@ class FumoQoder(loader.Module):
         history.extend(ids)
         self._set("history", history[-MAX_HISTORY:])
 
-    async def _download(self, url: str) -> bytes:
+    async def _download(self, url: str, max_size: int = MAX_IMAGE_SIZE) -> bytes:
         session = await self._http()
         async with session.get(url, headers={
             "User-Agent": USER_AGENT,
             "Referer": "/".join(url.split("/")[:3]) + "/",
         }) as resp:
             resp.raise_for_status()
+            # Bail out before pulling megabytes we're going to discard anyway
+            # (e.g. an oversized photo that can't go into an album).
+            if resp.content_length and resp.content_length > max_size:
+                raise RuntimeError(f"image > {max_size // (1024 * 1024)}MB")
             data = bytearray()
             async for chunk in resp.content.iter_chunked(64 * 1024):
                 data.extend(chunk)
-                if len(data) > MAX_IMAGE_SIZE:
-                    raise RuntimeError("image > 20MB")
+                if len(data) > max_size:
+                    raise RuntimeError(f"image > {max_size // (1024 * 1024)}MB")
         if not data:
             raise RuntimeError("empty response")
         return bytes(data)
 
     async def _send(self, entity, source: Optional[str] = None, count: Optional[int] = None,
-                    schedule: Optional[float] = None) -> list:
+                    schedule: Optional[float] = None, is_test: bool = False) -> list:
         if count is None:
             count = self._get("count", 1)
         count = max(1, min(MAX_COUNT, int(count or 1)))
@@ -526,10 +539,13 @@ class FumoQoder(loader.Module):
             files, sent, sizes = [], [], []
             last_err = None
             for post in posts:
+                # In an album an oversized photo can't be sent at all, so cap the
+                # download at 10 MB and skip it early instead of pulling 20 MB first.
+                cap = MAX_PHOTO_SIZE if (album and post["ext"] in PHOTO_EXTS) else MAX_IMAGE_SIZE
                 data = None
                 for _ in range(3):
                     try:
-                        data = await self._download(post["url"])
+                        data = await self._download(post["url"], max_size=cap)
                         break
                     except Exception as exc:
                         last_err = exc
@@ -537,8 +553,6 @@ class FumoQoder(loader.Module):
                 if data is None:
                     continue
                 size = len(data)
-                # In an album a photo over 10 MB can't be sent and can't be turned
-                # into a document (that would break the media group) — skip it.
                 if album and post["ext"] in PHOTO_EXTS and size > MAX_PHOTO_SIZE:
                     logger.info("[FumoQoder] skipping %s: photo > 10MB in album", post["id"])
                     continue
@@ -557,14 +571,19 @@ class FumoQoder(loader.Module):
                 # .webp is treated as a sticker (no caption) and an oversized photo
                 # is rejected by UploadPhoto — send both as a document instead.
                 as_doc = ext == ".webp" or (ext in PHOTO_EXTS and sizes[0] > MAX_PHOTO_SIZE)
-                if not as_doc:
+                if ext == ".webp":
+                    # Telethon would otherwise guess image/webp from the filename and
+                    # Telegram turns any image/webp upload into a captionless sticker.
+                    kwargs["mime_type"] = "application/octet-stream"
+                elif not as_doc:
                     kwargs["mime_type"] = EXT_MIME.get(ext)
                 kwargs["force_document"] = as_doc
             if schedule:
                 # Telegram publishes it server-side at that moment, even if the userbot
                 # is offline — this is the native "Scheduled Messages" feature.
                 kwargs["schedule"] = datetime.fromtimestamp(schedule, timezone.utc)
-            num = int(self._get("post_num", 0) or 0) + 1
+            # A manual .fumotest must not advance the channel's #N counter.
+            num = None if is_test else int(self._get("post_num", 0) or 0) + 1
             msg = await self.client.send_file(
                 entity, files[0] if len(files) == 1 else files,
                 caption=self._caption(sent, num), **kwargs,
@@ -575,17 +594,21 @@ class FumoQoder(loader.Module):
             for pid in reserved:
                 self._inflight.discard(pid)
 
-        # For a scheduled post, "now" is really its future publish time.
-        stamp = schedule if schedule else time.time()
+        # Mark the images as seen so a test doesn't keep returning the same ones.
         self._commit_history([p["id"] for p in sent])
-        self._set("post_num", num)
-        self._set("last_post_ts", stamp)
-        self._set("last_source", sent[0]["src"])
-        self._set("last_url", sent[0]["url"])
-        self._next_post = stamp + self._get("interval", DEFAULT_INTERVAL)
+        if not is_test:
+            # For a scheduled post, "now" is really its future publish time. A manual
+            # .fumotest must NOT advance the counter, the last-post stamp or the
+            # autopost timer — otherwise testing in one chat delays/renumbers the channel.
+            stamp = schedule if schedule else time.time()
+            self._set("post_num", num)
+            self._set("last_post_ts", stamp)
+            self._set("last_source", sent[0]["src"])
+            self._set("last_url", sent[0]["url"])
+            self._next_post = stamp + self._get("interval", DEFAULT_INTERVAL)
         logger.info(
             "[FumoQoder] %s n=%d src=%s id=%s target=%s msg_id=%s",
-            "SCHEDULED" if schedule else "SENT",
+            "TEST" if is_test else ("SCHEDULED" if schedule else "SENT"),
             len(files), sent[0]["src"], sent[0]["id"],
             getattr(entity, "id", entity), getattr(msg, "id", "?"),
         )
@@ -642,7 +665,12 @@ class FumoQoder(loader.Module):
         caption = "\n\n".join(parts)
         # Media captions are capped at 1024 chars; a 10-post album footer can exceed it.
         if len(caption) > CAPTION_LIMIT:
-            caption = caption[:CAPTION_LIMIT - 1] + "\u2026"
+            cut = caption[:CAPTION_LIMIT - 1]
+            # Don't slice through an escaped entity like &amp; — drop a dangling one.
+            amp = cut.rfind("&")
+            if amp != -1 and ";" not in cut[amp:]:
+                cut = cut[:amp]
+            caption = cut + "\u2026"
         return caption
 
     # ---------- target ----------
@@ -784,6 +812,15 @@ class FumoQoder(loader.Module):
         self._set("sched_pending", ts)
         self._next_post = ts
 
+    def _rearm_schedule(self):
+        """After a schedule-relevant setting changes, force the loop to re-check
+        Telegram's queue on its next tick instead of waiting out the old timer.
+        (_tick_schedule no-ops while a future post is already queued, so this can't
+        double-post — it just makes target/time/interval edits take effect at once.)"""
+        if self._get("schedule_mode", False):
+            self._set("sched_pending", 0)
+            self._next_post = 0
+
     # ---------- commands ----------
 
     @loader.command(
@@ -795,6 +832,7 @@ class FumoQoder(loader.Module):
         args = utils.get_args_raw(message).lower()
         if args in ("on", "1", "enable"):
             self._set("enabled", True)
+            self._rearm_schedule()
             await utils.answer(message, "\U0001F7E2 <b>Autoposting enabled.</b>")
         elif args in ("off", "0", "disable"):
             self._set("enabled", False)
@@ -834,6 +872,7 @@ class FumoQoder(loader.Module):
         else:
             entity, stored = await message.get_chat(), message.chat_id
         self._set("target", stored)
+        self._rearm_schedule()
         title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(stored)
         await utils.answer(
             message, f"\U0001F3AF <b>Target:</b> <code>{utils.escape_html(str(title))}</code>"
@@ -862,7 +901,12 @@ class FumoQoder(loader.Module):
             await utils.answer(message, "\u26A0\uFE0F <b>Interval: 1 minute .. 7 days.</b>")
             return
         self._set("interval", seconds)
-        self._next_post = (self._get("last_post_ts", 0.0) or time.time()) + seconds
+        if self._get("schedule_mode", False):
+            self._rearm_schedule()
+        else:
+            # Count from now, not from a possibly stale last_post_ts — otherwise
+            # changing the interval after idle would fire a post within seconds.
+            self._next_post = time.time() + seconds
         await utils.answer(message, f"\u23F1 <b>Interval:</b> <code>{fmt_interval(seconds)}</code>")
 
     @loader.command(
@@ -1010,6 +1054,7 @@ class FumoQoder(loader.Module):
         args = utils.get_args_raw(message).strip()
         if args.lower() in ("off", "clear", "none", ""):
             self._set("post_time", "")
+            self._rearm_schedule()
             await utils.answer(
                 message, "\u23F0 <b>Post time cleared.</b> Scheduled posts now use plain interval spacing."
             )
@@ -1027,6 +1072,7 @@ class FumoQoder(loader.Module):
             return
         val = f"{hh:02d}:{mm:02d}"
         self._set("post_time", val)
+        self._rearm_schedule()
         await utils.answer(
             message, f"\u23F0 <b>Scheduled posts at</b> <code>{val}</code> (local time). "
             "Each next date after the last queued post."
@@ -1202,7 +1248,7 @@ class FumoQoder(loader.Module):
                 return
         status = await utils.answer(message, "\U0001F50E <b>Fetching fumo...</b>")
         try:
-            sent = await self._send(await message.get_chat(), source=source, count=count)
+            sent = await self._send(await message.get_chat(), source=source, count=count, is_test=True)
         except FloodWaitError as exc:
             await utils.answer(status, f"\U0001F40C <b>FloodWait:</b> <code>{exc.seconds}s</code>")
             return
