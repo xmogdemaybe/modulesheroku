@@ -111,6 +111,11 @@ _TRANSIENT_WORDS = (
 )
 
 
+def _as_dict(data) -> dict:
+    """Google изредка отдаёт JSON-массив вместо объекта — .get на нём валит модуль."""
+    return data if isinstance(data, dict) else {}
+
+
 def normalize_model(name: str) -> str:
     n = (name or "").strip()
     if not n or n.lower().startswith("gemini") or n.startswith("models/"):
@@ -246,7 +251,7 @@ def md_to_tg_html(text: str) -> str:
     """Markdown+LaTeX → Telegram-HTML. Нераспознанное экранируется."""
     if not text:
         return text
-    blocks, inlines = [], []
+    blocks, inlines, links = [], [], []
     text = re.sub(r"```[^\n]*\n?(.*?)```",
                   lambda m: (blocks.append(m.group(1)), f"\x00B{len(blocks)-1}\x00")[1],
                   text, flags=re.S)
@@ -254,10 +259,15 @@ def md_to_tg_html(text: str) -> str:
     text = re.sub(r"`([^`\n]+)`",
                   lambda m: (inlines.append(m.group(1)), f"\x00I{len(inlines)-1}\x00")[1],
                   text)
+    # ссылки прячем в плейсхолдеры ДО emphasis-регулярок: иначе __/~~/*/_ внутри
+    # URL (…/__init__.html, site/~user) ломают HTML, а «"» в URL рвёт href.
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+                  lambda m: (links.append((m.group(1), m.group(2))),
+                             f"\x00L{len(links)-1}\x00")[1],
+                  text)
     text = re.sub(r"\$\$(.+?)\$\$", lambda m: latex_to_text(m.group(1)), text, flags=re.S)
     text = re.sub(r"\$([^$\n]+?)\$", lambda m: latex_to_text(m.group(1)), text)
     text = html.escape(text, quote=False)
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r'<a href="\2">\1</a>', text)
     text = re.sub(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t#]*$", r"<b>\1</b>", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.S)
@@ -267,6 +277,10 @@ def md_to_tg_html(text: str) -> str:
     text = re.sub(r"(?m)^([ \t]*)[*+\-][ \t]+", r"\1• ", text)
     text = re.sub(r"\x00I(\d+)\x00",
                   lambda m: "<code>" + html.escape(inlines[int(m.group(1))], quote=False) + "</code>",
+                  text)
+    text = re.sub(r"\x00L(\d+)\x00",
+                  lambda m: '<a href="' + html.escape(links[int(m.group(1))][1], quote=True) + '">'
+                            + html.escape(links[int(m.group(1))][0], quote=False) + "</a>",
                   text)
     text = re.sub(r"\x00B(\d+)\x00",
                   lambda m: "<pre><code>" + html.escape(blocks[int(m.group(1))], quote=False) + "</code></pre>",
@@ -428,6 +442,12 @@ class Betonomeshalka(loader.Module):
             "video": lambda: self._mime(msg, "video/mp4"),
         }.get(kind, lambda: self._mime(msg, ""))()
 
+        # Проверяем размер ДО download_media: иначе гигантский файл (500 МБ – 2 ГБ)
+        # целиком выкачается в RAM и убьёт процесс по OOM.
+        fsize = getattr(getattr(msg, "file", None), "size", 0) or 0
+        if fsize > MAX_INLINE:
+            return [], "файл больше 20 МБ — Gemini такое инлайн не принимает"
+
         if kind == "document":
             if mime in DOC_MIMES:
                 pass  # pdf/csv уходят как document-блок
@@ -486,7 +506,9 @@ class Betonomeshalka(loader.Module):
         if not gid:
             return [msg]
         try:
-            msgs = await self.client.get_messages(msg.peer_id, limit=10)
+            msgs = await self.client.get_messages(
+                msg.peer_id, limit=20,
+                min_id=max(0, msg.id - 10), max_id=msg.id + 10)
             same = [m for m in msgs
                     if getattr(m, "grouped_id", None) == gid and self._media_kind(m)]
             if not same:
@@ -531,10 +553,12 @@ class Betonomeshalka(loader.Module):
                     await asyncio.sleep(min(max(retry, 1), 30))
                     continue
                 if resp.status != 200:
-                    err = (last_data.get("error") or {}).get("message") or f"HTTP {resp.status}"
+                    err = (_as_dict(_as_dict(last_data).get("error")).get("message")
+                           or f"HTTP {resp.status}")
                     raise GeminiError(friendly_error(resp.status, err))
                 return last_data
-        err = (last_data.get("error") or {}).get("message") or f"HTTP {last_status or 429}"
+        err = (_as_dict(_as_dict(last_data).get("error")).get("message")
+               or f"HTTP {last_status or 429}")
         raise GeminiError(friendly_error(last_status or 429, err))
 
     def _debug_on(self) -> bool:
@@ -563,7 +587,7 @@ class Betonomeshalka(loader.Module):
         lines += [f"• {a}" for a in dbg["attempts"]]
         return "\n".join(lines)
 
-    async def _ask(self, parts: list, chat_id: int, key: str) -> str:
+    async def _ask(self, parts: list, ctx_key: str, key: str) -> str:
         model = self._model()
         body: dict = {"model": model, "input": parts}
         # thinking_level понимают только Gemini 3; gemma и компания отвечают ошибкой
@@ -576,7 +600,7 @@ class Betonomeshalka(loader.Module):
         body["store"] = ctx_on  # без контекста запросы не хранятся на сервере
         if ctx_on:
             # цепочка хранится как «модель|id»: чужой interaction_id Google бракует
-            saved = self._get(f"ctx_{chat_id}", "") or ""
+            saved = self._get(f"ctx_{ctx_key}", "") or ""
             m, _, prev = saved.partition("|")
             if prev and m == model:
                 body["previous_interaction_id"] = prev
@@ -587,7 +611,7 @@ class Betonomeshalka(loader.Module):
         while True:
             try:
                 t1 = time.monotonic()
-                data = await self._post(f"{API_BASE}/interactions", key, body)
+                data = _as_dict(await self._post(f"{API_BASE}/interactions", key, body))
                 t_post = time.monotonic() - t1
 
                 status = data.get("status", "")
@@ -598,10 +622,27 @@ class Betonomeshalka(loader.Module):
                     await asyncio.sleep(3)
                     waited += 3
                     session = await self._http()
-                    async with session.get(f"{API_BASE}/interactions/{iid}",
-                                           headers=headers) as resp:
-                        data = await resp.json()
-                        status = data.get("status", status)
+                    try:
+                        async with session.get(f"{API_BASE}/interactions/{iid}",
+                                               headers=headers) as resp:
+                            if resp.status != 200:
+                                raise GeminiError(friendly_error(
+                                    resp.status, f"HTTP {resp.status} при опросе статуса"))
+                            data = _as_dict(await resp.json())
+                    except GeminiError:
+                        raise
+                    except Exception as exc:
+                        # 502/503 от балансировщика приходит HTML-ом → resp.json()
+                        # валится ContentTypeError. Прерываем опрос, не крутим 240с.
+                        logger.warning("[betonomeshalka] poll error: %r", exc)
+                        raise GeminiError(f"ошибка опроса статуса: {exc}")
+                    new_status = data.get("status")
+                    if new_status:
+                        status = new_status
+                    elif data.get("error"):
+                        err = (_as_dict(data.get("error")).get("message")
+                               or "ошибка API при опросе")
+                        raise GeminiError(friendly_error(0, err))
 
                 if status == "failed":
                     errors = data.get("errors") or []
@@ -643,7 +684,7 @@ class Betonomeshalka(loader.Module):
                 raise
 
         if ctx_on and iid:
-            self._set(f"ctx_{chat_id}", f"{model}|{iid}")
+            self._set(f"ctx_{ctx_key}", f"{model}|{iid}")
         if dbg is not None:
             dbg["attempts"].append(f"ИТОГ: {time.monotonic() - t0:.1f}с")
             block = self._render_debug(dbg)
@@ -658,6 +699,25 @@ class Betonomeshalka(loader.Module):
         if len(text) <= limit:
             return text
         return text[:limit] + f"\n…(обрезано, всего {len(text)} симв.)"
+
+    @staticmethod
+    def _fit_converted(answer: str, prefix: str, limit: int = 4096) -> str:
+        """md_to_tg_html(answer) так, чтобы prefix+результат влез в limit.
+
+        Режем ИСХОДНЫЙ markdown и конвертим заново — так не рвётся HTML и не
+        остаётся незакрытых ``` (обрезка готового HTML ломала бы теги/сущности).
+        """
+        room = limit - len(prefix)
+        if room <= 0:
+            return ""
+        text = answer
+        for _ in range(6):
+            conv = md_to_tg_html(text)
+            if len(conv) <= room:
+                return conv
+            cut = int(len(text) * (room / max(1, len(conv)))) - 40
+            text = text[:max(1, cut)]
+        return md_to_tg_html(text)[:room]
 
     @staticmethod
     def _mask(key: str) -> str:
@@ -774,10 +834,17 @@ class Betonomeshalka(loader.Module):
                 await show(f"📷 <i>Альбом получен: {len(album)} медиа — загружаю…</i>")
             else:
                 await show("📥 <i>Медиа получено — загружаю…</i>")
+            total = 0
             for m in album:
                 media_parts, err = await self._media_parts(m)
                 if err:
-                    await utils.answer(message, f"❌ {utils.escape_html(err)}")
+                    # именно show(), не utils.answer: иначе при .gemini в подписи
+                    # отдельное статус-сообщение остаётся сиротой висеть в чате.
+                    await show(f"❌ {utils.escape_html(err)}")
+                    return
+                total += sum(len(p.get("data", "")) for p in media_parts)
+                if total > MAX_INLINE:  # base64-сумма всего альбома vs лимит запроса
+                    await show("❌ Альбом суммарно больше 20 МБ — Gemini такое инлайн не принимает")
                     return
                 parts.extend(media_parts)
 
@@ -821,9 +888,13 @@ class Betonomeshalka(loader.Module):
         m_esc = utils.escape_html(model)
         q_disp = query if len(query) <= 300 else query[:300] + "…"
         head = f"<b>{utils.escape_html(q_disp)}</b>\n{SEP}\n"
+        # контекст на ТРЕД (топик форума), а не только на чат: иначе в супергруппе
+        # с темами все топики делят один chat_id и смешивают диалоги.
+        thread = getattr(message, "message_thread_id", None)
+        ctx_key = f"{message.chat_id}_{thread}" if thread else str(message.chat_id)
         await show(head + f"⏳ <i>{m_esc} думает…</i>")
         try:
-            answer = await self._ask(parts, message.chat_id, key)
+            answer = await self._ask(parts, ctx_key, key)
         except GeminiError as exc:
             logger.error("[betonomeshalka] api error: %s", exc)
             await show(head + f"❌ {utils.escape_html(str(exc))}")
@@ -841,7 +912,14 @@ class Betonomeshalka(loader.Module):
                                   f"@{utils.escape_html(str(info))}</i>")
                 return
             logger.warning("[betonomeshalka] rich-доставка не удалась: %s", info)
-        await show(head + f"🤖 <b>{m_esc}</b> — ответ:\n{md_to_tg_html(self._fit(answer))}")
+        prefix = head + f"🤖 <b>{m_esc}</b> — ответ:\n"
+        try:
+            await show(prefix + self._fit_converted(answer, prefix))
+        except Exception:
+            # MessageTooLongError и пр. — аварийно показываем чистый урезанный текст,
+            # чтобы сообщение не осталось висеть на «⏳ думает…».
+            logger.exception("[betonomeshalka] show answer failed")
+            await show(prefix + utils.escape_html(answer[:3500]))
 
     @loader.command(
         ru_doc="Спросить Gemini: .gemini <запрос> (можно ответом на фото/войс/видео/док)",
@@ -860,7 +938,19 @@ class Betonomeshalka(loader.Module):
         args = utils.get_args_raw(message).strip()
         if args:
             self._set("api_key", args)
-            await utils.answer(message, f"🔑 <b>Ключ сохранён:</b> <code>{self._mask(args)}</code>")
+            # Удаляем сообщение с открытым ключом: push-уведомление показывает текст
+            # ДО правки, а история правок/логгеры сохранят ключ целиком.
+            chat = message.chat_id
+            try:
+                await message.delete()
+            except Exception:
+                logger.warning("[betonomeshalka] не смог удалить сообщение с ключом")
+            await self.client.send_message(
+                chat,
+                f"🔑 <b>Ключ сохранён:</b> <code>{self._mask(args)}</code>",
+                parse_mode="HTML",
+            )
+            return
         else:
             db_key = (self._get("api_key", "") or "").strip()
             env_key = (os.environ.get("GEMINI_API_KEY", "") or "").strip()
@@ -1025,8 +1115,10 @@ class Betonomeshalka(loader.Module):
     )
     async def gclear(self, message):
         """Reset per-chat context"""
-        self._set(f"ctx_{message.chat_id}", "")
-        await utils.answer(message, "🧹 Контекст чата сброшен.")
+        thread = getattr(message, "message_thread_id", None)
+        ctx_key = f"{message.chat_id}_{thread}" if thread else str(message.chat_id)
+        self._set(f"ctx_{ctx_key}", "")
+        await utils.answer(message, "🧹 Контекст сброшен.")
 
     @loader.command(
         ru_doc="Уровень раздумий: .gthink [minimal|low|medium|high] (ниже = быстрее)",
@@ -1137,7 +1229,16 @@ class Betonomeshalka(loader.Module):
             )
             return
         lines = [f"<b>{i}.</b> {utils.escape_html(t)}" for i, t in enumerate(notes, 1)]
-        body = self._fit("\n".join(lines), 3_000)
+        # Режем по границе заметок, а не готовый HTML: иначе разрез попадёт внутрь
+        # тега <b> или сущности &lt; и Telegram упадёт на парсинге.
+        acc, total = [], 0
+        for ln in lines:
+            if total + len(ln) + 1 > 3_000:
+                acc.append("…")
+                break
+            acc.append(ln)
+            total += len(ln) + 1
+        body = "\n".join(acc)
         await utils.answer(
             message,
             f"📝 <b>Заметки ({len(notes)}):</b>\n{body}\n\n"
@@ -1187,6 +1288,15 @@ class Betonomeshalka(loader.Module):
         sel, _, query = raw.partition(" ")
         sel = sel.strip().lower()
         query = query.strip()
+        if not query:
+            # без запроса _run подставил бы «Ответь на это сообщение» и приклеил
+            # личные заметки к чужому посту — требуем явный текст.
+            await utils.answer(
+                message,
+                "❌ Нужен текст запроса: <code>.gnote 1,3 &lt;запрос&gt;</code> "
+                "или <code>.gnote all &lt;запрос&gt;</code>.",
+            )
+            return
         if sel == "all":
             idx = list(range(1, len(notes) + 1))
         else:
