@@ -57,7 +57,9 @@ from .. import loader, utils
 logger = logging.getLogger(__name__)
 
 MODNAME = "TriggerChanger"
-MAX_PHOTO = 5 * 1024 * 1024
+# Heroku на каждый db.set переписывает весь json и держит 15 ревизий в памяти,
+# поэтому картинка в base64 дороже, чем выглядит: 2 МБ файла -> ~2.7 МБ текста
+MAX_PHOTO = 2 * 1024 * 1024
 PER_PAGE = 30
 MENU_PER_PAGE = 8
 BTN_TEXT = 60  # телега режет подпись кнопки на 64 символах — оставляем запас
@@ -66,6 +68,11 @@ MODE_CYCLE = ("sub", "word", "regex")
 CANCEL_WORDS = ("отмена", "cancel", "стоп", "stop", "хватит")
 YES_WORDS = ("да", "yes", "+", "угу", "ага")
 NO_WORDS = ("нет", "no", "-", "неа")
+MAX_EDITED = 500  # сколько последних правок помним, чтобы не править дважды
+EDITED_TTL = 600
+REEDIT_GUARD = 300  # одно и то же сообщение повторно не правим 5 минут
+WIZARD_TTL = 900  # брошенный .repadd не должен вечно глотать сообщения
+PHOTO_WAIT_TTL = 300  # столько ждём картинку из меню, чтобы не прилипла чужая
 # группа 1 = «не»/«нет»/«ни»/«неа» перед совпадением: с флагом -n такие
 # вхождения не трогаем (см. _apply)
 NEG_PREFIX = r"((?:[нН][еЕ][тТ]|[нН][еЕ][аА]|[нН][иИ]|[нН][еЕ])\s+)?"
@@ -129,7 +136,7 @@ class TriggerChangerMod(loader.Module):
         self._pending = {}  # uid -> состояние визарда
         self._edited = {}  # msg_id -> ts, страховка от повторной обработки
         self._undo = {}  # key -> {"msg", "orig", "ts} для отката автоправок
-        self._photo_wait = {}  # uid -> uid правила, которое ждёт картинку
+        self._photo_wait = {}  # uid юзера -> (uid правила, ts): ждём картинку
         self._menu_forms = {}  # uid -> открытое меню, чтобы обновить его из watcher
         # настройки жили в ключах БД — переносим в config, чтобы правда была одна
         for key in ("enabled", "clean_links"):
@@ -163,7 +170,18 @@ class TriggerChangerMod(loader.Module):
             return default
 
     def _set(self, key, value):
+        """Записать ключ. None — удалить ключ совсем.
+
+        db.set(key, None) не удаляет запись, а оставляет мёртвый ключ: за
+        месяцы правок таких ключей набирается столько же, сколько картинок.
+        """
         try:
+            if value is None:
+                namespace = self.db.setdefault(MODNAME, {})
+                if key in namespace:
+                    del namespace[key]
+                    self.db.save()
+                return
             self.db.set(MODNAME, key, value)
         except Exception as exc:
             logger.error("[TriggerChanger] db write %s: %r", key, exc)
@@ -374,9 +392,9 @@ class TriggerChangerMod(loader.Module):
                 self._undo.pop(key, None)
 
     def _remember_undo(self, message, orig):
-        self._prune_undo()
         key = f"{message.chat_id}:{message.id}"
         self._undo[key] = {"msg": message, "orig": orig, "ts": time.time()}
+        self._prune_undo()
         return key
 
     async def _notify_undo(self, message, key):
@@ -441,19 +459,33 @@ class TriggerChangerMod(loader.Module):
             if not isinstance(text, str):
                 return
 
+            # команды не глотаем даже во время визарда: иначе .replist,
+            # отправленный вместо ответа боту, уедет текстом замены
+            for prefix in self.get_prefixes():
+                if prefix and text.startswith(prefix):
+                    return
+
             # активный визард перехватывает ответы пользователя
-            if uid in self._pending:
-                await self._wizard_step(message, text)
-                return
+            state = self._pending.get(uid)
+            if state:
+                if time.time() - state.get("ts", 0) > WIZARD_TTL:
+                    self._pending.pop(uid, None)
+                    logger.info("[TriggerChanger] визард юзера %s истёк", uid)
+                else:
+                    await self._wizard_step(message, text)
+                    return
 
             # меню ждёт картинку для правила: глотаем только фото и «отмена»,
-            # остальные сообщения живут своей жизнью
+            # остальные сообщения живут своей жизнью. Просроченное ожидание
+            # снимаем — иначе случайное фото через час прилипнет к правилу.
             wait = self._photo_wait.get(uid)
             if wait:
-                if message.photo:
-                    await self._attach_photo(message, wait)
+                if time.time() - wait[1] > PHOTO_WAIT_TTL:
+                    self._photo_wait.pop(uid, None)
+                elif message.photo:
+                    await self._attach_photo(message, wait[0])
                     return
-                if text.strip().lower() in CANCEL_WORDS:
+                elif text.strip().lower() in CANCEL_WORDS:
                     self._photo_wait.pop(uid, None)
                     await utils.answer(message, "❌ Загрузка картинки отменена.")
                     return
@@ -462,11 +494,8 @@ class TriggerChangerMod(loader.Module):
                 return
             if message.fwd_from or message.via_bot_id:
                 return
-            for prefix in self.get_prefixes():
-                if prefix and text.startswith(prefix):
-                    return
             ts = self._edited.get(message.id)
-            if ts is not None and time.time() - ts < 300:
+            if ts is not None and time.time() - ts < REEDIT_GUARD:
                 return
 
             new_text, matched = self._apply(text)
@@ -478,11 +507,16 @@ class TriggerChangerMod(loader.Module):
                     logger.warning("[TriggerChanger] edit failed (msg %s): %r", message.id, exc)
                     return
                 self._edited[message.id] = time.time()
-                if len(self._edited) > 500:
-                    cutoff = time.time() - 600
+                if len(self._edited) > MAX_EDITED:
+                    cutoff = time.time() - EDITED_TTL
                     self._edited = {
                         k: v for k, v in self._edited.items() if v > cutoff
                     }
+                    # в активном чате записи не успевают состариться — режем по
+                    # количеству, иначе словарь растёт без предела
+                    if len(self._edited) > MAX_EDITED:
+                        fresh = sorted(self._edited, key=self._edited.get)[-MAX_EDITED:]
+                        self._edited = {k: self._edited[k] for k in fresh}
                 if self.config["undo"]:
                     await self._notify_undo(
                         message, self._remember_undo(message, text)
@@ -569,6 +603,7 @@ class TriggerChangerMod(loader.Module):
         state = self._pending.get(uid)
         if state is None:
             return
+        state["ts"] = time.time()  # живой визард не должен умереть на середине
         step = state.get("step")
         stripped = text.strip()
 
@@ -999,7 +1034,7 @@ class TriggerChangerMod(loader.Module):
             await self._menu_render(call, text, markup)
             return
         # кнопку с файлом телега не умеет: ждём фото от пользователя в watcher
-        self._photo_wait[call.sender_id] = uid
+        self._photo_wait[call.sender_id] = (uid, time.time())
         await self._menu_answer(
             call,
             "пришли картинку любым сообщением (например в «Избранное») — подхвачу",
@@ -1159,7 +1194,8 @@ class TriggerChangerMod(loader.Module):
             )
 
         state = {"step": "trigger", "mode": mode, "case": case, "neg": neg,
-                 "end": end, "trigger": "", "repl": None, "photo": None}
+                 "end": end, "trigger": "", "repl": None, "photo": None,
+                 "ts": time.time()}
 
         if trigger:
             if mode == "regex":
