@@ -23,12 +23,14 @@
 #   .fumoredditcookie <cookie>         browser cookie for Reddit (403 fallback)
 #   .fumoredditmode auto|json|arctic   listing via direct JSON or Arctic Shift archive
 #   .fumosub <subreddit>         set subreddit (default Fumofumo)
+#   .fumoschedule on|off         use Telegram scheduled messages for autoposting
+#   .fumonum [N]                 post counter (#N in caption); set your own number
 #   .fumotest [source] [count]   post fumo now (optionally from one source)
 #   .fumoreset                   clear sent-images history (settings are kept)
 #   .fumostatus                  show all settings + enabled sources
 #   .fumohelp                    command list with examples
 #
-# Caption placeholders: {source} {post} {url} {tags} {id} {date} {time}
+# Caption placeholders: {source} {post} {url} {tags} {id} {num} {date} {time}
 
 import asyncio
 import logging
@@ -391,40 +393,48 @@ class FumoQoder(loader.Module):
     async def _pick_posts(self, count: int = 1, source: Optional[str] = None) -> list:
         """Return up to `count` fresh, unseen posts with an added 'ext' field.
 
+        With no explicit source, every active source is fetched concurrently and
+        their posts are pooled and shuffled together, so a plain `.fumotest` mixes
+        Safebooru / Konachan / Reddit instead of draining one source first.
+
         Raises only when nothing at all could be picked; a partial result is fine.
         """
         history = set(self._get("history", []) or [])
         picked, errors = [], []
         sources = [self._source_by_name(source)] if source else self._active_sources()
-        for src in sources:
+
+        # Fetch all sources in parallel; a failing one is skipped, not fatal.
+        results = await asyncio.gather(
+            *[self._safe_fetch(src) for src in sources], return_exceptions=True
+        )
+        pool = []
+        for src, res in zip(sources, results):
+            name = src.__name__
+            if isinstance(res, Exception):
+                errors.append(f"{name}:{type(res).__name__}")
+                logger.warning("[FumoQoder] source %s failed: %r", name, res)
+                continue
+            pool.extend(res)
+        random.shuffle(pool)
+
+        chosen_ids = set()
+        for p in pool:
             if len(picked) >= count:
                 break
-            name = src.__name__
-            added = 0
-            try:
-                posts = await src()
-            except Exception as exc:
-                errors.append(f"{name}:{type(exc).__name__}")
-                logger.warning("[FumoQoder] source %s failed: %r", name, exc)
+            ext = self._ext(p["url"])
+            if not ext or p["id"] in history or p["id"] in chosen_ids:
                 continue
-            random.shuffle(posts)
-            chosen_ids = {p["id"] for p in picked}
-            for p in posts:
-                if len(picked) >= count:
-                    break
-                ext = self._ext(p["url"])
-                if not ext or p["id"] in history or p["id"] in chosen_ids:
-                    continue
-                p["ext"] = ext
-                chosen_ids.add(p["id"])
-                self._push_history(p["id"])
-                picked.append(p)
-                added += 1
-            if not added:
-                errors.append(f"{name}:no-fresh")
+            p["ext"] = ext
+            chosen_ids.add(p["id"])
+            self._push_history(p["id"])
+            picked.append(p)
         if not picked:
+            errors.append("no-fresh")
             raise RuntimeError("all sources failed: " + ", ".join(errors) if errors else "no fumo found")
         return picked
+
+    async def _safe_fetch(self, src):
+        return await src()
 
     def _push_history(self, post_id: str):
         history = self._get("history", []) or []
@@ -447,7 +457,8 @@ class FumoQoder(loader.Module):
             raise RuntimeError("empty response")
         return bytes(data)
 
-    async def _send(self, entity, source: Optional[str] = None, count: Optional[int] = None) -> list:
+    async def _send(self, entity, source: Optional[str] = None, count: Optional[int] = None,
+                    schedule: Optional[float] = None) -> list:
         if count is None:
             count = self._get("count", 1)
         count = max(1, min(MAX_COUNT, int(count or 1)))
@@ -477,24 +488,32 @@ class FumoQoder(loader.Module):
         kwargs = {}
         if len(files) == 1:
             kwargs["mime_type"] = EXT_MIME[sent[0]["ext"]]
+        if schedule:
+            # Telegram publishes it server-side at that moment, even if the userbot
+            # is offline — this is the native "Scheduled Messages" feature.
+            kwargs["schedule"] = datetime.fromtimestamp(schedule, timezone.utc)
+        num = int(self._get("post_num", 0) or 0) + 1
         msg = await self.client.send_file(
             entity, files[0] if len(files) == 1 else files,
-            caption=self._caption(sent), **kwargs,
+            caption=self._caption(sent, num), **kwargs,
         )
 
-        now = time.time()
-        self._set("last_post_ts", now)
+        # For a scheduled post, "now" is really its future publish time.
+        stamp = schedule if schedule else time.time()
+        self._set("post_num", num)
+        self._set("last_post_ts", stamp)
         self._set("last_source", sent[0]["src"])
         self._set("last_url", sent[0]["url"])
-        self._next_post = now + self._get("interval", DEFAULT_INTERVAL)
+        self._next_post = stamp + self._get("interval", DEFAULT_INTERVAL)
         logger.info(
-            "[FumoQoder] SENT n=%d src=%s id=%s target=%s msg_id=%s",
+            "[FumoQoder] %s n=%d src=%s id=%s target=%s msg_id=%s",
+            "SCHEDULED" if schedule else "SENT",
             len(files), sent[0]["src"], sent[0]["id"],
             getattr(entity, "id", entity), getattr(msg, "id", "?"),
         )
         return sent
 
-    def _caption(self, posts) -> str:
+    def _caption(self, posts, num: Optional[int] = None) -> str:
         if isinstance(posts, dict):
             posts = [posts]
         first = posts[0]
@@ -508,6 +527,7 @@ class FumoQoder(loader.Module):
             "{url}": utils.escape_html(first["url"]),
             "{tags}": utils.escape_html(first.get("tags", "")),
             "{id}": utils.escape_html(first["id"]),
+            "{num}": str(num if num is not None else self._get("post_num", 0)),
             "{date}": now.strftime("%Y-%m-%d"),
             "{time}": now.strftime("%H:%M:%S"),
         }
@@ -519,6 +539,9 @@ class FumoQoder(loader.Module):
 
         parts = []
         custom = render(self._get("caption", "") or "")
+        # Post counter: prepended unless the custom caption already uses {num}.
+        if num is not None and "{num}" not in (self._get("caption", "") or ""):
+            parts.append(f"<b>#{num}</b>")
         if custom:
             parts.append(custom)
         if self._get("meta", True):
@@ -550,25 +573,57 @@ class FumoQoder(loader.Module):
         await asyncio.sleep(10)
         while not self._stopping:
             try:
-                if not self._get("enabled", False) or time.time() < self._next_post:
-                    await asyncio.sleep(15)
-                    continue
-                try:
-                    await self._send(await self._target())
-                except FloodWaitError as exc:
-                    logger.warning("[FumoQoder] FloodWait %ss", exc.seconds)
-                    self._next_post = time.time() + exc.seconds + 30
-                except (ChatWriteForbiddenError, ChatAdminRequiredError) as exc:
-                    logger.warning("[FumoQoder] cannot write to target: %r", exc)
-                    self._next_post = time.time() + 300
-                except Exception as exc:
-                    logger.error("[FumoQoder] autopost failed: %r", exc)
-                    self._next_post = time.time() + 60
+                if self._get("enabled", False):
+                    if self._get("schedule_mode", False):
+                        await self._tick_schedule()
+                    elif time.time() >= self._next_post:
+                        await self._tick_live()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 pass
             await asyncio.sleep(15)
+
+    async def _tick_live(self):
+        try:
+            await self._send(await self._target())
+        except FloodWaitError as exc:
+            logger.warning("[FumoQoder] FloodWait %ss", exc.seconds)
+            self._next_post = time.time() + exc.seconds + 30
+        except (ChatWriteForbiddenError, ChatAdminRequiredError) as exc:
+            logger.warning("[FumoQoder] cannot write to target: %r", exc)
+            self._next_post = time.time() + 300
+        except Exception as exc:
+            logger.error("[FumoQoder] autopost failed: %r", exc)
+            self._next_post = time.time() + 60
+
+    async def _tick_schedule(self):
+        """Keep exactly one post queued in Telegram's Scheduled Messages.
+
+        `sched_pending` is the publish time of the queued post. Once that moment
+        passes (Telegram has fired it), we queue the next one an interval later.
+        The userbot can be offline in between — Telegram publishes it server-side.
+        """
+        now = time.time()
+        pending = self._get("sched_pending", 0) or 0
+        if pending > now:
+            self._next_post = pending
+            return
+        interval = self._get("interval", DEFAULT_INTERVAL)
+        fire_at = now + interval
+        try:
+            await self._send(await self._target(), schedule=fire_at)
+            self._set("sched_pending", fire_at)
+            self._next_post = fire_at
+        except FloodWaitError as exc:
+            logger.warning("[FumoQoder] FloodWait %ss", exc.seconds)
+            self._set("sched_pending", now + exc.seconds + 30)
+        except (ChatWriteForbiddenError, ChatAdminRequiredError) as exc:
+            logger.warning("[FumoQoder] cannot write to target: %r", exc)
+            self._set("sched_pending", now + 300)
+        except Exception as exc:
+            logger.error("[FumoQoder] schedule failed: %r", exc)
+            self._set("sched_pending", now + 60)
 
     # ---------- commands ----------
 
@@ -647,11 +702,11 @@ class FumoQoder(loader.Module):
         await utils.answer(message, f"\u23F1 <b>Interval:</b> <code>{fmt_interval(seconds)}</code>")
 
     @loader.command(
-        ru_doc="Свой текст подписи (плейсхолдеры {source}{post}{url}{tags}{date}{time}); пусто — очистить",
+        ru_doc="Свой текст подписи (плейсхолдеры {source}{post}{url}{tags}{num}{date}{time}); пусто — очистить",
         en_doc="Custom caption text (placeholders allowed); empty clears it",
     )
     async def fumocaption(self, message):
-        """Custom caption text; placeholders {source}{post}{url}{tags}{id}{date}{time}"""
+        """Custom caption text; placeholders {source}{post}{url}{tags}{id}{num}{date}{time}"""
         caption = utils.get_args_raw(message)
         self._set("caption", caption)
         await utils.answer(
@@ -745,6 +800,61 @@ class FumoQoder(loader.Module):
         self._set("subreddit", sub or DEFAULT_SUBREDDIT)
         await utils.answer(
             message, f"\U0001F4E1 <b>Subreddit:</b> <code>r/{utils.escape_html(sub or DEFAULT_SUBREDDIT)}</code>"
+        )
+
+    @loader.command(
+        ru_doc="Автопостинг через отложенные сообщения Telegram: .fumoschedule on/off",
+        en_doc="Autopost via Telegram Scheduled Messages: .fumoschedule on/off",
+    )
+    async def fumoschedule(self, message):
+        """Use Telegram's native Scheduled Messages: the post is queued server-side
+        and published even if the userbot is offline at that moment."""
+        args = utils.get_args_raw(message).lower()
+        if args in ("on", "1", "enable"):
+            self._set("schedule_mode", True)
+            self._set("sched_pending", 0)
+            await utils.answer(
+                message, "\U0001F4C5 <b>Schedule mode ON.</b> Next posts go to "
+                "Telegram's Scheduled Messages queue (published even if the bot is offline)."
+            )
+        elif args in ("off", "0", "disable"):
+            self._set("schedule_mode", False)
+            self._set("sched_pending", 0)
+            await utils.answer(
+                message, "\U0001F4C5 <b>Schedule mode OFF.</b> Posts are sent live when due."
+            )
+        else:
+            state = "on" if self._get("schedule_mode", False) else "off"
+            await utils.answer(
+                message, f"<b>Schedule mode:</b> {state}\n<code>.fumoschedule on|off</code>"
+            )
+
+    @loader.command(
+        ru_doc="Счётчик постов (#N в подписи): .fumonum 57 — задать своё число; без аргумента — показать",
+        en_doc="Post counter (#N in caption): .fumonum 57 sets your own number; no args shows it",
+    )
+    async def fumonum(self, message):
+        """Show or set the post counter that appears as #N at the top of each caption."""
+        args = utils.get_args_raw(message).strip()
+        if not args:
+            num = int(self._get("post_num", 0) or 0)
+            await utils.answer(
+                message, f"\U0001F522 <b>Post counter:</b> <code>#{num}</code> "
+                "(next post = <code>#{}</code>)\n<i>Set your own:</i> <code>.fumonum 57</code>".format(num + 1)
+            )
+            return
+        try:
+            num = int(args)
+        except ValueError:
+            await utils.answer(message, "\u26A0\uFE0F <b>Example:</b> <code>.fumonum 57</code>")
+            return
+        if num < 0:
+            await utils.answer(message, "\u26A0\uFE0F <b>Number must be >= 0.</b>")
+            return
+        self._set("post_num", num)
+        await utils.answer(
+            message, f"\U0001F522 <b>Counter set to</b> <code>#{num}</code>, "
+            f"next post will be <code>#{num + 1}</code>."
         )
 
     @loader.command(
@@ -933,7 +1043,8 @@ class FumoQoder(loader.Module):
         )
         if self._get("enabled", False):
             remain = max(0, int(self._next_post - time.time()))
-            state = f"\U0001F7E2 enabled, next post in <code>{fmt_interval(remain)}</code>"
+            mode = " (scheduled)" if self._get("schedule_mode", False) else ""
+            state = f"\U0001F7E2 enabled{mode}, next post in <code>{fmt_interval(remain)}</code>"
         else:
             state = "\U0001F534 disabled"
 
@@ -948,6 +1059,8 @@ class FumoQoder(loader.Module):
             f"<b>Target:</b> <code>{utils.escape_html(target_str)}</code>\n"
             f"<b>Interval:</b> <code>{fmt_interval(self._get('interval', DEFAULT_INTERVAL))}</code>\n"
             f"<b>Per send:</b> <code>{self._get('count', 1)}</code>\n"
+            f"<b>Post counter:</b> <code>#{int(self._get('post_num', 0) or 0)}</code>\n"
+            f"<b>Schedule mode:</b> {'on' if self._get('schedule_mode', False) else 'off'}\n"
             f"<b>Sources:</b> <code>{utils.escape_html(', '.join(active))}</code>\n"
             f"<b>Reddit media:</b> <code>{utils.escape_html(self._get('reddit_media', 'pics'))}</code>\n"
             f"<b>Reddit mode:</b> <code>{utils.escape_html(self._get('reddit_mode', 'auto'))}</code>\n"
@@ -974,10 +1087,13 @@ class FumoQoder(loader.Module):
             "<code>.fumo on</code> / <code>.fumo off</code> — enable/disable\n"
             "<code>.fumotarget @mychannel</code> — where to post (or reply / empty = current chat)\n"
             "<code>.fumointerval 30m</code> — how often (30m / 2h / 90 = minutes)\n"
-            "<code>.fumocount 3</code> — how many pictures per send (1..10, album)\n\n"
+            "<code>.fumocount 3</code> — how many pictures per send (1..10, album)\n"
+            "<code>.fumoschedule on</code> — queue posts as Telegram Scheduled Messages "
+            "(published even if the bot is offline)\n"
+            "<code>.fumonum 57</code> — set the post counter (#57 → #58 …); no args shows it\n\n"
             "<b>Caption</b>\n"
             "<code>.fumocaption Fumo time! {source}</code> — custom text "
-            "({source} {post} {url} {tags} {id} {date} {time}); empty = clear\n"
+            "({source} {post} {url} {tags} {id} {num} {date} {time}); empty = clear\n"
             "<code>.fumometa off</code> — hide source/tags/link footer\n\n"
             "<b>Sources & tags</b>\n"
             "<code>.fumotags</code> — show tags per source\n"
