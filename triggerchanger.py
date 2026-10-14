@@ -37,14 +37,16 @@
 #      или картинкой — тогда замена будет картинкой без текста
 #   3) бот спросит про картинку: ответь "да" и пришли картинку, или "нет"
 #      -> если картинка есть, она отправляется ответом на сработавшее сообщение
-# "отмена" на любом шаге — отмена.
+# "отмена" на любом шаге — отмена. Отвечать нужно в том же чате, где вызван
+# .repadd: в других чатах визард твои сообщения не перехватывает.
 #
 # Меню .repmenu (то же самое, но кнопками и переживает рестарт dyno):
 #   список правил -> карточка правила: режим, регистр, «не после не», «только
 #   в конце», текст замены, картинка, удаление. Текст вводится инпут-кнопкой
 #   (телега сама подставит @бот в поле ввода), а не перехватом ответов в чате.
 #   Картинка — исключение: её кнопкой не передать, поэтому после «🖼 загрузить»
-#   пришли фото любым сообщением (например в «Избранное»).
+#   пришли фото сообщением в тот же чат, где открыто меню (фото из других чатов
+#   модуль не подхватывает).
 
 import base64
 import io
@@ -63,6 +65,13 @@ MAX_PHOTO = 2 * 1024 * 1024
 PER_PAGE = 30
 MENU_PER_PAGE = 8
 BTN_TEXT = 60  # телега режет подпись кнопки на 64 символах — оставляем запас
+# answerCallbackQuery принимает только 200 символов — длинный текст исключения
+# превратил бы подсказку в новое падение
+ALERT_MAX = 195
+# инлайн-форма не умеет разбивать текст, как utils.answer: длинные триггеры и
+# замены показываем обрезанными, иначе форма просто не отрисуется
+CARD_TEXT = 400
+UNDO_PREVIEW = 500
 MODE_NAMES = {"sub": "подстрока", "word": "целое слово", "regex": "regex"}
 MODE_CYCLE = ("sub", "word", "regex")
 CANCEL_WORDS = ("отмена", "cancel", "стоп", "stop", "хватит")
@@ -134,10 +143,11 @@ class TriggerChangerMod(loader.Module):
         self.client = client
         self.db = db
         self._pending = {}  # uid -> состояние визарда
-        self._edited = {}  # msg_id -> ts, страховка от повторной обработки
+        self._edited = {}  # (chat_id, msg_id) -> ts, страховка от повторной обработки
         self._undo = {}  # key -> {"msg", "orig", "ts} для отката автоправок
-        self._photo_wait = {}  # uid юзера -> (uid правила, ts): ждём картинку
+        self._photo_wait = {}  # uid юзера -> (uid правила, ts, chat_id): ждём картинку
         self._menu_forms = {}  # uid -> открытое меню, чтобы обновить его из watcher
+        self._menu_chat = {}  # uid -> чат, где открыто меню: там же ждём картинку
         # настройки жили в ключах БД — переносим в config, чтобы правда была одна
         for key in ("enabled", "clean_links"):
             old = self._get(key)
@@ -158,6 +168,7 @@ class TriggerChangerMod(loader.Module):
         # списка переписывала весь json с балластом — разносим по ключам
         if self._migrate_photos(entries):
             self._store_entries(entries)
+        self._gc_photos(entries)
 
     # ---------- БД ----------
 
@@ -236,6 +247,33 @@ class TriggerChangerMod(loader.Module):
             moved = True
         return moved
 
+    def _photo_keys(self):
+        try:
+            namespace = self.db.setdefault(MODNAME, {})
+            return [
+                k for k in namespace
+                if isinstance(k, str) and k.startswith("photo:")
+            ]
+        except Exception as exc:
+            logger.error("[TriggerChanger] photo keys scan: %r", exc)
+            return []
+
+    def _gc_photos(self, entries):
+        """Убрать photo:*-ключи, на которые не ссылается ни одно правило.
+
+        Каждый такой ключ — до ~2.7 МБ base64 в json, который Heroku переписывает
+        целиком на любую правку: осиротевшие картинки стоят дороже, чем выглядят.
+        """
+        alive = {f"photo:{e.get('pid')}" for e in entries if e.get("pid")}
+        for key in self._photo_keys():
+            if key not in alive:
+                self._set(key, None)
+                logger.info("[TriggerChanger] удалён осиротевший ключ %s", key)
+
+    def _drop_all_photos(self):
+        for key in self._photo_keys():
+            self._set(key, None)
+
     # ---------- замена ----------
 
     def _compile(self, entry):
@@ -260,13 +298,25 @@ class TriggerChangerMod(loader.Module):
             pattern = core
         try:
             return re.compile(pattern, flags)
-        except (re.error, ValueError):
+        except (re.error, ValueError, RecursionError):
             # например паттерн уже содержит inline-флаги (?i) — тогда
             # переданные в compile() флаги запрещены, пробуем без них
             try:
                 return re.compile(pattern)
-            except (re.error, ValueError):
+            except (re.error, ValueError, RecursionError):
                 return None
+
+    def _regex_error(self, trigger):
+        """Проверить регулярку до записи в БД, вернуть текст ошибки или None.
+
+        Ловим и RecursionError: глубоко вложенные скобки роняют компилятор,
+        а не возвращают re.error.
+        """
+        try:
+            re.compile(trigger)
+        except (re.error, ValueError, RecursionError) as exc:
+            return str(exc) or type(exc).__name__
+        return None
 
     def _clean_links(self, text):
         """Вырезать трекер-параметры (si=, utm_* и т.п.) из URL в тексте.
@@ -404,9 +454,12 @@ class TriggerChangerMod(loader.Module):
             logger.info("[TriggerChanger] msg %s поправлено, но чат логов не задан", message.id)
             return
         entry = self._undo.get(key) or {}
+        orig = entry.get("orig", "")
+        if len(orig) > UNDO_PREVIEW:
+            orig = orig[:UNDO_PREVIEW] + "…"
         header = (
             "🔁 <b>TriggerChanger</b> поправил твоё сообщение\n"
-            f"<code>{utils.escape_html(entry.get('orig', ''))}</code>\n"
+            f"<code>{utils.escape_html(orig)}</code>\n"
             f"💬 <i>{utils.escape_html(self._chat_name(message))}</i>"
         )
         try:
@@ -431,10 +484,11 @@ class TriggerChangerMod(loader.Module):
             await call.delete()
             return
         try:
-            await entry["msg"].edit(entry["orig"])
+            # текст сообщения не парсим как HTML: в нём может быть «<3» или «&»
+            await entry["msg"].edit(entry["orig"], parse_mode=lambda t: (t, ()))
         except Exception as exc:
             logger.warning("[TriggerChanger] revert failed (%s): %r", key, exc)
-            await call.answer(f"не откатилось: {exc}", alert=True)
+            await call.answer(f"не откатилось: {exc}"[:ALERT_MAX], alert=True)
             await call.delete()
             return
         await call.answer("откатил")
@@ -465,8 +519,12 @@ class TriggerChangerMod(loader.Module):
                 if prefix and text.startswith(prefix):
                     return
 
-            # активный визард перехватывает ответы пользователя
+            # активный визард перехватывает ответы пользователя — но только в
+            # том чате, где его запустили: иначе забытый .repadd превратит
+            # сообщение собеседнику в подсказку бота
             state = self._pending.get(uid)
+            if state and state.get("chat_id") not in (None, message.chat_id):
+                state = None
             if state:
                 if time.time() - state.get("ts", 0) > WIZARD_TTL:
                     self._pending.pop(uid, None)
@@ -478,60 +536,77 @@ class TriggerChangerMod(loader.Module):
             # меню ждёт картинку для правила: глотаем только фото и «отмена»,
             # остальные сообщения живут своей жизнью. Просроченное ожидание
             # снимаем — иначе случайное фото через час прилипнет к правилу.
+            # Ждём только в том чате, где открыто меню: личное фото, отправленное
+            # собеседнику, не должно становиться картинкой правила.
             wait = self._photo_wait.get(uid)
             if wait:
                 if time.time() - wait[1] > PHOTO_WAIT_TTL:
                     self._photo_wait.pop(uid, None)
-                elif message.photo:
-                    await self._attach_photo(message, wait[0])
-                    return
-                elif text.strip().lower() in CANCEL_WORDS:
-                    self._photo_wait.pop(uid, None)
-                    await utils.answer(message, "❌ Загрузка картинки отменена.")
-                    return
+                elif message.chat_id == wait[2]:
+                    if message.photo:
+                        await self._attach_photo(message, wait[0])
+                        return
+                    if text.strip().lower() in CANCEL_WORDS:
+                        self._photo_wait.pop(uid, None)
+                        await utils.answer(message, "❌ Загрузка картинки отменена.")
+                        return
 
             if not self.config["enabled"] or not text:
                 return
             if message.fwd_from or message.via_bot_id:
                 return
-            ts = self._edited.get(message.id)
+            # id сообщений в супергруппах свои для каждого чата — ключом берём
+            # пару (чат, сообщение), иначе правка в одном чате заблокирует
+            # сообщение с тем же номером в другом
+            key = (message.chat_id, message.id)
+            ts = self._edited.get(key)
             if ts is not None and time.time() - ts < REEDIT_GUARD:
                 return
 
             new_text, matched = self._apply(text)
+            photo_entries = [e for e in matched if e.get("pid")]
 
             if new_text != text and 0 < len(new_text) <= 4096:
                 try:
-                    await message.edit(new_text)
+                    # parse_mode-колбэк отключает разбор HTML: в замене может
+                    # быть «<3» или «&», а клиент по умолчанию парсит текст
+                    await message.edit(new_text, parse_mode=lambda t: (t, ()))
                 except Exception as exc:
                     logger.warning("[TriggerChanger] edit failed (msg %s): %r", message.id, exc)
                     return
-                self._edited[message.id] = time.time()
-                if len(self._edited) > MAX_EDITED:
-                    cutoff = time.time() - EDITED_TTL
-                    self._edited = {
-                        k: v for k, v in self._edited.items() if v > cutoff
-                    }
-                    # в активном чате записи не успевают состариться — режем по
-                    # количеству, иначе словарь растёт без предела
-                    if len(self._edited) > MAX_EDITED:
-                        fresh = sorted(self._edited, key=self._edited.get)[-MAX_EDITED:]
-                        self._edited = {k: self._edited[k] for k in fresh}
-                if self.config["undo"]:
+                self._mark_edited(key)
+                # без чата логов форма отката всё равно не уйдёт — нечего
+                # держать в памяти объект сообщения
+                if self.config["undo"] and self._logchat() is not None:
                     await self._notify_undo(
                         message, self._remember_undo(message, text)
                     )
 
-            photo_entries = [e for e in matched if e.get("pid")]
             if photo_entries:
                 try:
                     b64 = self._photo_b64(photo_entries[0])
                     if b64:
-                        await message.respond(file=io.BytesIO(base64.b64decode(b64)))
+                        bio = io.BytesIO(base64.b64decode(b64))
+                        # без имени Telethon шлёт поток безымянным документом
+                        bio.name = "photo.jpg"
+                        await message.reply(file=bio)
+                        self._mark_edited(key)
                 except Exception as exc:
                     logger.warning("[TriggerChanger] photo send failed: %r", exc)
         except Exception as exc:
             logger.exception("[TriggerChanger] watcher error: %r", exc)
+
+    def _mark_edited(self, key):
+        self._edited[key] = time.time()
+        if len(self._edited) <= MAX_EDITED:
+            return
+        cutoff = time.time() - EDITED_TTL
+        self._edited = {k: v for k, v in self._edited.items() if v > cutoff}
+        # в активном чате записи не успевают состариться — режем по количеству,
+        # иначе словарь растёт без предела
+        if len(self._edited) > MAX_EDITED:
+            fresh = sorted(self._edited, key=self._edited.get)[-MAX_EDITED:]
+            self._edited = {k: self._edited[k] for k in fresh}
 
     # ---------- визард ----------
 
@@ -591,11 +666,12 @@ class TriggerChangerMod(loader.Module):
         elif entry["repl"] == "":
             repl_str = "<i>(пусто — вырезать)</i>"
         else:
-            repl_str = f"<code>{utils.escape_html(entry['repl'])}</code>"
+            repl_str = f"<code>{utils.escape_html(self._preview(entry['repl'], 100))}</code>"
         await utils.answer(
             message,
             f"✅ Добавлено <code>#{entry['id']}</code>{flag_str}\n"
-            f"<code>{utils.escape_html(entry['trigger'])}</code> ➜ {repl_str}{photo_str}{warn}",
+            f"<code>{utils.escape_html(self._preview(entry['trigger'], 100))}</code>"
+            f" ➜ {repl_str}{photo_str}{warn}",
         )
 
     async def _wizard_step(self, message, text):
@@ -628,6 +704,15 @@ class TriggerChangerMod(loader.Module):
                     f"Сначала удали: <code>.repdel {dup['id']}</code>",
                 )
                 return
+            if state["mode"] == "regex":
+                err = self._regex_error(trigger)
+                if err:
+                    self._pending.pop(uid, None)
+                    await utils.answer(
+                        message,
+                        f"❌ Невалидный regex: <code>{utils.escape_html(err)}</code>",
+                    )
+                    return
             state["trigger"] = trigger
             state["step"] = "repl"
             await utils.answer(
@@ -702,18 +787,22 @@ class TriggerChangerMod(loader.Module):
         text = str(text or "").replace("\n", " ").strip()
         return text if len(text) <= BTN_TEXT else text[: BTN_TEXT - 1] + "…"
 
+    def _preview(self, text, limit=CARD_TEXT):
+        text = str(text or "")
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
     def _repl_html(self, entry):
         repl = entry.get("repl")
         if repl is None:
             return "<i>(без текста — только картинка)</i>"
         if repl == "":
             return "<i>(пусто — вырезать)</i>"
-        return f"<code>{utils.escape_html(repl)}</code>"
+        return f"<code>{utils.escape_html(self._preview(repl))}</code>"
 
     def _suspect(self, entry):
         """Триггер похож на регулярку, но режим не regex — забытый -r."""
         return entry.get("mode") != "regex" and any(
-            ch in entry.get("trigger", "") for ch in REGEX_CHARS
+            ch in (entry.get("trigger") or "") for ch in REGEX_CHARS
         )
 
     def _flags_html(self, entry):
@@ -744,7 +833,8 @@ class TriggerChangerMod(loader.Module):
         text += "\n" + self._menu_status()
         if entries:
             text += "\n\n" + "\n".join(
-                f"<code>#{e['id']}</code> {utils.escape_html(e.get('trigger', ''))}"
+                f"<code>#{e['id']}</code> "
+                f"{utils.escape_html(self._preview(e.get('trigger', ''), 80))}"
                 for e in chunk
             )
         else:
@@ -803,7 +893,7 @@ class TriggerChangerMod(loader.Module):
     def _menu_card(self, entry, confirm=False):
         text = (
             f"<b>Правило <code>#{entry['id']}</code></b>\n"
-            f"🔎 <code>{utils.escape_html(entry.get('trigger', ''))}</code>\n"
+            f"🔎 <code>{utils.escape_html(self._preview(entry.get('trigger', '')))}</code>\n"
             f"➜ {self._repl_html(entry)}\n"
             f"🖼 картинка: {'есть' if entry.get('pid') else 'нет'}\n\n"
             f"{self._flags_html(entry)}"
@@ -880,7 +970,7 @@ class TriggerChangerMod(loader.Module):
 
     async def _menu_answer(self, call, text, alert=False):
         try:
-            await call.answer(text, alert=alert)
+            await call.answer(str(text)[:ALERT_MAX], alert=alert)
         except Exception as exc:
             logger.warning("[TriggerChanger] menu answer failed: %r", exc)
 
@@ -911,6 +1001,10 @@ class TriggerChangerMod(loader.Module):
         await self._menu_page(call, page)
 
     async def _menu_close(self, call):
+        # закрыл меню — значит и картинку для правила уже не ждём,
+        # иначе следующее фото юзера прилипнет к правилу
+        self._photo_wait.pop(call.sender_id, None)
+        self._menu_forms.pop(call.sender_id, None)
         try:
             await call.delete()
         except Exception as exc:
@@ -925,10 +1019,9 @@ class TriggerChangerMod(loader.Module):
         index = MODE_CYCLE.index(mode) + 1 if mode in MODE_CYCLE else 0
         new = MODE_CYCLE[index % len(MODE_CYCLE)]
         if new == "regex":
-            try:
-                re.compile(entry.get("trigger", ""))
-            except re.error as exc:
-                await self._menu_answer(call, f"невалидный regex: {exc}", True)
+            err = self._regex_error(entry.get("trigger") or "")
+            if err:
+                await self._menu_answer(call, f"невалидный regex: {err}", True)
                 return
         entry["mode"] = new
         self._store_entries(entries)
@@ -1016,7 +1109,11 @@ class TriggerChangerMod(loader.Module):
         self._drop_photo(entry)
         entries.remove(entry)
         self._store_entries(entries)
-        self._photo_wait = {k: v for k, v in self._photo_wait.items() if v != uid}
+        # в _photo_wait лежит кортеж (uid правила, ts, chat_id) — сравниваем
+        # с первым элементом, иначе ожидание картинки переживёт правило
+        self._photo_wait = {
+            k: v for k, v in self._photo_wait.items() if v[0] != uid
+        }
         await self._menu_answer(call, "удалил")
         await self._menu_page(call, 1)
 
@@ -1033,12 +1130,17 @@ class TriggerChangerMod(loader.Module):
             text, markup = self._menu_card(entry)
             await self._menu_render(call, text, markup)
             return
-        # кнопку с файлом телега не умеет: ждём фото от пользователя в watcher
-        self._photo_wait[call.sender_id] = (uid, time.time())
+        # кнопку с файлом телега не умеет: ждём фото от пользователя в watcher,
+        # но только в том чате, где открыто меню
+        chat = self._menu_chat.get(call.sender_id)
+        if chat is None:
+            await self._menu_answer(
+                call, "меню устарело — открой .repmenu заново", True
+            )
+            return
+        self._photo_wait[call.sender_id] = (uid, time.time(), chat)
         await self._menu_answer(
-            call,
-            "пришли картинку любым сообщением (например в «Избранное») — подхвачу",
-            True,
+            call, "пришли картинку сообщением в этот же чат — подхвачу", True
         )
 
     async def _attach_photo(self, message, uid):
@@ -1108,6 +1210,7 @@ class TriggerChangerMod(loader.Module):
     )
     async def repmenu(self, message):
         """Inline menu: browse and edit rules with buttons"""
+        uid = message.sender_id
         text, markup, _ = self._menu_list(1)
         try:
             form = await self.inline.form(
@@ -1116,6 +1219,7 @@ class TriggerChangerMod(loader.Module):
                 reply_markup=markup,
                 ttl=FORM_TTL,
                 force_me=True,
+                on_unload=lambda *_: self._menu_forms.pop(uid, None),
             )
         except Exception as exc:
             logger.warning("[TriggerChanger] menu form failed: %r", exc)
@@ -1127,8 +1231,10 @@ class TriggerChangerMod(loader.Module):
                 "Смотри <code>.replist</code>, добавляй через <code>.repadd</code>.",
             )
             return
-        # форма понадобится watcher'у, чтобы обновить карточку после загрузки фото
-        self._menu_forms[message.sender_id] = form
+        # форма понадобится watcher'у, чтобы обновить карточку после загрузки фото;
+        # чат запоминаем, чтобы картинку правила ждать именно здесь
+        self._menu_forms[uid] = form
+        self._menu_chat[uid] = message.chat_id
 
     @loader.command(
         ru_doc="Вкл/выкл чистку ссылок от трекеров: .repclean [on|off]; без аргументов — переключить",
@@ -1195,16 +1301,15 @@ class TriggerChangerMod(loader.Module):
 
         state = {"step": "trigger", "mode": mode, "case": case, "neg": neg,
                  "end": end, "trigger": "", "repl": None, "photo": None,
-                 "ts": time.time()}
+                 "chat_id": message.chat_id, "ts": time.time()}
 
         if trigger:
             if mode == "regex":
-                try:
-                    re.compile(trigger)
-                except re.error as exc:
+                err = self._regex_error(trigger)
+                if err:
                     await utils.answer(
                         message,
-                        f"❌ Невалидный regex: <code>{utils.escape_html(str(exc))}</code>",
+                        f"❌ Невалидный regex: <code>{utils.escape_html(err)}</code>",
                     )
                     return
             dup = self._find_dup(trigger, mode, case)
@@ -1225,7 +1330,8 @@ class TriggerChangerMod(loader.Module):
                 message,
                 note
                 + "✏️ Напиши <b>триггер</b> ответом на это сообщение "
-                "(что искать в твоих сообщениях). «Отмена» — выйти.",
+                "(что искать в твоих сообщениях). «Отмена» — выйти.\n"
+                "💬 Отвечай в этом же чате — в других сообщения визард не ловит.",
             )
         else:
             await utils.answer(
@@ -1278,7 +1384,8 @@ class TriggerChangerMod(loader.Module):
                 flags += "E"
             flag_str = f" <code>[{flags}]</code>" if flags else ""
             photo = " 🖼" if entry.get("pid") else ""
-            trig = utils.escape_html(entry.get("trigger", ""))
+            # список должен читаться, а не скроллиться: длинные триггеры режем
+            trig = utils.escape_html(self._preview(entry.get("trigger", ""), 100))
             suspect = self._suspect(entry)
             warn = " ⚠️ <i>похоже на regex без -r</i>" if suspect else ""
             raw_repl = entry.get("repl")
@@ -1287,7 +1394,7 @@ class TriggerChangerMod(loader.Module):
             elif raw_repl == "":
                 repl = "<i>(пусто)</i>"
             else:
-                repl = utils.escape_html(raw_repl)
+                repl = utils.escape_html(self._preview(raw_repl, 100))
             lines.append(
                 f"<code>#{entry['id']}</code>{flag_str}{photo} {trig} ➜ {repl}{warn}"
             )
@@ -1373,9 +1480,10 @@ class TriggerChangerMod(loader.Module):
             )
             return
         count = len(entries)
-        for entry in entries:
-            self._drop_photo(entry)
         self._store_entries([])
+        # чистим все photo:*-ключи, а не только упомянутые в entries: если список
+        # когда-то сбрасывался, осиротевшие картинки остались бы в json навсегда
+        self._drop_all_photos()
         self._set("photo_seq", 0)
         self._set("uid_seq", 0)
         self._set("logchat", None)
@@ -1387,6 +1495,7 @@ class TriggerChangerMod(loader.Module):
         self._undo = {}
         self._photo_wait = {}
         self._menu_forms = {}
+        self._menu_chat = {}
         await utils.answer(
             message,
             f"♻️ Сброс: удалено правил <code>{count}</code>. Настройки по умолчанию "
