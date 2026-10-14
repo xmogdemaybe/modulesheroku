@@ -39,6 +39,8 @@
 #      -> если картинка есть, она отправляется ответом на сработавшее сообщение
 # "отмена" на любом шаге — отмена. Отвечать нужно в том же чате, где вызван
 # .repadd: в других чатах визард твои сообщения не перехватывает.
+# Если вырезание («-») съело весь текст сообщения — сообщение удалится, а откат
+# в чате логов вернёт текст новым сообщением.
 #
 # Меню .repmenu (то же самое, но кнопками и переживает рестарт dyno):
 #   список правил -> карточка правила: режим, регистр, «не после не», «только
@@ -441,9 +443,14 @@ class TriggerChangerMod(loader.Module):
             for key in oldest[: len(self._undo) - MAX_UNDO]:
                 self._undo.pop(key, None)
 
-    def _remember_undo(self, message, orig):
+    def _remember_undo(self, message, orig, deleted=False):
         key = f"{message.chat_id}:{message.id}"
-        self._undo[key] = {"msg": message, "orig": orig, "ts": time.time()}
+        self._undo[key] = {
+            "msg": message,
+            "orig": orig,
+            "ts": time.time(),
+            "deleted": deleted,
+        }
         self._prune_undo()
         return key
 
@@ -457,8 +464,9 @@ class TriggerChangerMod(loader.Module):
         orig = entry.get("orig", "")
         if len(orig) > UNDO_PREVIEW:
             orig = orig[:UNDO_PREVIEW] + "…"
+        verb = "удалил" if entry.get("deleted") else "поправил"
         header = (
-            "🔁 <b>TriggerChanger</b> поправил твоё сообщение\n"
+            f"🔁 <b>TriggerChanger</b> {verb} твоё сообщение\n"
             f"<code>{utils.escape_html(orig)}</code>\n"
             f"💬 <i>{utils.escape_html(self._chat_name(message))}</i>"
         )
@@ -485,7 +493,11 @@ class TriggerChangerMod(loader.Module):
             return
         try:
             # текст сообщения не парсим как HTML: в нём может быть «<3» или «&»
-            await entry["msg"].edit(entry["orig"], parse_mode=lambda t: (t, ()))
+            if entry.get("deleted"):
+                # удалённое сообщение не отредактировать — шлём текст заново
+                await entry["msg"].respond(entry["orig"], parse_mode=lambda t: (t, ()))
+            else:
+                await entry["msg"].edit(entry["orig"], parse_mode=lambda t: (t, ()))
         except Exception as exc:
             logger.warning("[TriggerChanger] revert failed (%s): %r", key, exc)
             await call.answer(f"не откатилось: {exc}"[:ALERT_MAX], alert=True)
@@ -509,7 +521,10 @@ class TriggerChangerMod(loader.Module):
             uid = message.sender_id
             if uid is None:
                 return
-            text = message.text or ""
+            # message.text приходит с HTML-разметкой (<a href=…> вместо ссылки),
+            # а правим мы текст как есть — берём чистый raw_text
+            raw = getattr(message, "raw_text", None)
+            text = raw if isinstance(raw, str) else (message.text or "")
             if not isinstance(text, str):
                 return
 
@@ -566,21 +581,33 @@ class TriggerChangerMod(loader.Module):
             new_text, matched = self._apply(text)
             photo_entries = [e for e in matched if e.get("pid")]
 
-            if new_text != text and 0 < len(new_text) <= 4096:
-                try:
-                    # parse_mode-колбэк отключает разбор HTML: в замене может
-                    # быть «<3» или «&», а клиент по умолчанию парсит текст
-                    await message.edit(new_text, parse_mode=lambda t: (t, ()))
-                except Exception as exc:
-                    logger.warning("[TriggerChanger] edit failed (msg %s): %r", message.id, exc)
-                    return
-                self._mark_edited(key)
-                # без чата логов форма отката всё равно не уйдёт — нечего
-                # держать в памяти объект сообщения
-                if self.config["undo"] and self._logchat() is not None:
-                    await self._notify_undo(
-                        message, self._remember_undo(message, text)
-                    )
+            if new_text != text:
+                applied = False
+                if not new_text.strip() and message.media is None and not photo_entries:
+                    # правило вырезало весь текст — пустое сообщение не оставляем
+                    applied = True
+                    try:
+                        await message.delete()
+                    except Exception as exc:
+                        logger.warning("[TriggerChanger] delete failed (msg %s): %r", message.id, exc)
+                        return
+                elif 0 < len(new_text) <= 4096:
+                    applied = True
+                    try:
+                        # parse_mode-колбэк отключает разбор HTML: в замене может
+                        # быть «<3» или «&», а клиент по умолчанию парсит текст
+                        await message.edit(new_text, parse_mode=lambda t: (t, ()))
+                    except Exception as exc:
+                        logger.warning("[TriggerChanger] edit failed (msg %s): %r", message.id, exc)
+                        return
+                if applied:
+                    self._mark_edited(key)
+                    # без чата логов форма отката всё равно не уйдёт — нечего
+                    # держать в памяти объект сообщения
+                    if self.config["undo"] and self._logchat() is not None:
+                        await self._notify_undo(
+                            message, self._remember_undo(message, text, not new_text.strip())
+                        )
 
             if photo_entries:
                 try:
