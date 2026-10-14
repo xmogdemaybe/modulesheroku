@@ -7,6 +7,7 @@
 # "photo:<pid>", чтобы правка одного правила не переписывала весь json.
 #
 # Команды:
+#   .repmenu                       меню правил кнопками (основной вход)
 #   .repadd <триггер> [-r|-w|-c|-n|-e]   добавить замену (визард: замена -> картинка?)
 #   .replist [страница]            список правил
 #   .repdel <id|all>               удалить правило / всё
@@ -37,6 +38,13 @@
 #   3) бот спросит про картинку: ответь "да" и пришли картинку, или "нет"
 #      -> если картинка есть, она отправляется ответом на сработавшее сообщение
 # "отмена" на любом шаге — отмена.
+#
+# Меню .repmenu (то же самое, но кнопками и переживает рестарт dyno):
+#   список правил -> карточка правила: режим, регистр, «не после не», «только
+#   в конце», текст замены, картинка, удаление. Текст вводится инпут-кнопкой
+#   (телега сама подставит @бот в поле ввода), а не перехватом ответов в чате.
+#   Картинка — исключение: её кнопкой не передать, поэтому после «🖼 загрузить»
+#   пришли фото любым сообщением (например в «Избранное»).
 
 import base64
 import io
@@ -51,6 +59,10 @@ logger = logging.getLogger(__name__)
 MODNAME = "TriggerChanger"
 MAX_PHOTO = 5 * 1024 * 1024
 PER_PAGE = 30
+MENU_PER_PAGE = 8
+BTN_TEXT = 60  # телега режет подпись кнопки на 64 символах — оставляем запас
+MODE_NAMES = {"sub": "подстрока", "word": "целое слово", "regex": "regex"}
+MODE_CYCLE = ("sub", "word", "regex")
 CANCEL_WORDS = ("отмена", "cancel", "стоп", "stop", "хватит")
 YES_WORDS = ("да", "yes", "+", "угу", "ага")
 NO_WORDS = ("нет", "no", "-", "неа")
@@ -117,6 +129,8 @@ class TriggerChangerMod(loader.Module):
         self._pending = {}  # uid -> состояние визарда
         self._edited = {}  # msg_id -> ts, страховка от повторной обработки
         self._undo = {}  # key -> {"msg", "orig", "ts} для отката автоправок
+        self._photo_wait = {}  # uid -> uid правила, которое ждёт картинку
+        self._menu_forms = {}  # uid -> открытое меню, чтобы обновить его из watcher
         # настройки жили в ключах БД — переносим в config, чтобы правда была одна
         for key in ("enabled", "clean_links"):
             old = self._get(key)
@@ -128,8 +142,10 @@ class TriggerChangerMod(loader.Module):
             entries = []
             self._set("entries", entries)
         # после старых удалений id могли остаться «с дырками» (напр. 3, 4, 5) —
-        # пересобираем нумерацию подряд: 1..N
-        if [e.get("id") for e in entries] != list(range(1, len(entries) + 1)):
+        # пересобираем нумерацию подряд: 1..N; заодно выдаём недостающие uid
+        if [e.get("id") for e in entries] != list(range(1, len(entries) + 1)) or any(
+            not e.get("uid") for e in entries
+        ):
             self._store_entries(entries)
         # в старых версиях base64 картинки лежал прямо в правиле: любая правка
         # списка переписывала весь json с балластом — разносим по ключам
@@ -153,9 +169,19 @@ class TriggerChangerMod(loader.Module):
             logger.error("[TriggerChanger] db write %s: %r", key, exc)
 
     def _store_entries(self, entries):
-        """Сохранить правила, пересобрав нумерацию подряд: 1..N (без дырок)."""
+        """Сохранить правила, пересобрав нумерацию подряд: 1..N (без дырок).
+
+        Заодно выдаём каждому правилу постоянный uid: id после удалений
+        съезжают, а кнопка меню должна вести на то же правило, которое на ней
+        рисовали.
+        """
+        seq = int(self._get("uid_seq", 0) or 0)
         for index, entry in enumerate(entries, 1):
             entry["id"] = index
+            if not entry.get("uid"):
+                seq += 1
+                entry["uid"] = f"u{seq}"
+        self._set("uid_seq", seq)
         self._set("entries", entries)
 
     # ---------- картинки правил (отдельные ключи БД) ----------
@@ -349,7 +375,7 @@ class TriggerChangerMod(loader.Module):
 
     def _remember_undo(self, message, orig):
         self._prune_undo()
-        key = f"{getattr(message, 'chat_id', 0)}:{message.id}"
+        key = f"{message.chat_id}:{message.id}"
         self._undo[key] = {"msg": message, "orig": orig, "ts": time.time()}
         return key
 
@@ -406,12 +432,12 @@ class TriggerChangerMod(loader.Module):
     @loader.watcher()
     async def watcher(self, message):
         try:
-            if not getattr(message, "out", False):
+            if not message.out:
                 return
-            uid = getattr(message, "sender_id", None)
+            uid = message.sender_id
             if uid is None:
                 return
-            text = getattr(message, "text", None) or ""
+            text = message.text or ""
             if not isinstance(text, str):
                 return
 
@@ -420,9 +446,21 @@ class TriggerChangerMod(loader.Module):
                 await self._wizard_step(message, text)
                 return
 
+            # меню ждёт картинку для правила: глотаем только фото и «отмена»,
+            # остальные сообщения живут своей жизнью
+            wait = self._photo_wait.get(uid)
+            if wait:
+                if message.photo:
+                    await self._attach_photo(message, wait)
+                    return
+                if text.strip().lower() in CANCEL_WORDS:
+                    self._photo_wait.pop(uid, None)
+                    await utils.answer(message, "❌ Загрузка картинки отменена.")
+                    return
+
             if not self.config["enabled"] or not text:
                 return
-            if getattr(message, "fwd_from", None) or getattr(message, "via_bot_id", None):
+            if message.fwd_from or message.via_bot_id:
                 return
             for prefix in self.get_prefixes():
                 if prefix and text.startswith(prefix):
@@ -508,9 +546,7 @@ class TriggerChangerMod(loader.Module):
         photo_str = "\n🖼 Картинка: прикреплена" if entry.get("pid") else ""
         # буквальный «[?&]si=...» никогда не совпадёт со ссылкой — напоминаем про -r
         warn = ""
-        if entry["mode"] != "regex" and any(
-            ch in entry["trigger"] for ch in REGEX_CHARS
-        ):
+        if self._suspect(entry):
             warn = (
                 "\n⚠️ Триггер похож на регулярку, но флаг <code>-r</code> не указан — "
                 "совпадение ищется как обычный текст. Если нужна регулярка: "
@@ -617,6 +653,385 @@ class TriggerChangerMod(loader.Module):
             )
             return
 
+    # ---------- инлайн-меню ----------
+
+    def _menu_entry(self, uid):
+        """Вернуть (список правил, правило) или (None, None), если его уже нет."""
+        entries = self._get("entries", []) or []
+        for entry in entries:
+            if entry.get("uid") == uid:
+                return entries, entry
+        return None, None
+
+    def _short(self, text):
+        text = str(text or "").replace("\n", " ").strip()
+        return text if len(text) <= BTN_TEXT else text[: BTN_TEXT - 1] + "…"
+
+    def _repl_html(self, entry):
+        repl = entry.get("repl")
+        if repl is None:
+            return "<i>(без текста — только картинка)</i>"
+        if repl == "":
+            return "<i>(пусто — вырезать)</i>"
+        return f"<code>{utils.escape_html(repl)}</code>"
+
+    def _suspect(self, entry):
+        """Триггер похож на регулярку, но режим не regex — забытый -r."""
+        return entry.get("mode") != "regex" and any(
+            ch in entry.get("trigger", "") for ch in REGEX_CHARS
+        )
+
+    def _flags_html(self, entry):
+        lines = [
+            f"⚙️ режим: {MODE_NAMES.get(entry.get('mode', 'sub'), 'подстрока')}",
+            f"🔠 регистр: {'да' if entry.get('case') else 'нет'}",
+        ]
+        if entry.get("mode") != "regex":
+            lines.append(f"🚫 не после «не»: {'да' if entry.get('neg') else 'нет'}")
+            lines.append(f"📍 только в конце: {'да' if entry.get('end') else 'нет'}")
+        return "\n".join(lines)
+
+    def _menu_status(self):
+        return (
+            f"🔁 автозамена {'🟢' if self.config['enabled'] else '🔴'}   "
+            f"🔗 чистка ссылок {'🟢' if self.config['clean_links'] else '🔴'}   "
+            f"↩️ откат {'🟢' if self.config['undo'] else '🔴'}"
+        )
+
+    def _menu_list(self, page=1):
+        entries = self._get("entries", []) or []
+        pages = max(1, (len(entries) + MENU_PER_PAGE - 1) // MENU_PER_PAGE)
+        page = min(max(1, int(page)), pages)
+        chunk = entries[(page - 1) * MENU_PER_PAGE : page * MENU_PER_PAGE]
+        text = "📋 <b>Правила автозамены</b>"
+        if pages > 1:
+            text += f" (стр. {page}/{pages})"
+        text += "\n" + self._menu_status()
+        if entries:
+            text += "\n\n" + "\n".join(
+                f"<code>#{e['id']}</code> {utils.escape_html(e.get('trigger', ''))}"
+                for e in chunk
+            )
+        else:
+            text += "\n\nПравил нет — добавь первое кнопкой «➕ правило»."
+
+        markup = []
+        for entry in chunk:
+            repl = entry.get("repl")
+            if entry.get("pid"):
+                tail = "🖼"
+            elif repl is None:
+                tail = "∅"
+            else:
+                tail = repl or "—"
+            markup.append([
+                {
+                    "text": self._short(f"#{entry['id']} {entry.get('trigger', '')} ➜ {tail}"),
+                    "callback": self._menu_open,
+                    "args": (entry["uid"],),
+                }
+            ])
+        if pages > 1:
+            nav = []
+            if page > 1:
+                nav.append({"text": "⬅️", "callback": self._menu_page, "args": (page - 1,)})
+            if page < pages:
+                nav.append({"text": "➡️", "callback": self._menu_page, "args": (page + 1,)})
+            markup.append(nav)
+        markup.append([
+            {
+                "text": "➕ правило",
+                "input": "триггер: что искать в твоих сообщениях",
+                "handler": self._menu_new,
+            },
+            {
+                "text": f"🔁 {'выкл' if self.config['enabled'] else 'вкл'}",
+                "callback": self._menu_toggle,
+                "args": ("enabled", page),
+            },
+        ])
+        markup.append([
+            {
+                "text": f"🔗 {'выкл' if self.config['clean_links'] else 'вкл'}",
+                "callback": self._menu_toggle,
+                "args": ("clean_links", page),
+            },
+            {
+                "text": f"↩️ {'выкл' if self.config['undo'] else 'вкл'}",
+                "callback": self._menu_toggle,
+                "args": ("undo", page),
+            },
+            {"text": "❌", "callback": self._menu_close},
+        ])
+        return text, markup, page
+
+    def _menu_card(self, entry, confirm=False):
+        text = (
+            f"<b>Правило <code>#{entry['id']}</code></b>\n"
+            f"🔎 <code>{utils.escape_html(entry.get('trigger', ''))}</code>\n"
+            f"➜ {self._repl_html(entry)}\n"
+            f"🖼 картинка: {'есть' if entry.get('pid') else 'нет'}\n\n"
+            f"{self._flags_html(entry)}"
+        )
+        if self._suspect(entry):
+            text += (
+                "\n\n⚠️ <i>Триггер похож на регулярку, но режим не regex — "
+                "совпадение ищется как обычный текст.</i>"
+            )
+        uid = entry["uid"]
+        mode = entry.get("mode", "sub")
+        flag_row = [
+            {
+                "text": f"🔠 регистр: {'да' if entry.get('case') else 'нет'}",
+                "callback": self._menu_flag,
+                "args": (uid, "case"),
+            }
+        ]
+        if mode != "regex":
+            flag_row.append({
+                "text": f"🚫 после «не»: {'да' if entry.get('neg') else 'нет'}",
+                "callback": self._menu_flag,
+                "args": (uid, "neg"),
+            })
+            flag_row.append({
+                "text": f"📍 в конце: {'да' if entry.get('end') else 'нет'}",
+                "callback": self._menu_flag,
+                "args": (uid, "end"),
+            })
+        markup = [
+            [
+                {
+                    "text": f"⚙️ режим: {MODE_NAMES.get(mode, 'подстрока')}",
+                    "callback": self._menu_mode,
+                    "args": (uid,),
+                }
+            ],
+            flag_row,
+            [
+                {
+                    "text": "✏️ текст замены",
+                    "input": "на что менять («-» = вырезать)",
+                    "handler": self._menu_repl,
+                    "args": (uid,),
+                },
+                {"text": "🈳 без текста", "callback": self._menu_notext, "args": (uid,)},
+            ],
+            [
+                {
+                    "text": "🖼 убрать картинку" if entry.get("pid") else "🖼 загрузить картинку",
+                    "callback": self._menu_photo,
+                    "args": (uid,),
+                }
+            ],
+        ]
+        if confirm:
+            markup.append([
+                {"text": "🗑 точно удалить", "callback": self._menu_del, "args": (uid,)},
+                {"text": "отмена", "callback": self._menu_open, "args": (uid,)},
+            ])
+        else:
+            markup.append([
+                {"text": "🗑 удалить", "callback": self._menu_askdel, "args": (uid,)}
+            ])
+        markup.append([{"text": "« назад", "callback": self._menu_back, "args": (uid,)}])
+        return text, markup
+
+    async def _menu_render(self, call, text, markup):
+        try:
+            await call.edit(text, markup)
+        except Exception as exc:
+            logger.warning("[TriggerChanger] menu edit failed: %r", exc)
+            await self._menu_answer(call, "меню устарело — открой .repmenu заново", True)
+
+    async def _menu_answer(self, call, text, alert=False):
+        try:
+            await call.answer(text, alert=alert)
+        except Exception as exc:
+            logger.warning("[TriggerChanger] menu answer failed: %r", exc)
+
+    async def _menu_gone(self, call):
+        await self._menu_answer(call, "правило уже удалено", True)
+        await self._menu_page(call, 1)
+
+    async def _menu_open(self, call, uid):
+        _, entry = self._menu_entry(uid)
+        if entry is None:
+            await self._menu_gone(call)
+            return
+        text, markup = self._menu_card(entry)
+        await self._menu_render(call, text, markup)
+
+    async def _menu_page(self, call, page):
+        text, markup, _ = self._menu_list(page)
+        await self._menu_render(call, text, markup)
+
+    async def _menu_back(self, call, uid):
+        entries = self._get("entries", []) or []
+        index = next((i for i, e in enumerate(entries) if e.get("uid") == uid), 0)
+        await self._menu_page(call, index // MENU_PER_PAGE + 1)
+
+    async def _menu_toggle(self, call, key, page):
+        self.config[key] = not self.config[key]
+        await self._menu_answer(call, f"{'вкл' if self.config[key] else 'выкл'}")
+        await self._menu_page(call, page)
+
+    async def _menu_close(self, call):
+        try:
+            await call.delete()
+        except Exception as exc:
+            logger.warning("[TriggerChanger] menu close failed: %r", exc)
+
+    async def _menu_mode(self, call, uid):
+        entries, entry = self._menu_entry(uid)
+        if entry is None:
+            await self._menu_gone(call)
+            return
+        mode = entry.get("mode", "sub")
+        index = MODE_CYCLE.index(mode) + 1 if mode in MODE_CYCLE else 0
+        new = MODE_CYCLE[index % len(MODE_CYCLE)]
+        if new == "regex":
+            try:
+                re.compile(entry.get("trigger", ""))
+            except re.error as exc:
+                await self._menu_answer(call, f"невалидный regex: {exc}", True)
+                return
+        entry["mode"] = new
+        self._store_entries(entries)
+        await self._menu_answer(call, MODE_NAMES[new])
+        text, markup = self._menu_card(entry)
+        await self._menu_render(call, text, markup)
+
+    async def _menu_flag(self, call, uid, key):
+        entries, entry = self._menu_entry(uid)
+        if entry is None:
+            await self._menu_gone(call)
+            return
+        if entry.get("mode") == "regex":
+            await self._menu_answer(
+                call, "в regex-режиме не работает — впиши условие в саму регулярку", True
+            )
+            return
+        entry[key] = not entry.get(key)
+        self._store_entries(entries)
+        await self._menu_answer(call, "вкл" if entry[key] else "выкл")
+        text, markup = self._menu_card(entry)
+        await self._menu_render(call, text, markup)
+
+    async def _menu_notext(self, call, uid):
+        entries, entry = self._menu_entry(uid)
+        if entry is None:
+            await self._menu_gone(call)
+            return
+        entry["repl"] = None
+        self._store_entries(entries)
+        await self._menu_answer(call, "замена без текста")
+        text, markup = self._menu_card(entry)
+        await self._menu_render(call, text, markup)
+
+    async def _menu_repl(self, call, query, uid):
+        """Инпут-кнопка: телега передаёт введённый текст вторым аргументом."""
+        entries, entry = self._menu_entry(uid)
+        if entry is None:
+            await self._menu_gone(call)
+            return
+        value = (query or "").strip()
+        entry["repl"] = "" if value == "-" else value
+        self._store_entries(entries)
+        await self._menu_answer(call, "сохранил")
+        text, markup = self._menu_card(entry)
+        await self._menu_render(call, text, markup)
+
+    async def _menu_new(self, call, query):
+        trigger = (query or "").strip()
+        if not trigger:
+            await self._menu_answer(call, "пустой триггер", True)
+            return
+        dup = self._find_dup(trigger, "sub", False)
+        if dup is not None:
+            await self._menu_answer(call, f"такой триггер уже есть (#{dup['id']})", True)
+            return
+        entries = self._get("entries", []) or []
+        entry = {
+            "trigger": trigger,
+            "repl": "",
+            "mode": "sub",
+            "case": False,
+            "neg": False,
+            "end": False,
+        }
+        entries.append(entry)
+        self._store_entries(entries)
+        await self._menu_answer(call, f"добавил #{entry['id']}")
+        text, markup = self._menu_card(entry)
+        await self._menu_render(call, text, markup)
+
+    async def _menu_askdel(self, call, uid):
+        _, entry = self._menu_entry(uid)
+        if entry is None:
+            await self._menu_gone(call)
+            return
+        text, markup = self._menu_card(entry, confirm=True)
+        await self._menu_render(call, text, markup)
+
+    async def _menu_del(self, call, uid):
+        entries, entry = self._menu_entry(uid)
+        if entry is None:
+            await self._menu_gone(call)
+            return
+        self._drop_photo(entry)
+        entries.remove(entry)
+        self._store_entries(entries)
+        self._photo_wait = {k: v for k, v in self._photo_wait.items() if v != uid}
+        await self._menu_answer(call, "удалил")
+        await self._menu_page(call, 1)
+
+    async def _menu_photo(self, call, uid):
+        entries, entry = self._menu_entry(uid)
+        if entry is None:
+            await self._menu_gone(call)
+            return
+        if entry.get("pid"):
+            self._drop_photo(entry)
+            entry.pop("pid", None)
+            self._store_entries(entries)
+            await self._menu_answer(call, "картинку убрал")
+            text, markup = self._menu_card(entry)
+            await self._menu_render(call, text, markup)
+            return
+        # кнопку с файлом телега не умеет: ждём фото от пользователя в watcher
+        self._photo_wait[call.sender_id] = uid
+        await self._menu_answer(
+            call,
+            "пришли картинку любым сообщением (например в «Избранное») — подхвачу",
+            True,
+        )
+
+    async def _attach_photo(self, message, uid):
+        """Подхватить фото, которое пользователь прислал для правила из меню."""
+        self._photo_wait.pop(message.sender_id, None)
+        entries, entry = self._menu_entry(uid)
+        if entry is None:
+            logger.info("[TriggerChanger] правило %s пропало — картинку не сохраняю", uid)
+            return
+        state = {}
+        ok, err = await self._set_photo(state, message)
+        if not ok:
+            await utils.answer(message, f"❌ {err}")
+            return
+        # старое фото правила больше никто не найдёт — убираем, чтобы не висело в БД
+        self._drop_photo(entry)
+        entry["pid"] = self._save_photo(state["photo"])
+        self._store_entries(entries)
+        logger.info("[TriggerChanger] правило #%s: картинка обновлена", entry["id"])
+        form = self._menu_forms.get(message.sender_id)
+        if form is None:
+            return
+        text, markup = self._menu_card(entry)
+        try:
+            await form.edit(text, markup)
+        except Exception as exc:
+            logger.warning("[TriggerChanger] menu refresh failed: %r", exc)
+
     # ---------- команды ----------
 
     @loader.command(
@@ -637,6 +1052,7 @@ class TriggerChangerMod(loader.Module):
             f"(с картинками: <code>{photos}</code>)\n"
             f"🔗 Чистка ссылок от трекеров — {clean}\n"
             f"↩️ Откат автоправок в чат логов — {undo}\n\n"
+            "<code>.repmenu</code> — меню правил кнопками\n"
             "<code>.repadd &lt;триггер&gt; [-r|-w|-c|-n|-e]</code> — добавить замену (дальше по подсказкам)\n"
             "<code>.replist</code> — список правил\n"
             "<code>.repdel &lt;id|all&gt;</code> — удалить правило / всё\n"
@@ -650,6 +1066,34 @@ class TriggerChangerMod(loader.Module):
             "Пример: <code>.repadd да</code>, в ответ пишешь <code>da✅</code> — и каждое «да» "
             "в твоих сообщениях станет <code>da✅</code> сразу после отправки.",
         )
+
+    @loader.command(
+        ru_doc="Меню правил кнопками: .repmenu",
+        en_doc="Inline rules menu: .repmenu",
+    )
+    async def repmenu(self, message):
+        """Inline menu: browse and edit rules with buttons"""
+        text, markup, _ = self._menu_list(1)
+        try:
+            form = await self.inline.form(
+                text,
+                message=message,
+                reply_markup=markup,
+                ttl=FORM_TTL,
+                force_me=True,
+            )
+        except Exception as exc:
+            logger.warning("[TriggerChanger] menu form failed: %r", exc)
+            form = False
+        if not form:
+            await utils.answer(
+                message,
+                "❌ Меню не открылось (не настроен инлайн-бот?). "
+                "Смотри <code>.replist</code>, добавляй через <code>.repadd</code>.",
+            )
+            return
+        # форма понадобится watcher'у, чтобы обновить карточку после загрузки фото
+        self._menu_forms[message.sender_id] = form
 
     @loader.command(
         ru_doc="Вкл/выкл чистку ссылок от трекеров: .repclean [on|off]; без аргументов — переключить",
@@ -799,9 +1243,7 @@ class TriggerChangerMod(loader.Module):
             flag_str = f" <code>[{flags}]</code>" if flags else ""
             photo = " 🖼" if entry.get("pid") else ""
             trig = utils.escape_html(entry.get("trigger", ""))
-            suspect = entry.get("mode", "sub") != "regex" and any(
-                ch in entry.get("trigger", "") for ch in REGEX_CHARS
-            )
+            suspect = self._suspect(entry)
             warn = " ⚠️ <i>похоже на regex без -r</i>" if suspect else ""
             raw_repl = entry.get("repl")
             if raw_repl is None:
@@ -899,12 +1341,16 @@ class TriggerChangerMod(loader.Module):
             self._drop_photo(entry)
         self._store_entries([])
         self._set("photo_seq", 0)
+        self._set("uid_seq", 0)
         self._set("logchat", None)
         self.config["enabled"] = True
         self.config["clean_links"] = False
+        self.config["undo"] = True
         self._pending = {}
         self._edited = {}
         self._undo = {}
+        self._photo_wait = {}
+        self._menu_forms = {}
         await utils.answer(
             message,
             f"♻️ Сброс: удалено правил <code>{count}</code>. Настройки по умолчанию "
