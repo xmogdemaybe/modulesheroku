@@ -52,6 +52,7 @@
 #   пришли фото сообщением в тот же чат, где открыто меню (фото из других чатов
 #   модуль не подхватывает).
 
+import asyncio
 import base64
 import copy
 import difflib
@@ -106,9 +107,15 @@ TRACKER_PARAMS = {
 YT_PARAMS = {"si", "feature"}
 YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 URL_TAIL = ".,;:!?»'\""
-FORM_TTL = 900
-UNDO_TTL = 3600
+# форма живёт 10 минут: по истечении мы сами её удаляем, потому что форк по ttl
+# только забывает кнопки, а сообщение в чате оставляет
+FORM_TTL = 600
+# откат доступен ровно пока висит форма — дольше помнить бессмысленно
+UNDO_TTL = FORM_TTL
 MAX_UNDO = 20
+# inline.form() ждёт подтверждения от инлайн-бота без таймаута: если оно не
+# придёт, навсегда зависнет и команда, и watcher. Ограничиваем ожидание.
+FORM_OPEN = 20
 LOG_MODULES = ("hikka_logs", "tester")
 
 
@@ -159,6 +166,7 @@ class TriggerChangerMod(loader.Module):
         self._photo_wait = {}  # uid юзера -> (uid правила, ts, chat_id): ждём картинку
         self._menu_forms = {}  # uid -> открытое меню, чтобы обновить его из watcher
         self._menu_chat = {}  # uid -> чат, где открыто меню: там же ждём картинку
+        self._form_timers = {}  # key -> задача автоудаления формы отката
         # pid -> файл телеги: повторно слать готовый объект быстрее, чем каждый
         # раз загружать байты из БД заново
         self._photo_cache = {}
@@ -183,6 +191,11 @@ class TriggerChangerMod(loader.Module):
         if self._migrate_photos(entries):
             self._store_entries(entries)
         self._gc_photos(entries)
+
+    async def on_unload(self):
+        for task in self._form_timers.values():
+            task.cancel()
+        self._form_timers = {}
 
     # ---------- БД ----------
 
@@ -578,6 +591,61 @@ class TriggerChangerMod(loader.Module):
             for key in oldest[: len(self._undo) - MAX_UNDO]:
                 self._undo.pop(key, None)
 
+    async def _open_form(self, *args, **kwargs):
+        """inline.form() с ограниченным ожиданием: без подтверждения инлайн-бота
+        форк висит вечно и утаскивает за собой watcher/команду."""
+        return await asyncio.wait_for(self.inline.form(*args, **kwargs), FORM_OPEN)
+
+    def _form_ids(self, obj):
+        """chat и message_id формы.
+
+        Форк заполняет их уже после отправки, а до того (или если что-то пошло не
+        так) там None. Тогда delete_messages(None, None) у telethon падает в
+        TypeError и засыпает чат логов трейсбеками — поэтому смотрим сюда.
+        """
+        units = getattr(obj, "_units", None) or {}
+        unit = units.get(getattr(obj, "unit_id", None)) or {}
+        return unit.get("chat"), unit.get("message_id")
+
+    async def _kill_form(self, obj):
+        """Убрать форму из чата так, чтобы обработчик кнопки не упал."""
+        if obj is None:
+            return False
+        chat, mid = self._form_ids(obj)
+        if chat is None or mid is None:
+            logger.info("[TriggerChanger] форму не удалить: форк не запомнил сообщение")
+            return False
+        try:
+            await obj.delete()
+        except Exception as exc:
+            logger.info("[TriggerChanger] форма не удалилась: %r", exc)
+            return False
+        # delete() юнит из памяти не убирает — кнопки живут до ttl
+        try:
+            await obj.unload()
+        except Exception:
+            pass
+        return True
+
+    def _form_timer(self, key, form):
+        """Через FORM_TTL форма отката удалится сама: форк по ttl только забывает
+        кнопки, сообщение в чате оставляет навсегда."""
+
+        async def expire():
+            await asyncio.sleep(FORM_TTL)
+            self._form_timers.pop(key, None)
+            if self._undo.pop(key, None) is None:
+                return  # кнопку уже нажали — форму убрали там
+            await self._kill_form(form)
+
+        self._form_timer_cancel(key)
+        self._form_timers[key] = asyncio.ensure_future(expire())
+
+    def _form_timer_cancel(self, key):
+        task = self._form_timers.pop(key, None)
+        if task is not None:
+            task.cancel()
+
     def _remember_undo(self, message, orig, deleted=False, photo_msg=None):
         key = f"{message.chat_id}:{message.id}"
         self._undo[key] = {
@@ -610,8 +678,8 @@ class TriggerChangerMod(loader.Module):
             f"💬 <i>{utils.escape_html(self._chat_name(message))}</i>"
         )
         try:
-            await self.inline.form(
-                header + "\n\nОткатить правку?",
+            form = await self._open_form(
+                header + f"\n\nОткатить правку? <i>(исчезнет через {FORM_TTL // 60} мин)</i>",
                 message=chat,
                 reply_markup=[[
                     {"text": "↩️ откатить", "callback": self._inline_undo, "args": (key,)},
@@ -619,16 +687,25 @@ class TriggerChangerMod(loader.Module):
                 ]],
                 ttl=FORM_TTL,
                 force_me=True,
-                on_unload=lambda *_: self._undo.pop(key, None),
+                on_unload=lambda *_: (
+                    self._undo.pop(key, None),
+                    self._form_timer_cancel(key),
+                ),
             )
         except Exception as exc:
             logger.warning("[TriggerChanger] undo form failed: %r", exc)
+            return
+        if not form:
+            return
+        entry["form"] = form
+        self._form_timer(key, form)
 
     async def _inline_undo(self, call, key):
+        self._form_timer_cancel(key)
         entry = self._undo.pop(key, None)
         if entry is None:
             await call.answer("поздно — правка уже забыта", alert=True)
-            await call.delete()
+            await self._kill_form(call)
             return
         ents = entry.get("ents") or []
         try:
@@ -646,7 +723,7 @@ class TriggerChangerMod(loader.Module):
         except Exception as exc:
             logger.warning("[TriggerChanger] revert failed (%s): %r", key, exc)
             await call.answer(f"не откатилось: {exc}"[:ALERT_MAX], alert=True)
-            await call.delete()
+            await self._kill_form(call)
             return
         photo_msg = entry.get("photo_msg")
         if photo_msg is not None:
@@ -655,12 +732,13 @@ class TriggerChangerMod(loader.Module):
             except Exception as exc:
                 logger.info("[TriggerChanger] картинку отката не удалить: %r", exc)
         await call.answer("откатил")
-        await call.delete()
+        await self._kill_form(call)
 
     async def _inline_keep(self, call, key):
+        self._form_timer_cancel(key)
         self._undo.pop(key, None)
         await call.answer("ок")
-        await call.delete()
+        await self._kill_form(call)
 
     # ---------- watcher ----------
 
@@ -1280,10 +1358,7 @@ class TriggerChangerMod(loader.Module):
         # закрыл меню — значит и картинку для правила уже не ждём,
         # иначе следующее фото юзера прилипнет к правилу
         self._menu_state_clear(call.sender_id)
-        try:
-            await call.delete()
-        except Exception as exc:
-            logger.warning("[TriggerChanger] menu close failed: %r", exc)
+        await self._kill_form(call)
 
     def _menu_state_clear(self, uid):
         self._photo_wait.pop(uid, None)
@@ -1515,7 +1590,7 @@ class TriggerChangerMod(loader.Module):
         self._menu_state_clear(uid)
         text, markup, _ = self._menu_list(1)
         try:
-            form = await self.inline.form(
+            form = await self._open_form(
                 text,
                 message=message,
                 reply_markup=markup,
@@ -1809,6 +1884,9 @@ class TriggerChangerMod(loader.Module):
         self._pending = {}
         self._edited = {}
         self._undo = {}
+        for task in self._form_timers.values():
+            task.cancel()
+        self._form_timers = {}
         self._photo_wait = {}
         self._menu_forms = {}
         self._menu_chat = {}
