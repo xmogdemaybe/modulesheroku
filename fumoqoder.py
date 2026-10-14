@@ -24,6 +24,7 @@
 #   .fumoredditmode auto|json|arctic   listing via direct JSON or Arctic Shift archive
 #   .fumosub <subreddit>         set subreddit (default Fumofumo)
 #   .fumoschedule on|off         use Telegram scheduled messages for autoposting
+#   .fumotime 07:00|off          wall-clock publish time for scheduled posts (local)
 #   .fumonum [N]                 post counter (#N in caption); set your own number
 #   .fumotest [source] [count]   post fumo now (optionally from one source)
 #   .fumoreset                   clear sent-images history (settings are kept)
@@ -36,7 +37,7 @@ import asyncio
 import logging
 import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any, Optional
 
@@ -54,6 +55,11 @@ from telethon.errors import (
     ChatWriteForbiddenError,
     FloodWaitError,
 )
+
+try:
+    from telethon.tl.functions.messages import GetScheduledHistoryRequest
+except ImportError:  # very old forks
+    GetScheduledHistoryRequest = None
 
 from .. import loader, utils
 
@@ -597,22 +603,86 @@ class FumoQoder(loader.Module):
             logger.error("[FumoQoder] autopost failed: %r", exc)
             self._next_post = time.time() + 60
 
+    def _parse_post_time(self):
+        """Return (hh, mm) from the stored '.fumotime' value, or None if unset/invalid."""
+        raw = (self._get("post_time", "") or "").strip()
+        if not raw or ":" not in raw:
+            return None
+        try:
+            hh, mm = raw.split(":", 1)
+            hh, mm = int(hh), int(mm)
+        except ValueError:
+            return None
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh, mm
+        return None
+
+    def _next_fire(self, base: float, now: Optional[float] = None) -> float:
+        """When to publish the next post, given the last (already queued) one at `base`.
+
+        With a `.fumotime` HH:MM set, the post goes on the next date at that local
+        wall-clock time (spacing in whole days derived from the interval), rolled
+        forward until it is in the future; otherwise it is simply `base + interval`.
+        """
+        interval = self._get("interval", DEFAULT_INTERVAL)
+        hm = self._parse_post_time()
+        if hm is None:
+            fire = base + interval
+            if now is not None and fire <= now:
+                fire = now + interval
+            return fire
+        hh, mm = hm
+        days = max(1, int(round(interval / 86400)))
+        base_dt = datetime.fromtimestamp(base, tz=timezone.utc).astimezone()
+        cand = (base_dt + timedelta(days=days)).replace(
+            hour=hh, minute=mm, second=0, microsecond=0
+        )
+        floor = now if now is not None else base
+        while cand.timestamp() <= floor:
+            cand += timedelta(days=days)
+        return cand.timestamp()
+
+    async def _last_scheduled_ts(self, entity) -> float:
+        """Publish time of the latest message in Telegram's Scheduled queue (0 if none).
+
+        Reading the real queue (not just our own db) lets the module chain after posts
+        the user scheduled by hand, and stays correct across reloads.
+        """
+        if GetScheduledHistoryRequest is None:
+            return self._get("sched_pending", 0) or 0
+        try:
+            peer = await self.client.get_input_entity(entity)
+            res = await self.client(GetScheduledHistoryRequest(peer=peer, hash=0))
+            stamps = [
+                m.date.timestamp() for m in getattr(res, "messages", [])
+                if getattr(m, "date", None) is not None
+            ]
+            return max(stamps) if stamps else 0
+        except Exception as exc:
+            logger.warning("[FumoQoder] cannot read scheduled history: %r", exc)
+            return self._get("sched_pending", 0) or 0
+
     async def _tick_schedule(self):
         """Keep exactly one post queued in Telegram's Scheduled Messages.
 
-        `sched_pending` is the publish time of the queued post. Once that moment
-        passes (Telegram has fired it), we queue the next one an interval later.
-        The userbot can be offline in between — Telegram publishes it server-side.
+        The chain is anchored to the newest message already in the queue: while that
+        publish time is still in the future we do nothing; once it has fired (or the
+        queue is empty) we queue the next one via `_next_fire`. Telegram publishes it
+        server-side even if the userbot is offline in between.
         """
         now = time.time()
-        pending = self._get("sched_pending", 0) or 0
-        if pending > now:
-            self._next_post = pending
+        entity = await self._target()
+        last = await self._last_scheduled_ts(entity)
+        if last > now:
+            # A post is already pending in the queue — just track it.
+            self._set("sched_pending", last)
+            self._next_post = last
             return
-        interval = self._get("interval", DEFAULT_INTERVAL)
-        fire_at = now + interval
+        fire_at = self._next_fire(last if last else now, now)
+        if fire_at <= now:
+            fire_at = now + self._get("interval", DEFAULT_INTERVAL)
         try:
-            await self._send(await self._target(), schedule=fire_at)
+            await self._send(entity, schedule=fire_at)
             self._set("sched_pending", fire_at)
             self._next_post = fire_at
         except FloodWaitError as exc:
@@ -828,6 +898,42 @@ class FumoQoder(loader.Module):
             await utils.answer(
                 message, f"<b>Schedule mode:</b> {state}\n<code>.fumoschedule on|off</code>"
             )
+
+    @loader.command(
+        ru_doc="Во сколько слать отложенные посты: .fumotime 07:00 (off — сброс); время по часовому поясу машины",
+        en_doc="Wall-clock time for scheduled posts: .fumotime 07:00 (off resets); machine local time",
+    )
+    async def fumotime(self, message):
+        """Set the time of day (HH:MM, machine local time) scheduled posts are published at.
+
+        Each next post goes on the following date at this time, chained after the last
+        message already in Telegram's Scheduled queue. 'off' (or empty) clears it and
+        falls back to plain interval spacing.
+        """
+        args = utils.get_args_raw(message).strip()
+        if args.lower() in ("off", "clear", "none", ""):
+            self._set("post_time", "")
+            await utils.answer(
+                message, "\u23F0 <b>Post time cleared.</b> Scheduled posts now use plain interval spacing."
+            )
+            return
+        parts = args.split(":")
+        ok = len(parts) == 2 and all(p.strip().isdigit() for p in parts)
+        if ok:
+            hh, mm = int(parts[0]), int(parts[1])
+            ok = 0 <= hh <= 23 and 0 <= mm <= 59
+        if not ok:
+            await utils.answer(
+                message, "\u26A0\uFE0F <b>Example:</b> <code>.fumotime 07:00</code> "
+                "(24h format, machine local time)"
+            )
+            return
+        val = f"{hh:02d}:{mm:02d}"
+        self._set("post_time", val)
+        await utils.answer(
+            message, f"\u23F0 <b>Scheduled posts at</b> <code>{val}</code> (local time). "
+            "Each next date after the last queued post."
+        )
 
     @loader.command(
         ru_doc="Счётчик постов (#N в подписи): .fumonum 57 — задать своё число; без аргумента — показать",
@@ -1061,6 +1167,7 @@ class FumoQoder(loader.Module):
             f"<b>Per send:</b> <code>{self._get('count', 1)}</code>\n"
             f"<b>Post counter:</b> <code>#{int(self._get('post_num', 0) or 0)}</code>\n"
             f"<b>Schedule mode:</b> {'on' if self._get('schedule_mode', False) else 'off'}\n"
+            f"<b>Post time:</b> <code>{utils.escape_html(self._get('post_time', '') or '—')}</code>\n"
             f"<b>Sources:</b> <code>{utils.escape_html(', '.join(active))}</code>\n"
             f"<b>Reddit media:</b> <code>{utils.escape_html(self._get('reddit_media', 'pics'))}</code>\n"
             f"<b>Reddit mode:</b> <code>{utils.escape_html(self._get('reddit_mode', 'auto'))}</code>\n"
@@ -1090,6 +1197,8 @@ class FumoQoder(loader.Module):
             "<code>.fumocount 3</code> — how many pictures per send (1..10, album)\n"
             "<code>.fumoschedule on</code> — queue posts as Telegram Scheduled Messages "
             "(published even if the bot is offline)\n"
+            "<code>.fumotime 07:00</code> — publish scheduled posts at this local time, "
+            "chained after the last queued post (off = plain interval)\n"
             "<code>.fumonum 57</code> — set the post counter (#57 → #58 …); no args shows it\n\n"
             "<b>Caption</b>\n"
             "<code>.fumocaption Fumo time! {source}</code> — custom text "
