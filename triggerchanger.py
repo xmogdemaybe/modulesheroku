@@ -11,6 +11,7 @@
 #   .repdel <id|all>               удалить правило / всё
 #   .reptoggle [on|off]            вкл/выкл автозамену
 #   .repclean [on|off]             вкл/выкл чистку ссылок от трекеров
+#   .represet да                   полный сброс: правила, картинки, настройки
 #   .reptest <текст>               проверить текст без отправки
 #
 # Режимы совпадения (флаги при добавлении):
@@ -468,6 +469,7 @@ class TriggerChangerMod(loader.Module):
             "<code>.repdel &lt;id|all&gt;</code> — удалить правило / всё\n"
             "<code>.reptoggle [on|off]</code> — вкл/выкл\n"
             "<code>.repclean [on|off]</code> — вкл/выкл чистку ссылок (si=, utm_* и т.п.)\n"
+            "<code>.represet да</code> — сбросить всё: правила, картинки, настройки\n"
             "<code>.reptest &lt;текст&gt;</code> — проверить без отправки\n\n"
             "Флаги: <code>-r</code> regex, <code>-w</code> целое слово, "
             "<code>-c</code> регистр, <code>-n</code> не после «не»/«нет»/«неа»/«ни», "
@@ -588,9 +590,17 @@ class TriggerChangerMod(loader.Module):
     async def replist(self, message):
         """List replacement rules"""
         entries = self._get("entries", []) or []
+        # чистка ссылок — не правило, а настройка: показываем её тут же,
+        # иначе не видно, включена ли она
+        status = (
+            f"🔁 Автозамена — {'🟢 вкл' if self._get('enabled', True) else '🔴 выкл'}\n"
+            f"🔗 Чистка ссылок от трекеров — "
+            f"{'🟢 вкл' if self._get('clean_links', False) else '🔴 выкл'}"
+        )
         if not entries:
             await utils.answer(
-                message, "📋 Правил нет. Добавь: <code>.repadd да</code>"
+                message,
+                f"{status}\n📋 Правил нет. Добавь: <code>.repadd да</code>",
             )
             return
         raw = utils.get_args_raw(message).strip()
@@ -633,7 +643,7 @@ class TriggerChangerMod(loader.Module):
         header = "📋 <b>Правила автозамены</b>"
         if pages > 1:
             header += f" (стр. {page}/{pages})"
-        await utils.answer(message, header + "\n" + "\n".join(lines))
+        await utils.answer(message, header + "\n" + status + "\n\n" + "\n".join(lines))
 
     @loader.command(
         ru_doc="Удалить правило: .repdel <id>, или .repdel all",
@@ -688,6 +698,35 @@ class TriggerChangerMod(loader.Module):
             await utils.answer(message, "🟢 Автозамена включена.")
         else:
             await utils.answer(message, "🔴 Автозамена выключена.")
+
+    @loader.command(
+        ru_doc="Полный сброс модуля: .represet да — удалить все правила, картинки и настройки",
+        en_doc="Full module reset: .represet yes — wipe rules, photos and settings",
+    )
+    async def represet(self, message):
+        """Wipe this module's DB: rules, photos, settings"""
+        raw = utils.get_args_raw(message).strip().lower()
+        entries = self._get("entries", []) or []
+        if raw not in ("да", "yes", "+", "confirm"):
+            await utils.answer(
+                message,
+                f"⚠️ Удалю всё, что хранит этот модуль: правил <code>{len(entries)}</code>, "
+                "их картинки и настройки (автозамена, чистка ссылок). "
+                "Другие модули не пострадают.\n"
+                "Подтверди: <code>.represet да</code>",
+            )
+            return
+        count = len(entries)
+        self._store_entries([])
+        self._set("enabled", True)
+        self._set("clean_links", False)
+        self._pending = {}
+        self._edited = {}
+        await utils.answer(
+            message,
+            f"♻️ Сброс: удалено правил <code>{count}</code>. Настройки по умолчанию "
+            "(автозамена вкл, чистка ссылок выкл).",
+        )
 
     @loader.command(
         ru_doc="Проверить текст без отправки: .reptest да привет",
