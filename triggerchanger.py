@@ -3,7 +3,8 @@
 #
 # Как работает: watcher ловит ТВОИ отправленные сообщения, прогоняет текст
 # по словарю замен и тут же редактирует сообщение, если что-то совпало.
-# Правила хранятся в БД (json Heroku), картинки — в base64.
+# Правила хранятся в БД (json Heroku); картинки — base64 в отдельном ключе
+# "photo:<pid>", чтобы правка одного правила не переписывала весь json.
 #
 # Команды:
 #   .repadd <триггер> [-r|-w|-c|-n|-e]   добавить замену (визард: замена -> картинка?)
@@ -93,6 +94,10 @@ class TriggerChangerMod(loader.Module):
         # пересобираем нумерацию подряд: 1..N
         if [e.get("id") for e in entries] != list(range(1, len(entries) + 1)):
             self._store_entries(entries)
+        # в старых версиях base64 картинки лежал прямо в правиле: любая правка
+        # списка переписывала весь json с балластом — разносим по ключам
+        if self._migrate_photos(entries):
+            self._store_entries(entries)
 
     # ---------- БД ----------
 
@@ -115,6 +120,40 @@ class TriggerChangerMod(loader.Module):
         for index, entry in enumerate(entries, 1):
             entry["id"] = index
         self._set("entries", entries)
+
+    # ---------- картинки правил (отдельные ключи БД) ----------
+
+    def _save_photo(self, data_b64):
+        """Положить base64 в свой ключ БД, вернуть pid.
+
+        pid не зависит от id правила: нумерация правил пересобирается при
+        каждом удалении, а фото-ключи должны оставаться на месте.
+        """
+        seq = int(self._get("photo_seq", 0) or 0) + 1
+        self._set("photo_seq", seq)
+        pid = f"p{seq}"
+        self._set(f"photo:{pid}", data_b64)
+        return pid
+
+    def _photo_b64(self, entry):
+        pid = entry.get("pid")
+        return self._get(f"photo:{pid}") if pid else None
+
+    def _drop_photo(self, entry):
+        pid = entry.get("pid")
+        if pid:
+            self._set(f"photo:{pid}", None)
+
+    def _migrate_photos(self, entries):
+        moved = False
+        for entry in entries:
+            if "photo" not in entry:
+                continue
+            data = entry.pop("photo")
+            if data:
+                entry["pid"] = self._save_photo(data)
+            moved = True
+        return moved
 
     # ---------- замена ----------
 
@@ -282,11 +321,12 @@ class TriggerChangerMod(loader.Module):
                         k: v for k, v in self._edited.items() if v > cutoff
                     }
 
-            photo_entries = [e for e in matched if e.get("photo")]
+            photo_entries = [e for e in matched if e.get("pid")]
             if photo_entries:
                 try:
-                    data = base64.b64decode(photo_entries[0]["photo"])
-                    await message.respond(file=io.BytesIO(data))
+                    b64 = self._photo_b64(photo_entries[0])
+                    if b64:
+                        await message.respond(file=io.BytesIO(base64.b64decode(b64)))
                 except Exception as exc:
                     logger.warning("[TriggerChanger] photo send failed: %r", exc)
         except Exception as exc:
@@ -316,8 +356,10 @@ class TriggerChangerMod(loader.Module):
             "case": bool(state.get("case", False)),
             "neg": bool(state.get("neg", False)),
             "end": bool(state.get("end", False)),
-            "photo": state.get("photo"),
         }
+        photo = state.get("photo")
+        if photo:
+            entry["pid"] = self._save_photo(photo)
         entries.append(entry)
         self._store_entries(entries)
         self._pending.pop(uid, None)
@@ -334,7 +376,7 @@ class TriggerChangerMod(loader.Module):
         if entry["end"]:
             flags.append("только в конце")
         flag_str = f" <i>({', '.join(flags)})</i>" if flags else ""
-        photo_str = "\n🖼 Картинка: прикреплена" if entry["photo"] else ""
+        photo_str = "\n🖼 Картинка: прикреплена" if entry.get("pid") else ""
         # буквальный «[?&]si=...» никогда не совпадёт со ссылкой — напоминаем про -r
         warn = ""
         if entry["mode"] != "regex" and any(
@@ -456,7 +498,7 @@ class TriggerChangerMod(loader.Module):
         """Show status and help"""
         entries = self._get("entries", []) or []
         enabled = self._get("enabled", True)
-        photos = sum(1 for e in entries if e.get("photo"))
+        photos = sum(1 for e in entries if e.get("pid"))
         state = "🟢 вкл" if enabled else "🔴 выкл"
         clean = "🟢 вкл" if self._get("clean_links", False) else "🔴 выкл"
         await utils.answer(
@@ -624,7 +666,7 @@ class TriggerChangerMod(loader.Module):
             if entry.get("end"):
                 flags += "E"
             flag_str = f" <code>[{flags}]</code>" if flags else ""
-            photo = " 🖼" if entry.get("photo") else ""
+            photo = " 🖼" if entry.get("pid") else ""
             trig = utils.escape_html(entry.get("trigger", ""))
             suspect = entry.get("mode", "sub") != "regex" and any(
                 ch in entry.get("trigger", "") for ch in REGEX_CHARS
@@ -655,6 +697,8 @@ class TriggerChangerMod(loader.Module):
         entries = self._get("entries", []) or []
         if raw in ("all", "все"):
             count = len(entries)
+            for entry in entries:
+                self._drop_photo(entry)
             self._store_entries([])
             await utils.answer(
                 message, f"🗑 Удалено всех правил: <code>{count}</code>"
@@ -670,6 +714,9 @@ class TriggerChangerMod(loader.Module):
         if len(remaining) == len(entries):
             await utils.answer(message, f"❌ Правило <code>#{rid}</code> не найдено.")
             return
+        for entry in entries:
+            if entry.get("id") == rid:
+                self._drop_photo(entry)
         self._store_entries(remaining)
         await utils.answer(
             message, f"🗑 Удалено <code>#{rid}</code>. Осталось: <code>{len(remaining)}</code>"
@@ -717,7 +764,10 @@ class TriggerChangerMod(loader.Module):
             )
             return
         count = len(entries)
+        for entry in entries:
+            self._drop_photo(entry)
         self._store_entries([])
+        self._set("photo_seq", 0)
         self._set("enabled", True)
         self._set("clean_links", False)
         self._pending = {}
@@ -753,7 +803,7 @@ class TriggerChangerMod(loader.Module):
             )
             return
         ids = ", ".join(f"#{e['id']}" for e in matched)
-        photos = any(e.get("photo") for e in matched)
+        photos = any(e.get("pid") for e in matched)
         result = utils.escape_html(new_text) if new_text else "<i>(пусто)</i>"
         await utils.answer(
             message,
