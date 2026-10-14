@@ -77,15 +77,39 @@ URL_TAIL = ".,;:!?»'\""
 class TriggerChangerMod(loader.Module):
     """Автозамена слов/триггеров в отправляемых сообщениях, с БД и картинками"""
 
-    strings = {"name": MODNAME}
+    strings = {
+        "name": MODNAME,
+        "cfg_enabled": "Автозамена в исходящих сообщениях",
+        "cfg_clean_links": "Вырезать трекеры (si=, utm_*, fbclid и т.п.) из ссылок",
+    }
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "enabled",
+                True,
+                lambda: self.strings("cfg_enabled"),
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "clean_links",
+                False,
+                lambda: self.strings("cfg_clean_links"),
+                validator=loader.validators.Boolean(),
+            ),
+        )
 
     async def client_ready(self, client, db):
         self.client = client
         self.db = db
         self._pending = {}  # uid -> состояние визарда
         self._edited = {}  # msg_id -> ts, страховка от повторной обработки
-        if self._get("enabled") is None:
-            self._set("enabled", True)
+        # настройки жили в ключах БД — переносим в config, чтобы правда была одна
+        for key in ("enabled", "clean_links"):
+            old = self._get(key)
+            if old is not None:
+                self.config[key] = bool(old)
+                self._set(key, None)
         entries = self._get("entries", [])
         if not isinstance(entries, list):
             entries = []
@@ -194,7 +218,7 @@ class TriggerChangerMod(loader.Module):
         первым, в середине и последним, и в каждом случае ссылка должна
         остаться рабочей.
         """
-        if not self._get("clean_links", False):
+        if not self.config["clean_links"]:
             return text
 
         def clean(match):
@@ -295,7 +319,7 @@ class TriggerChangerMod(loader.Module):
                 await self._wizard_step(message, text)
                 return
 
-            if not self._get("enabled", True) or not text:
+            if not self.config["enabled"] or not text:
                 return
             if getattr(message, "fwd_from", None) or getattr(message, "via_bot_id", None):
                 return
@@ -497,10 +521,10 @@ class TriggerChangerMod(loader.Module):
     async def rep(self, message):
         """Show status and help"""
         entries = self._get("entries", []) or []
-        enabled = self._get("enabled", True)
+        enabled = self.config["enabled"]
         photos = sum(1 for e in entries if e.get("pid"))
         state = "🟢 вкл" if enabled else "🔴 выкл"
-        clean = "🟢 вкл" if self._get("clean_links", False) else "🔴 выкл"
+        clean = "🟢 вкл" if self.config["clean_links"] else "🔴 выкл"
         await utils.answer(
             message,
             f"🔁 <b>TriggerChanger</b> — {state}, правил: <code>{len(entries)}</code> "
@@ -532,13 +556,13 @@ class TriggerChangerMod(loader.Module):
         elif raw in ("off", "0", "выкл", "disable"):
             new = False
         elif not raw:
-            new = not self._get("clean_links", False)
+            new = not self.config["clean_links"]
         else:
             await utils.answer(
                 message, "❌ Аргумент: <code>on</code> / <code>off</code> / пусто."
             )
             return
-        self._set("clean_links", new)
+        self.config["clean_links"] = new
         if new:
             await utils.answer(
                 message,
@@ -635,9 +659,9 @@ class TriggerChangerMod(loader.Module):
         # чистка ссылок — не правило, а настройка: показываем её тут же,
         # иначе не видно, включена ли она
         status = (
-            f"🔁 Автозамена — {'🟢 вкл' if self._get('enabled', True) else '🔴 выкл'}\n"
+            f"🔁 Автозамена — {'🟢 вкл' if self.config['enabled'] else '🔴 выкл'}\n"
             f"🔗 Чистка ссылок от трекеров — "
-            f"{'🟢 вкл' if self._get('clean_links', False) else '🔴 выкл'}"
+            f"{'🟢 вкл' if self.config['clean_links'] else '🔴 выкл'}"
         )
         if not entries:
             await utils.answer(
@@ -734,13 +758,13 @@ class TriggerChangerMod(loader.Module):
         elif raw in ("off", "0", "выкл", "disable"):
             new = False
         elif not raw:
-            new = not self._get("enabled", True)
+            new = not self.config["enabled"]
         else:
             await utils.answer(
                 message, "❌ Аргумент: <code>on</code> / <code>off</code> / пусто."
             )
             return
-        self._set("enabled", new)
+        self.config["enabled"] = new
         if new:
             await utils.answer(message, "🟢 Автозамена включена.")
         else:
@@ -768,8 +792,8 @@ class TriggerChangerMod(loader.Module):
             self._drop_photo(entry)
         self._store_entries([])
         self._set("photo_seq", 0)
-        self._set("enabled", True)
-        self._set("clean_links", False)
+        self.config["enabled"] = True
+        self.config["clean_links"] = False
         self._pending = {}
         self._edited = {}
         await utils.answer(
