@@ -53,6 +53,8 @@
 #   модуль не подхватывает).
 
 import base64
+import copy
+import difflib
 import io
 import logging
 import re
@@ -108,6 +110,11 @@ FORM_TTL = 900
 UNDO_TTL = 3600
 MAX_UNDO = 20
 LOG_MODULES = ("hikka_logs", "tester")
+
+
+def _u16_len(text):
+    """Длина строки в utf-16: именно в таких единицах телега считает офсеты."""
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
 
 
 @loader.tds
@@ -276,6 +283,25 @@ class TriggerChangerMod(loader.Module):
             logger.error("[TriggerChanger] photo keys scan: %r", exc)
             return []
 
+    def _drop_keys(self, keys):
+        """Удалить несколько ключей одним db.save().
+
+        Heroku на каждый save переписывает весь json и держит 15 ревизий в
+        памяти: чистка пачки картинок по одной ключ-за-ключом стоит дорого.
+        """
+        keys = [k for k in keys if k]
+        if not keys:
+            return
+        try:
+            namespace = self.db.setdefault(MODNAME, {})
+            removed = [k for k in keys if k in namespace]
+            for key in removed:
+                del namespace[key]
+            if removed:
+                self.db.save()
+        except Exception as exc:
+            logger.error("[TriggerChanger] db bulk delete: %r", exc)
+
     def _gc_photos(self, entries):
         """Убрать photo:*-ключи, на которые не ссылается ни одно правило.
 
@@ -283,15 +309,15 @@ class TriggerChangerMod(loader.Module):
         целиком на любую правку: осиротевшие картинки стоят дороже, чем выглядят.
         """
         alive = {f"photo:{e.get('pid')}" for e in entries if e.get("pid")}
-        for key in self._photo_keys():
-            if key not in alive:
-                self._set(key, None)
+        dead = [key for key in self._photo_keys() if key not in alive]
+        if dead:
+            self._drop_keys(dead)
+            for key in dead:
                 self._photo_cache.pop(key[len("photo:"):], None)
                 logger.info("[TriggerChanger] удалён осиротевший ключ %s", key)
 
     def _drop_all_photos(self):
-        for key in self._photo_keys():
-            self._set(key, None)
+        self._drop_keys(self._photo_keys())
         self._photo_cache.clear()
 
     # ---------- замена ----------
@@ -422,23 +448,91 @@ class TriggerChangerMod(loader.Module):
         return new_text, matched
 
     def _tidy(self, text):
-        text = re.sub(r"[ \t]{2,}", " ", text)
-        # «пошли ,» -> «пошли,»
-        text = re.sub(r"[ \t]+([,.;:!?…])", r"\1", text)
+        # отступы строк не трогаем: схлопываем только пробелы внутри строки
+        text = re.sub(r"(?<=\S)[ \t]{2,}", " ", text)
+        # «пошли ,» -> «пошли,» (двоеточие и «;» не трогаем — это смайлики «:(» и «;)»)
+        text = re.sub(r"[ \t]+([,.!?…])", r"\1", text)
         # «пошли,.» -> «пошли.» (троеточия и «?!» не трогаем)
         text = re.sub(r"[,;]+(?=[,.;:!?…])", "", text)
+        # «блять, пошли» -> «, пошли» -> «пошли»
+        text = re.sub(r"^\s*[,;]+\s*", "", text)
         return text.strip()
 
     def _split_triggers(self, trigger, mode):
         """«сука, блять» — это два правила, а не одна длинная подстрока.
 
-        В regex запятая — часть паттерна (<code>{2,5}</code>, перечисления),
-        поэтому там не режем.
+        В regex запятая — часть паттерна, да и в обычном триггере она может
+        стоять внутри «\\d{2,5}» — поэтому режем только запятые верхнего
+        уровня (не внутри {} и []). Строка из одних запятых даёт пустой список.
         """
         if mode == "regex" or "," not in trigger:
             return [trigger]
-        parts = [p.strip() for p in trigger.split(",") if p.strip()]
-        return parts or [trigger]
+        parts, buf, depth = [], [], 0
+        for ch in trigger:
+            if ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                parts.append("".join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        parts.append("".join(buf).strip())
+        return [p for p in parts if p]
+
+    def _remap_entities(self, text, new_text, entities):
+        """Пересчитать сущности под новый текст.
+
+        Форматирование (жирный, спойлеры, ссылки) телега хранит не в тексте, а
+        списком сущностей с офсетами: без пересчёта правка оставила бы сообщение
+        голым текстом, а ссылка после чистки трекера перестала бы быть ссылкой.
+        Сущность, которую замена переписала изнутри, теряется — её текст уже не тот.
+        """
+        if not entities:
+            return []
+        # utf-16 офсет -> индекс символа в python-строке
+        char_of_u16 = []
+        for index, ch in enumerate(text):
+            char_of_u16.extend([index] * (2 if ord(ch) > 0xFFFF else 1))
+        moved = {}
+        opcodes = difflib.SequenceMatcher(
+            None, text, new_text, autojunk=False
+        ).get_opcodes()
+        for tag, i1, i2, j1, _ in opcodes:
+            if tag == "equal":
+                for shift in range(i2 - i1):
+                    moved[i1 + shift] = j1 + shift
+        # границы сущности могли попасть внутрь замены: тянем их к ближайшему
+        # уцелевшему символу (ссылка с вырезанным ?si= должна остаться ссылкой)
+        last_before, first_after = {}, {}
+        seen = None
+        for index in range(len(text)):
+            seen = moved.get(index, seen)
+            last_before[index] = seen
+        seen = None
+        for index in range(len(text) - 1, -1, -1):
+            seen = moved.get(index, seen)
+            first_after[index] = seen
+        result = []
+        for ent in entities:
+            offset = getattr(ent, "offset", 0)
+            length = getattr(ent, "length", 0)
+            last = offset + length - 1
+            if not (0 <= offset < len(char_of_u16) and 0 <= last < len(char_of_u16)):
+                continue
+            start = first_after.get(char_of_u16[offset])
+            end = last_before.get(char_of_u16[last])
+            if start is None or end is None or end < start:
+                continue
+            new_ent = copy.copy(ent)
+            new_ent.offset = _u16_len(new_text[:start])
+            new_ent.length = _u16_len(new_text[start:end + 1])
+            url = getattr(new_ent, "url", None)
+            if url:
+                new_ent.url = self._clean_links(url)
+            result.append(new_ent)
+        return result
 
     def _find_dup(self, trigger, mode, case, entries=None):
         for entry in entries if entries is not None else (self._get("entries", []) or []):
@@ -484,13 +578,17 @@ class TriggerChangerMod(loader.Module):
             for key in oldest[: len(self._undo) - MAX_UNDO]:
                 self._undo.pop(key, None)
 
-    def _remember_undo(self, message, orig, deleted=False):
+    def _remember_undo(self, message, orig, deleted=False, photo_msg=None):
         key = f"{message.chat_id}:{message.id}"
         self._undo[key] = {
             "msg": message,
             "orig": orig,
             "ts": time.time(),
             "deleted": deleted,
+            # без них откат вернёт голый текст и оставит картинку висеть в чате
+            "ents": list(getattr(message, "entities", None) or []),
+            "reply_to": getattr(message, "reply_to_msg_id", None),
+            "photo_msg": photo_msg,
         }
         self._prune_undo()
         return key
@@ -532,18 +630,30 @@ class TriggerChangerMod(loader.Module):
             await call.answer("поздно — правка уже забыта", alert=True)
             await call.delete()
             return
+        ents = entry.get("ents") or []
         try:
             # текст сообщения не парсим как HTML: в нём может быть «<3» или «&»
             if entry.get("deleted"):
-                # удалённое сообщение не отредактировать — шлём текст заново
-                await entry["msg"].respond(entry["orig"], parse_mode=lambda t: (t, ()))
+                # удалённое сообщение не отредактировать — шлём текст заново,
+                # в тот же тред, ответом на то же сообщение
+                await entry["msg"].respond(
+                    entry["orig"],
+                    parse_mode=lambda t: (t, ents),
+                    reply_to=entry.get("reply_to"),
+                )
             else:
-                await entry["msg"].edit(entry["orig"], parse_mode=lambda t: (t, ()))
+                await entry["msg"].edit(entry["orig"], parse_mode=lambda t: (t, ents))
         except Exception as exc:
             logger.warning("[TriggerChanger] revert failed (%s): %r", key, exc)
             await call.answer(f"не откатилось: {exc}"[:ALERT_MAX], alert=True)
             await call.delete()
             return
+        photo_msg = entry.get("photo_msg")
+        if photo_msg is not None:
+            try:
+                await photo_msg.delete()
+            except Exception as exc:
+                logger.info("[TriggerChanger] картинку отката не удалить: %r", exc)
         await call.answer("откатил")
         await call.delete()
 
@@ -623,38 +733,44 @@ class TriggerChangerMod(loader.Module):
             photo_entries = [e for e in matched if e.get("pid")]
 
             gone = False
+            applied = False
             if new_text != text:
-                applied = False
                 if not new_text.strip() and message.media is None:
                     # правило вырезало весь текст — пустое сообщение не оставляем
-                    applied = True
                     try:
                         await message.delete()
                         gone = True
+                        applied = True
                     except Exception as exc:
                         logger.warning("[TriggerChanger] delete failed (msg %s): %r", message.id, exc)
                         return
                 elif 0 < len(new_text) <= 4096:
-                    applied = True
+                    ents = self._remap_entities(
+                        text, new_text, getattr(message, "entities", None) or []
+                    )
                     try:
-                        # parse_mode-колбэк отключает разбор HTML: в замене может
-                        # быть «<3» или «&», а клиент по умолчанию парсит текст
-                        await message.edit(new_text, parse_mode=lambda t: (t, ()))
+                        # parse_mode-колбэк отключает разбор HTML (в замене может
+                        # быть «<3») и возвращает сущности на новых местах
+                        await message.edit(new_text, parse_mode=lambda t: (t, ents))
+                        applied = True
                     except Exception as exc:
                         logger.warning("[TriggerChanger] edit failed (msg %s): %r", message.id, exc)
                         return
-                if applied:
-                    self._mark_edited(key)
-                    # без чата логов форма отката всё равно не уйдёт — нечего
-                    # держать в памяти объект сообщения
-                    if self.config["undo"] and self._logchat() is not None:
-                        await self._notify_undo(
-                            message, self._remember_undo(message, text, gone)
-                        )
 
+            photo_msg = None
             if photo_entries:
-                if await self._send_rule_photo(message, photo_entries[0], gone):
+                photo_msg = await self._send_rule_photo(message, photo_entries[0], gone)
+                if photo_msg is not None:
                     self._mark_edited(key)
+
+            if applied:
+                self._mark_edited(key)
+                # без чата логов форма отката всё равно не уйдёт — нечего
+                # держать в памяти объект сообщения
+                if self.config["undo"] and self._logchat() is not None:
+                    await self._notify_undo(
+                        message, self._remember_undo(message, text, gone, photo_msg)
+                    )
         except Exception as exc:
             logger.exception("[TriggerChanger] watcher error: %r", exc)
 
@@ -669,15 +785,14 @@ class TriggerChangerMod(loader.Module):
         cached = self._photo_cache.get(pid)
         if cached is not None:
             try:
-                await send(file=cached)
-                return True
+                return await send(file=cached)
             except Exception as exc:
                 # ссылка на файл могла протухнуть — шлём байты и обновляем кэш
                 logger.info("[TriggerChanger] кэш фото %s не сработал (%r)", pid, exc)
                 self._photo_cache.pop(pid, None)
         b64 = self._photo_b64(entry)
         if not b64:
-            return False
+            return None
         try:
             bio = io.BytesIO(base64.b64decode(b64))
             # без имени Telethon шлёт поток безымянным документом
@@ -685,11 +800,11 @@ class TriggerChangerMod(loader.Module):
             sent = await send(file=bio)
         except Exception as exc:
             logger.warning("[TriggerChanger] photo send failed: %r", exc)
-            return False
+            return None
         media = getattr(sent, "photo", None) or getattr(sent, "document", None)
         if media is not None:
             self._photo_cache[pid] = media
-        return True
+        return sent
 
     def _mark_edited(self, key):
         self._edited[key] = time.time()
@@ -706,6 +821,10 @@ class TriggerChangerMod(loader.Module):
     # ---------- визард ----------
 
     async def _set_photo(self, state, message):
+        # размер виден до скачивания: не тянем в память dyno заведомо огромное
+        size = getattr(getattr(message, "file", None), "size", None)
+        if size and size > MAX_PHOTO:
+            return False, f"картинка больше {MAX_PHOTO // 1024 // 1024} МБ."
         try:
             data = await message.download_media(bytes)
         except Exception as exc:
@@ -750,7 +869,9 @@ class TriggerChangerMod(loader.Module):
             await utils.answer(
                 message,
                 "⚠️ Такие триггеры уже есть — ничего не добавил. "
-                "Удали старые: <code>.replist</code>, потом <code>.repdel &lt;id&gt;</code>.",
+                "Смотри <code>.replist</code>, удаляй через <code>.repdel &lt;id&gt;</code>."
+                if skipped
+                else "⚠️ В триггере одни запятые — сохранять нечего.",
             )
             return
         self._store_entries(entries)
@@ -768,10 +889,14 @@ class TriggerChangerMod(loader.Module):
             flags.append("только в конце")
         flag_str = f" <i>({', '.join(flags)})</i>" if flags else ""
         photo_str = "\n🖼 Картинка: прикреплена" if pid else ""
-        skip_str = (
-            f"\n⚠️ Уже были, пропустил: <code>{utils.escape_html(', '.join(skipped))}</code>"
-            if skipped else ""
-        )
+        if skipped:
+            shown = ", ".join(self._preview(t, 40) for t in skipped[:10])
+            more = f" и ещё {len(skipped) - 10}" if len(skipped) > 10 else ""
+            skip_str = (
+                f"\n⚠️ Уже были, пропустил: <code>{utils.escape_html(shown)}</code>{more}"
+            )
+        else:
+            skip_str = ""
         repl = state.get("repl")
         if repl is None:
             repl_str = "<i>(без текста)</i>"
@@ -781,10 +906,12 @@ class TriggerChangerMod(loader.Module):
             repl_str = f"<code>{utils.escape_html(self._preview(repl, 100))}</code>"
 
         if len(added) > 1:
-            ids = ", ".join(f"#{e['id']}" for e in added)
+            ids = ", ".join(f"#{e['id']}" for e in added[:20])
+            if len(added) > 20:
+                ids += f" … +{len(added) - 20}"
             trig = ", ".join(
                 f"<code>{utils.escape_html(self._preview(e['trigger'], 60))}</code>"
-                for e in added
+                for e in added[:20]
             )
             await utils.answer(
                 message,
@@ -825,18 +952,30 @@ class TriggerChangerMod(loader.Module):
 
         if step == "trigger":
             trigger = stripped
+            mode, case = state["mode"], state["case"]
             if not trigger:
                 await utils.answer(
                     message, "⚠️ Пустой триггер. Напиши его ответом или «отмена»."
                 )
                 return
-            dup = self._find_dup(trigger, state["mode"], state["case"])
-            if dup is not None:
-                self._pending.pop(uid, None)
+            parts = self._split_triggers(trigger, mode)
+            if not parts:
                 await utils.answer(
                     message,
-                    f"⚠️ Такой триггер уже есть (<code>#{dup['id']}</code>). "
-                    f"Сначала удали: <code>.repdel {dup['id']}</code>",
+                    "⚠️ В триггере одни запятые — сохранять нечего. "
+                    "Напиши его заново или «отмена».",
+                )
+                return
+            dup = self._find_dup(trigger, mode, case)
+            if dup is not None or all(
+                self._find_dup(p, mode, case) is not None for p in parts
+            ):
+                self._pending.pop(uid, None)
+                rid = dup["id"] if dup else self._find_dup(parts[0], mode, case)["id"]
+                await utils.answer(
+                    message,
+                    f"⚠️ Такой триггер уже есть (<code>#{rid}</code>). "
+                    f"Сначала удали: <code>.repdel {rid}</code>",
                 )
                 return
             if state["mode"] == "regex":
@@ -1122,6 +1261,8 @@ class TriggerChangerMod(loader.Module):
         await self._menu_render(call, text, markup)
 
     async def _menu_page(self, call, page):
+        # ушёл со страницы/карточки — картинку для правила уже не ждём
+        self._photo_wait.pop(call.sender_id, None)
         text, markup, _ = self._menu_list(page)
         await self._menu_render(call, text, markup)
 
@@ -1138,12 +1279,16 @@ class TriggerChangerMod(loader.Module):
     async def _menu_close(self, call):
         # закрыл меню — значит и картинку для правила уже не ждём,
         # иначе следующее фото юзера прилипнет к правилу
-        self._photo_wait.pop(call.sender_id, None)
-        self._menu_forms.pop(call.sender_id, None)
+        self._menu_state_clear(call.sender_id)
         try:
             await call.delete()
         except Exception as exc:
             logger.warning("[TriggerChanger] menu close failed: %r", exc)
+
+    def _menu_state_clear(self, uid):
+        self._photo_wait.pop(uid, None)
+        self._menu_forms.pop(uid, None)
+        self._menu_chat.pop(uid, None)
 
     async def _menu_mode(self, call, uid):
         entries, entry = self._menu_entry(uid)
@@ -1227,6 +1372,9 @@ class TriggerChangerMod(loader.Module):
             entries.append(entry)
             added.append(entry)
         if not added:
+            if not skipped:
+                await self._menu_answer(call, "в триггере одни запятые", True)
+                return
             dup = self._find_dup(skipped[0], "sub", False, entries)
             await self._menu_answer(
                 call, f"такой триггер уже есть (#{dup['id'] if dup else '?'})", True
@@ -1362,6 +1510,9 @@ class TriggerChangerMod(loader.Module):
     async def repmenu(self, message):
         """Inline menu: browse and edit rules with buttons"""
         uid = message.sender_id
+        # меню могло остаться от прошлого чата: старое ожидание картинки не должно
+        # переживать новое открытие
+        self._menu_state_clear(uid)
         text, markup, _ = self._menu_list(1)
         try:
             form = await self.inline.form(
@@ -1370,7 +1521,7 @@ class TriggerChangerMod(loader.Module):
                 reply_markup=markup,
                 ttl=FORM_TTL,
                 force_me=True,
-                on_unload=lambda *_: self._menu_forms.pop(uid, None),
+                on_unload=lambda *_: self._menu_state_clear(uid),
             )
         except Exception as exc:
             logger.warning("[TriggerChanger] menu form failed: %r", exc)
@@ -1465,6 +1616,9 @@ class TriggerChangerMod(loader.Module):
                     return
             dup = self._find_dup(trigger, mode, case)
             parts = self._split_triggers(trigger, mode)
+            if not parts:
+                await utils.answer(message, "⚠️ В триггере одни запятые — сохранять нечего.")
+                return
             if dup is not None:
                 await utils.answer(
                     message,
