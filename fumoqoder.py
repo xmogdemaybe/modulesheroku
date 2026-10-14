@@ -142,7 +142,12 @@ class FumoQoder(loader.Module):
         # On a fresh install last_post_ts is 0; anchor to now so enabling autopost
         # doesn't instantly fire a post before the user has set a target.
         last_ts = self._get("last_post_ts", 0.0) or time.time()
-        self._next_post = last_ts + self._get("interval", DEFAULT_INTERVAL)
+        if self._get("schedule_mode", False):
+            # Check Telegram's real queue on the first tick (it won't double-post:
+            # _tick_schedule no-ops while a future post is already queued).
+            self._next_post = 0
+        else:
+            self._next_post = last_ts + self._get("interval", DEFAULT_INTERVAL)
         self._task = asyncio.create_task(self._loop())
 
     async def on_unload(self):
@@ -510,6 +515,12 @@ class FumoQoder(loader.Module):
             compatible = [p for p in posts if p["ext"] in ALBUM_OK_EXTS]
             if compatible:
                 posts = compatible
+                album = len(posts) > 1
+            else:
+                # Nothing album-safe was picked: send a single one (as a document if
+                # it's .webp/oversized) rather than crashing on an invalid media group.
+                posts = posts[:1]
+                album = False
 
         try:
             files, sent, sizes = [], [], []
@@ -760,13 +771,18 @@ class FumoQoder(loader.Module):
             self._next_post = fire_at
         except FloodWaitError as exc:
             logger.warning("[FumoQoder] FloodWait %ss", exc.seconds)
-            self._set("sched_pending", now + exc.seconds + 30)
+            self._backoff(now + exc.seconds + 30)
         except (ChatWriteForbiddenError, ChatAdminRequiredError) as exc:
             logger.warning("[FumoQoder] cannot write to target: %r", exc)
-            self._set("sched_pending", now + 300)
+            self._backoff(now + 300)
         except Exception as exc:
             logger.error("[FumoQoder] schedule failed: %r", exc)
-            self._set("sched_pending", now + 60)
+            self._backoff(now + 60)
+
+    def _backoff(self, ts: float):
+        """Push the loop gate forward so a failing tick doesn't retry every 15s."""
+        self._set("sched_pending", ts)
+        self._next_post = ts
 
     # ---------- commands ----------
 
