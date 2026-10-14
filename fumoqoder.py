@@ -2,10 +2,10 @@
 # requires: aiohttp curl_cffi
 # FumoQoder — random Touhou fumo autoposter for Hikka / Heroku.
 #
-# Sources (tried in random order, then fallbacks):
+# Sources (all fetched together and mixed, unless a single one is requested):
 #   Safebooru / Konachan             -> boorus (safe-only)
-#   Reddit (r/Fumofumo)              -> fallback; listing via direct JSON or the
-#                                       Arctic Shift archive (.fumoredditmode)
+#   Reddit (r/Fumofumo)              -> toggleable source; listing via direct JSON or
+#                                       the Arctic Shift archive (.fumoredditmode)
 #
 # Commands:
 #   .fumo on|off                 toggle autoposting
@@ -17,7 +17,7 @@
 #   .fumotags [source] [tags]    per-source search tags (show if no args)
 #   .fumoexclude <tags>          global minus-tag blacklist for boorus
 #   .fumokonachan net|com        konachan.net (safe) / konachan.com (R-18, filtered)
-#   .fumoreddit on|off           toggle Reddit fallback source
+#   .fumoreddit on|off           toggle the Reddit source
 #   .fumoredditmedia pics|videos|all   what to fetch from Reddit
 #   .fumoredditauth <id> <secret>      Reddit OAuth app credentials (403 fallback)
 #   .fumoredditcookie <cookie>         browser cookie for Reddit (403 fallback)
@@ -61,6 +61,8 @@ try:
 except ImportError:  # very old forks
     GetScheduledHistoryRequest = None
 
+from telethon import utils as tl_utils
+
 from .. import loader, utils
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,13 @@ SAFE_EXTS = {
 }
 EXT_MIME = {**SAFE_EXTS, ".mp4": "video/mp4"}
 MAX_COUNT = 10
+# Telegram rejects photos larger than 10 MB (UploadPhoto); such images are sent
+# as documents instead. Albums also can't mix photos with stickers (.webp) or
+# GIFs, so only these extensions are eligible for a multi-file album.
+MAX_PHOTO_SIZE = 10 * 1024 * 1024
+PHOTO_EXTS = {".jpg", ".png"}
+ALBUM_OK_EXTS = {".jpg", ".png", ".mp4"}
+CAPTION_LIMIT = 1024
 
 # Sensible per-source defaults (Safebooru uses fumo_(doll); Konachan needs a
 # broader tag). Override any of them with: .fumotags <source> <tags>
@@ -120,7 +129,7 @@ SOURCE_MAP = {
 
 @loader.tds
 class FumoQoder(loader.Module):
-    """Random Touhou fumo autoposter (Safebooru / Konachan + Reddit fallback)"""
+    """Random Touhou fumo autoposter (Safebooru / Konachan / Reddit, mixed)"""
 
     strings = {"name": "FumoQoder"}
 
@@ -129,9 +138,11 @@ class FumoQoder(loader.Module):
         self.db = db
         self._session: Optional[aiohttp.ClientSession] = None
         self._stopping = False
-        self._next_post = self._get("last_post_ts", 0.0) + self._get(
-            "interval", DEFAULT_INTERVAL
-        )
+        self._inflight: set = set()
+        # On a fresh install last_post_ts is 0; anchor to now so enabling autopost
+        # doesn't instantly fire a post before the user has set a target.
+        last_ts = self._get("last_post_ts", 0.0) or time.time()
+        self._next_post = last_ts + self._get("interval", DEFAULT_INTERVAL)
         self._task = asyncio.create_task(self._loop())
 
     async def on_unload(self):
@@ -235,16 +246,22 @@ class FumoQoder(loader.Module):
         domain = self._get("konachan_domain", "konachan.net") or "konachan.net"
         tags = self._booru_tags("konachan")
         for page in self._page_candidates(3, 1):
-            posts = [
-                {
-                    "id": f"kn_{p.get('id')}", "url": p["file_url"], "src": "Konachan",
+            posts = []
+            for p in await self._moebooru(f"https://{domain}/post.json", tags, page):
+                if not isinstance(p, dict) or not p.get("file_url"):
+                    continue
+                if domain != "konachan.net" and p.get("rating") != "s":
+                    continue
+                url = p["file_url"]
+                if url.startswith("//"):
+                    url = "https:" + url
+                elif url.startswith("/"):
+                    url = f"https://{domain}" + url
+                posts.append({
+                    "id": f"kn_{p.get('id')}", "url": url, "src": "Konachan",
                     "post_url": f"https://{domain}/post/show/{p.get('id')}",
                     "tags": tags,
-                }
-                for p in await self._moebooru(f"https://{domain}/post.json", tags, page)
-                if isinstance(p, dict) and p.get("file_url")
-                and (domain == "konachan.net" or p.get("rating") == "s")
-            ]
+                })
             if posts:
                 return posts
         return []
@@ -265,6 +282,9 @@ class FumoQoder(loader.Module):
         ) as resp:
             resp.raise_for_status()
             payload = await resp.json(content_type=None)
+        if not isinstance(payload, dict) or "access_token" not in payload:
+            err = payload.get("error") if isinstance(payload, dict) else payload
+            raise RuntimeError(f"reddit oauth failed: {err!r}")
         self._rd_token = payload["access_token"]
         self._rd_token_exp = now + int(payload.get("expires_in", 3600))
         return self._rd_token
@@ -275,6 +295,10 @@ class FumoQoder(loader.Module):
         posts = []
         for d in items:
             if not isinstance(d, dict):
+                continue
+            # Never leak 18+ posts: the module is safe-only by design, and the user
+            # can point .fumosub at any subreddit.
+            if d.get("over_18"):
                 continue
             img = d.get("url_overridden_by_dest") or d.get("url") or ""
             video = ((d.get("secure_media") or {}).get("reddit_video") or {}).get("fallback_url") or ""
@@ -388,7 +412,7 @@ class FumoQoder(loader.Module):
         return getattr(self, SOURCE_MAP[name.lower()])
 
     def _active_sources(self) -> list:
-        """Boorus (shuffled) first, then the optional Reddit fallback."""
+        """Boorus plus the optional Reddit source; all are fetched and mixed."""
         boorus = [self._src_safebooru, self._src_konachan]
         random.shuffle(boorus)
         sources = list(boorus)
@@ -406,6 +430,7 @@ class FumoQoder(loader.Module):
         Raises only when nothing at all could be picked; a partial result is fine.
         """
         history = set(self._get("history", []) or [])
+        self._inflight = getattr(self, "_inflight", set())
         picked, errors = [], []
         sources = [self._source_by_name(source)] if source else self._active_sources()
 
@@ -428,11 +453,14 @@ class FumoQoder(loader.Module):
             if len(picked) >= count:
                 break
             ext = self._ext(p["url"])
-            if not ext or p["id"] in history or p["id"] in chosen_ids:
+            pid = p["id"]
+            if not ext or pid in history or pid in chosen_ids or pid in self._inflight:
                 continue
             p["ext"] = ext
-            chosen_ids.add(p["id"])
-            self._push_history(p["id"])
+            chosen_ids.add(pid)
+            # Reserve in memory only; the id is written to the db history in _send
+            # AFTER a successful send, so a failed download/post can be retried.
+            self._inflight.add(pid)
             picked.append(p)
         if not picked:
             errors.append("no-fresh")
@@ -442,9 +470,13 @@ class FumoQoder(loader.Module):
     async def _safe_fetch(self, src):
         return await src()
 
-    def _push_history(self, post_id: str):
+    def _commit_history(self, ids: list):
+        """Persist sent-post ids in a single db write (called after a successful send)."""
+        ids = [i for i in ids if i]
+        if not ids:
+            return
         history = self._get("history", []) or []
-        history.append(post_id)
+        history.extend(ids)
         self._set("history", history[-MAX_HISTORY:])
 
     async def _download(self, url: str) -> bytes:
@@ -469,43 +501,72 @@ class FumoQoder(loader.Module):
             count = self._get("count", 1)
         count = max(1, min(MAX_COUNT, int(count or 1)))
         posts = await self._pick_posts(count, source)
+        reserved = [p["id"] for p in posts]
 
-        files, sent = [], []
-        last_err = None
-        for post in posts:
-            data = None
-            for _ in range(3):
-                try:
-                    data = await self._download(post["url"])
-                    break
-                except Exception as exc:
-                    last_err = exc
-                    logger.warning("[FumoQoder] download failed for %s: %r", post["url"], exc)
-            if data is None:
-                continue
-            logger.info("[FumoQoder] RAW POST %r", post)
-            file = BytesIO(data)
-            file.name = f"fumo_{post['id']}{post['ext']}"
-            files.append(file)
-            sent.append(post)
-        if not files:
-            raise RuntimeError(f"download failed: {last_err}")
+        # Albums can't mix photos with stickers (.webp) or GIFs — keep only the
+        # Telegram-safe set for multi-file sends.
+        album = count > 1
+        if album:
+            compatible = [p for p in posts if p["ext"] in ALBUM_OK_EXTS]
+            if compatible:
+                posts = compatible
 
-        kwargs = {}
-        if len(files) == 1:
-            kwargs["mime_type"] = EXT_MIME[sent[0]["ext"]]
-        if schedule:
-            # Telegram publishes it server-side at that moment, even if the userbot
-            # is offline — this is the native "Scheduled Messages" feature.
-            kwargs["schedule"] = datetime.fromtimestamp(schedule, timezone.utc)
-        num = int(self._get("post_num", 0) or 0) + 1
-        msg = await self.client.send_file(
-            entity, files[0] if len(files) == 1 else files,
-            caption=self._caption(sent, num), **kwargs,
-        )
+        try:
+            files, sent, sizes = [], [], []
+            last_err = None
+            for post in posts:
+                data = None
+                for _ in range(3):
+                    try:
+                        data = await self._download(post["url"])
+                        break
+                    except Exception as exc:
+                        last_err = exc
+                        logger.warning("[FumoQoder] download failed for %s: %r", post["url"], exc)
+                if data is None:
+                    continue
+                size = len(data)
+                # In an album a photo over 10 MB can't be sent and can't be turned
+                # into a document (that would break the media group) — skip it.
+                if album and post["ext"] in PHOTO_EXTS and size > MAX_PHOTO_SIZE:
+                    logger.info("[FumoQoder] skipping %s: photo > 10MB in album", post["id"])
+                    continue
+                logger.debug("[FumoQoder] RAW POST %r", post)
+                file = BytesIO(data)
+                file.name = f"fumo_{post['id']}{post['ext']}"
+                files.append(file)
+                sent.append(post)
+                sizes.append(size)
+            if not files:
+                raise RuntimeError(f"download failed: {last_err}")
+
+            kwargs = {}
+            if len(files) == 1:
+                ext = sent[0]["ext"]
+                # .webp is treated as a sticker (no caption) and an oversized photo
+                # is rejected by UploadPhoto — send both as a document instead.
+                as_doc = ext == ".webp" or (ext in PHOTO_EXTS and sizes[0] > MAX_PHOTO_SIZE)
+                if not as_doc:
+                    kwargs["mime_type"] = EXT_MIME.get(ext)
+                kwargs["force_document"] = as_doc
+            if schedule:
+                # Telegram publishes it server-side at that moment, even if the userbot
+                # is offline — this is the native "Scheduled Messages" feature.
+                kwargs["schedule"] = datetime.fromtimestamp(schedule, timezone.utc)
+            num = int(self._get("post_num", 0) or 0) + 1
+            msg = await self.client.send_file(
+                entity, files[0] if len(files) == 1 else files,
+                caption=self._caption(sent, num), **kwargs,
+            )
+        finally:
+            # Release the in-memory reservation regardless of outcome; only ids we
+            # actually sent get persisted to history below.
+            for pid in reserved:
+                self._inflight.discard(pid)
 
         # For a scheduled post, "now" is really its future publish time.
         stamp = schedule if schedule else time.time()
+        self._commit_history([p["id"] for p in sent])
         self._set("post_num", num)
         self._set("last_post_ts", stamp)
         self._set("last_source", sent[0]["src"])
@@ -544,9 +605,13 @@ class FumoQoder(loader.Module):
             return t
 
         parts = []
-        custom = render(self._get("caption", "") or "")
+        # Escape the user's template too, so a literal '<' (e.g. "<3") can't break
+        # Telegram's HTML caption parser; placeholders are then filled with
+        # already-escaped values.
+        raw_custom = self._get("caption", "") or ""
+        custom = render(utils.escape_html(raw_custom))
         # Post counter: prepended unless the custom caption already uses {num}.
-        if num is not None and "{num}" not in (self._get("caption", "") or ""):
+        if num is not None and "{num}" not in raw_custom:
             parts.append(f"<b>#{num}</b>")
         if custom:
             parts.append(custom)
@@ -563,7 +628,11 @@ class FumoQoder(loader.Module):
                     for i, p in enumerate(posts, 1)
                 ]
                 parts.append("\n".join(lines))
-        return "\n\n".join(parts)
+        caption = "\n\n".join(parts)
+        # Media captions are capped at 1024 chars; a 10-post album footer can exceed it.
+        if len(caption) > CAPTION_LIMIT:
+            caption = caption[:CAPTION_LIMIT - 1] + "\u2026"
+        return caption
 
     # ---------- target ----------
 
@@ -579,10 +648,13 @@ class FumoQoder(loader.Module):
         await asyncio.sleep(10)
         while not self._stopping:
             try:
-                if self._get("enabled", False):
+                # Gate BOTH modes on _next_post so we never hit Telegram every 15s:
+                # in schedule mode a tick does get_entity + GetScheduledHistory RPCs,
+                # which would otherwise run 5760 times a day and trigger FloodWait.
+                if self._get("enabled", False) and time.time() >= self._next_post:
                     if self._get("schedule_mode", False):
                         await self._tick_schedule()
-                    elif time.time() >= self._next_post:
+                    else:
                         await self._tick_live()
             except asyncio.CancelledError:
                 raise
@@ -620,9 +692,9 @@ class FumoQoder(loader.Module):
     def _next_fire(self, base: float, now: Optional[float] = None) -> float:
         """When to publish the next post, given the last (already queued) one at `base`.
 
-        With a `.fumotime` HH:MM set, the post goes on the next date at that local
-        wall-clock time (spacing in whole days derived from the interval), rolled
-        forward until it is in the future; otherwise it is simply `base + interval`.
+        With a `.fumotime` HH:MM set, the post goes at that local wall-clock time on
+        the next date it falls in the future (spacing in whole days derived from the
+        interval); otherwise it is simply `base + interval`.
         """
         interval = self._get("interval", DEFAULT_INTERVAL)
         hm = self._parse_post_time()
@@ -634,9 +706,10 @@ class FumoQoder(loader.Module):
         hh, mm = hm
         days = max(1, int(round(interval / 86400)))
         base_dt = datetime.fromtimestamp(base, tz=timezone.utc).astimezone()
-        cand = (base_dt + timedelta(days=days)).replace(
-            hour=hh, minute=mm, second=0, microsecond=0
-        )
+        # Start from the SAME date at HH:MM, then roll forward in whole-day steps
+        # until it's strictly in the future — so an empty queue at 06:00 with
+        # .fumotime 07:00 fires today at 07:00, not tomorrow.
+        cand = base_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
         floor = now if now is not None else base
         while cand.timestamp() <= floor:
             cand += timedelta(days=days)
@@ -733,10 +806,15 @@ class FumoQoder(loader.Module):
                     f"<code>{utils.escape_html(str(exc))}</code>",
                 )
                 return
-            stored = entity.id
+            # Store the marked peer id (-100... for channels), not the bare entity.id,
+            # or get_entity() would later resolve it as a user and fail after a restart.
+            stored = tl_utils.get_peer_id(entity)
         elif message.is_reply:
             reply = await message.get_reply_message()
-            entity, stored = reply.chat, reply.chat_id
+            if reply is None:
+                entity, stored = await message.get_chat(), message.chat_id
+            else:
+                entity, stored = reply.chat, reply.chat_id
         else:
             entity, stored = await message.get_chat(), message.chat_id
         self._set("target", stored)
@@ -761,14 +839,14 @@ class FumoQoder(loader.Module):
                 seconds = int(float(args[:-1]))
             else:
                 seconds = int(float(args) * 60)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             await utils.answer(message, "\u26A0\uFE0F <b>Example:</b> <code>.fumointerval 30m</code>")
             return
         if not MIN_INTERVAL <= seconds <= MAX_INTERVAL:
             await utils.answer(message, "\u26A0\uFE0F <b>Interval: 1 minute .. 7 days.</b>")
             return
         self._set("interval", seconds)
-        self._next_post = self._get("last_post_ts", 0.0) + seconds
+        self._next_post = (self._get("last_post_ts", 0.0) or time.time()) + seconds
         await utils.answer(message, f"\u23F1 <b>Interval:</b> <code>{fmt_interval(seconds)}</code>")
 
     @loader.command(
@@ -843,11 +921,11 @@ class FumoQoder(loader.Module):
         await utils.answer(message, f"\U0001F6AB <b>Exclude:</b> <code>{shown}</code>")
 
     @loader.command(
-        ru_doc="Вкл/выкл Reddit как страховочный источник: .fumoreddit on/off",
-        en_doc="Toggle Reddit fallback source: .fumoreddit on/off",
+        ru_doc="Вкл/выкл Reddit как источник (миксуется с booru): .fumoreddit on/off",
+        en_doc="Toggle the Reddit source (mixed with the boorus): .fumoreddit on/off",
     )
     async def fumoreddit(self, message):
-        """Toggle the Reddit fallback source"""
+        """Toggle the Reddit source (mixed in with the boorus)"""
         args = utils.get_args_raw(message).lower()
         if args in ("on", "1", "enable"):
             self._set("reddit", True)
@@ -858,7 +936,7 @@ class FumoQoder(loader.Module):
             await utils.answer(message, f"<b>Reddit:</b> {state}\n<code>.fumoreddit on|off</code>")
             return
         state = "on" if self._get("reddit", True) else "off"
-        await utils.answer(message, f"\U0001F4E1 <b>Reddit fallback:</b> {state}")
+        await utils.answer(message, f"\U0001F4E1 <b>Reddit source:</b> {state}")
 
     @loader.command(
         ru_doc="Сабреддит: .fumosub Fumofumo (пусто — сброс)",
@@ -883,6 +961,7 @@ class FumoQoder(loader.Module):
         if args in ("on", "1", "enable"):
             self._set("schedule_mode", True)
             self._set("sched_pending", 0)
+            self._next_post = 0  # let the gated loop queue the first post promptly
             await utils.answer(
                 message, "\U0001F4C5 <b>Schedule mode ON.</b> Next posts go to "
                 "Telegram's Scheduled Messages queue (published even if the bot is offline)."
@@ -890,8 +969,10 @@ class FumoQoder(loader.Module):
         elif args in ("off", "0", "disable"):
             self._set("schedule_mode", False)
             self._set("sched_pending", 0)
+            self._next_post = time.time() + self._get("interval", DEFAULT_INTERVAL)
             await utils.answer(
-                message, "\U0001F4C5 <b>Schedule mode OFF.</b> Posts are sent live when due."
+                message, "\U0001F4C5 <b>Schedule mode OFF.</b> Posts are sent live when due. "
+                "<i>Note: messages already in Telegram's Scheduled queue are not removed.</i>"
             )
         else:
             state = "on" if self._get("schedule_mode", False) else "off"
@@ -1210,7 +1291,7 @@ class FumoQoder(loader.Module):
             "<code>.fumoexclude nude gore</code> — minus-tag blacklist for boorus\n"
             "<code>.fumokonachan net|com</code> — konachan.net (safe) / konachan.com (R-18, filtered)\n\n"
             "<b>Reddit</b>\n"
-            "<code>.fumoreddit on|off</code> — fallback source\n"
+            "<code>.fumoreddit on|off</code> — Reddit source (mixed with the boorus)\n"
             "<code>.fumosub Fumofumo</code> — subreddit\n"
             "<code>.fumoredditmedia pics|videos|all</code> — what to fetch\n"
             "<code>.fumoredditauth &lt;client_id&gt; &lt;client_secret&gt;</code> — OAuth app "
