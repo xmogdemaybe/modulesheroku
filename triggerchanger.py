@@ -13,6 +13,7 @@
 #   .reptoggle [on|off]            вкл/выкл автозамену
 #   .repclean [on|off]             вкл/выкл чистку ссылок от трекеров
 #   .represet да                   полный сброс: правила, картинки, настройки
+#   .replogs [id|off]              куда кидать форму отката (по умолчанию — чат логов Hikka)
 #   .reptest <текст>               проверить текст без отправки
 #
 # Режимы совпадения (флаги при добавлении):
@@ -71,6 +72,10 @@ TRACKER_PARAMS = {
 YT_PARAMS = {"si", "feature"}
 YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 URL_TAIL = ".,;:!?»'\""
+FORM_TTL = 900
+UNDO_TTL = 3600
+MAX_UNDO = 20
+LOG_MODULES = ("hikka_logs", "tester")
 
 
 @loader.tds
@@ -81,6 +86,7 @@ class TriggerChangerMod(loader.Module):
         "name": MODNAME,
         "cfg_enabled": "Автозамена в исходящих сообщениях",
         "cfg_clean_links": "Вырезать трекеры (si=, utm_*, fbclid и т.п.) из ссылок",
+        "cfg_undo": "Кидать в чат логов форму «↩️ откатить» после каждой автоправки",
     }
 
     def __init__(self):
@@ -97,6 +103,12 @@ class TriggerChangerMod(loader.Module):
                 lambda: self.strings("cfg_clean_links"),
                 validator=loader.validators.Boolean(),
             ),
+            loader.ConfigValue(
+                "undo",
+                True,
+                lambda: self.strings("cfg_undo"),
+                validator=loader.validators.Boolean(),
+            ),
         )
 
     async def client_ready(self, client, db):
@@ -104,6 +116,7 @@ class TriggerChangerMod(loader.Module):
         self.db = db
         self._pending = {}  # uid -> состояние визарда
         self._edited = {}  # msg_id -> ts, страховка от повторной обработки
+        self._undo = {}  # key -> {"msg", "orig", "ts} для отката автоправок
         # настройки жили в ключах БД — переносим в config, чтобы правда была одна
         for key in ("enabled", "clean_links"):
             old = self._get(key)
@@ -300,6 +313,94 @@ class TriggerChangerMod(loader.Module):
                 return entry
         return None
 
+    # ---------- откат автоправок ----------
+
+    def _logchat(self):
+        """Куда кидать форму отката: свой чат важнее, иначе берём hikka-логи."""
+        own = self._get("logchat")
+        if isinstance(own, int) and own:
+            return own
+        for name in LOG_MODULES:
+            try:
+                mod = self.lookup(name)
+            except Exception:
+                continue
+            chat = getattr(mod, "logchat", None)
+            if isinstance(chat, int) and chat:
+                return chat
+        return None
+
+    def _chat_name(self, message):
+        chat = getattr(message, "chat", None)
+        title = getattr(chat, "title", None)
+        if title:
+            return title
+        first = getattr(chat, "first_name", None)
+        return f"л/с {first}" if first else "?"
+
+    def _prune_undo(self):
+        cutoff = time.time() - UNDO_TTL
+        for key in [k for k, v in self._undo.items() if v["ts"] < cutoff]:
+            self._undo.pop(key, None)
+        if len(self._undo) > MAX_UNDO:
+            oldest = sorted(self._undo, key=lambda k: self._undo[k]["ts"])
+            for key in oldest[: len(self._undo) - MAX_UNDO]:
+                self._undo.pop(key, None)
+
+    def _remember_undo(self, message, orig):
+        self._prune_undo()
+        key = f"{getattr(message, 'chat_id', 0)}:{message.id}"
+        self._undo[key] = {"msg": message, "orig": orig, "ts": time.time()}
+        return key
+
+    async def _notify_undo(self, message, key):
+        """В TG летит только форма отката — остальное остаётся в терминале."""
+        chat = self._logchat()
+        if chat is None:
+            logger.info("[TriggerChanger] msg %s поправлено, но чат логов не задан", message.id)
+            return
+        entry = self._undo.get(key) or {}
+        header = (
+            "🔁 <b>TriggerChanger</b> поправил твоё сообщение\n"
+            f"<code>{utils.escape_html(entry.get('orig', ''))}</code>\n"
+            f"💬 <i>{utils.escape_html(self._chat_name(message))}</i>"
+        )
+        try:
+            await self.inline.form(
+                header + "\n\nОткатить правку?",
+                message=chat,
+                reply_markup=[[
+                    {"text": "↩️ откатить", "callback": self._inline_undo, "args": (key,)},
+                    {"text": "ок", "callback": self._inline_keep, "args": (key,)},
+                ]],
+                ttl=FORM_TTL,
+                force_me=True,
+                on_unload=lambda *_: self._undo.pop(key, None),
+            )
+        except Exception as exc:
+            logger.warning("[TriggerChanger] undo form failed: %r", exc)
+
+    async def _inline_undo(self, call, key):
+        entry = self._undo.pop(key, None)
+        if entry is None:
+            await call.answer("поздно — правка уже забыта", alert=True)
+            await call.delete()
+            return
+        try:
+            await entry["msg"].edit(entry["orig"])
+        except Exception as exc:
+            logger.warning("[TriggerChanger] revert failed (%s): %r", key, exc)
+            await call.answer(f"не откатилось: {exc}", alert=True)
+            await call.delete()
+            return
+        await call.answer("откатил")
+        await call.delete()
+
+    async def _inline_keep(self, call, key):
+        self._undo.pop(key, None)
+        await call.answer("ок")
+        await call.delete()
+
     # ---------- watcher ----------
 
     @loader.watcher()
@@ -344,6 +445,10 @@ class TriggerChangerMod(loader.Module):
                     self._edited = {
                         k: v for k, v in self._edited.items() if v > cutoff
                     }
+                if self.config["undo"]:
+                    await self._notify_undo(
+                        message, self._remember_undo(message, text)
+                    )
 
             photo_entries = [e for e in matched if e.get("pid")]
             if photo_entries:
@@ -525,11 +630,13 @@ class TriggerChangerMod(loader.Module):
         photos = sum(1 for e in entries if e.get("pid"))
         state = "🟢 вкл" if enabled else "🔴 выкл"
         clean = "🟢 вкл" if self.config["clean_links"] else "🔴 выкл"
+        undo = "🟢 вкл" if self.config["undo"] else "🔴 выкл"
         await utils.answer(
             message,
             f"🔁 <b>TriggerChanger</b> — {state}, правил: <code>{len(entries)}</code> "
             f"(с картинками: <code>{photos}</code>)\n"
-            f"🔗 Чистка ссылок от трекеров — {clean}\n\n"
+            f"🔗 Чистка ссылок от трекеров — {clean}\n"
+            f"↩️ Откат автоправок в чат логов — {undo}\n\n"
             "<code>.repadd &lt;триггер&gt; [-r|-w|-c|-n|-e]</code> — добавить замену (дальше по подсказкам)\n"
             "<code>.replist</code> — список правил\n"
             "<code>.repdel &lt;id|all&gt;</code> — удалить правило / всё\n"
@@ -792,14 +899,42 @@ class TriggerChangerMod(loader.Module):
             self._drop_photo(entry)
         self._store_entries([])
         self._set("photo_seq", 0)
+        self._set("logchat", None)
         self.config["enabled"] = True
         self.config["clean_links"] = False
         self._pending = {}
         self._edited = {}
+        self._undo = {}
         await utils.answer(
             message,
             f"♻️ Сброс: удалено правил <code>{count}</code>. Настройки по умолчанию "
             "(автозамена вкл, чистка ссылок выкл).",
+        )
+
+    @loader.command(
+        ru_doc="Куда кидать форму отката: .replogs [id|off]; без аргумента — текущий чат",
+        en_doc="Where to send undo forms: .replogs [id|off]; no args = current chat",
+    )
+    async def replogs(self, message):
+        """Set the chat that receives undo forms"""
+        raw = utils.get_args_raw(message).strip().lower()
+        if raw in ("off", "выкл", "auto"):
+            self._set("logchat", None)
+            await utils.answer(
+                message, "📁 Свой чат сброшен — беру чат логов Hikka (hikka-logs)."
+            )
+            return
+        target = message.chat_id
+        if raw:
+            if not re.fullmatch(r"-?\d+", raw):
+                await utils.answer(
+                    message, "❌ Нужен числовый id чата или <code>off</code>."
+                )
+                return
+            target = int(raw)
+        self._set("logchat", target)
+        await utils.answer(
+            message, f"📁 Формы отката будут приходить в <code>{target}</code>."
         )
 
     @loader.command(
