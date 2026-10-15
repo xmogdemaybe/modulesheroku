@@ -527,10 +527,26 @@ class FumoQoder(loader.Module):
         return bytes(data)
 
     def _ffmpeg(self) -> str:
-        """Absolute path to ffmpeg, or "" when it's not installed / not on PATH."""
-        if not hasattr(self, "_ffmpeg_path"):
-            self._ffmpeg_path = shutil.which("ffmpeg") or ""
-        return self._ffmpeg_path
+        """Absolute path to ffmpeg, or "" when it's not installed / not on PATH.
+
+        Not cached: on Termux $PREFIX/bin is already on the running process's PATH,
+        so a freshly installed ffmpeg is picked up without restarting the userbot.
+        """
+        return shutil.which("ffmpeg") or ""
+
+    @staticmethod
+    async def _kill(proc):
+        """Terminate a subprocess and reap it, so a timed-out ffmpeg leaves no zombie."""
+        if not proc or proc.returncode is not None:
+            return
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+        try:
+            await proc.wait()
+        except Exception:
+            pass
 
     async def _mux_video(self, post: dict) -> Optional[bytes]:
         """Fetch a Reddit video WITH audio by muxing its DASH (or HLS) stream.
@@ -567,11 +583,11 @@ class FumoQoder(loader.Module):
                     )
                     _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
                 except asyncio.TimeoutError:
-                    if proc:
-                        proc.kill()
+                    await self._kill(proc)
                     logger.warning("[FumoQoder] ffmpeg timed out for %s", post.get("id"))
                     continue
                 except Exception as exc:
+                    await self._kill(proc)
                     logger.warning("[FumoQoder] ffmpeg failed for %s: %r", post.get("id"), exc)
                     continue
                 if proc.returncode != 0:
@@ -1234,7 +1250,8 @@ class FumoQoder(loader.Module):
         note = ""
         if args in ("videos", "all") and not self._ffmpeg():
             note = ("\n\u26A0\uFE0F <b>ffmpeg not found</b> — Reddit videos will be skipped "
-                    "(they need it to restore the sound). Install: <code>winget install Gyan.FFmpeg</code>")
+                    "(they need it to restore the sound). How to install ffmpeg depends on "
+                    "the device/OS the userbot runs on.")
         await utils.answer(message, f"\U0001F4E1 <b>Reddit media:</b> <code>{args}</code>{note}")
 
     @loader.command(
