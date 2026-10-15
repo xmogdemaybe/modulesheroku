@@ -18,7 +18,8 @@
 #   .fumoexclude <tags>          global minus-tag blacklist for boorus
 #   .fumokonachan net|com        konachan.net (safe) / konachan.com (R-18, filtered)
 #   .fumoreddit on|off           toggle the Reddit source
-#   .fumoredditmedia pics|videos|all   what to fetch from Reddit
+#   .fumoredditmedia pics|videos|all   what to fetch from Reddit (videos need
+#                                       ffmpeg installed to restore their sound)
 #   .fumoredditauth <id> <secret>      Reddit OAuth app credentials (403 fallback)
 #   .fumoredditcookie <cookie>         browser cookie for Reddit (403 fallback)
 #   .fumoredditmode auto|json|arctic   listing via direct JSON or Arctic Shift archive
@@ -36,7 +37,10 @@
 import asyncio
 import json
 import logging
+import os
 import random
+import shutil
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -70,6 +74,7 @@ logger = logging.getLogger(__name__)
 
 MAX_HISTORY = 400
 MAX_IMAGE_SIZE = 20 * 1024 * 1024
+MAX_VIDEO_SIZE = 50 * 1024 * 1024
 MIN_INTERVAL = 60
 MAX_INTERVAL = 7 * 24 * 3600
 DEFAULT_INTERVAL = 3600
@@ -311,7 +316,8 @@ class FumoQoder(loader.Module):
             if d.get("over_18"):
                 continue
             img = d.get("url_overridden_by_dest") or d.get("url") or ""
-            video = ((d.get("secure_media") or {}).get("reddit_video") or {}).get("fallback_url") or ""
+            rv = (d.get("secure_media") or {}).get("reddit_video") or {}
+            video = rv.get("fallback_url") or ""
             is_video = bool(video) and media in ("videos", "all")
             if is_video:
                 img = video
@@ -322,11 +328,18 @@ class FumoQoder(loader.Module):
                 continue
             if media == "videos" and not is_video:
                 continue
-            posts.append({
+            item = {
                 "id": f"rd_{d.get('id')}", "url": img, "src": "Reddit",
                 "post_url": "https://reddit.com" + (d.get("permalink") or ""),
                 "tags": f"r/{sub}",
-            })
+            }
+            if is_video:
+                # Reddit serves video and audio as SEPARATE DASH tracks, so the
+                # plain fallback_url is muted. Keep the muxable stream URLs; _send
+                # merges them with ffmpeg to get the sound back.
+                item["video_dash"] = rv.get("dash_url") or ""
+                item["video_hls"] = rv.get("hls_url") or ""
+            posts.append(item)
         return posts
 
     async def _reddit_listing(self, sub: str) -> Any:
@@ -513,6 +526,75 @@ class FumoQoder(loader.Module):
             raise RuntimeError("empty response")
         return bytes(data)
 
+    def _ffmpeg(self) -> str:
+        """Absolute path to ffmpeg, or "" when it's not installed / not on PATH."""
+        if not hasattr(self, "_ffmpeg_path"):
+            self._ffmpeg_path = shutil.which("ffmpeg") or ""
+        return self._ffmpeg_path
+
+    async def _mux_video(self, post: dict) -> Optional[bytes]:
+        """Fetch a Reddit video WITH audio by muxing its DASH (or HLS) stream.
+
+        Reddit splits video and audio into separate tracks, so the direct link is
+        silent; ffmpeg merges them into one .mp4. Returns None when ffmpeg is
+        missing or every stream fails, so the caller can skip the post instead of
+        sending a muted video.
+        """
+        ff = self._ffmpeg()
+        if not ff:
+            return None
+        streams = [u for u in (post.get("video_dash"), post.get("video_hls")) if u]
+        if not streams:
+            return None
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        tmp.close()
+        try:
+            for src in streams:
+                cmd = [
+                    ff, "-y",
+                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                    "-user_agent", USER_AGENT,
+                    "-i", src,
+                    "-c", "copy", "-movflags", "+faststart",
+                    tmp.name,
+                ]
+                proc = None
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+                except asyncio.TimeoutError:
+                    if proc:
+                        proc.kill()
+                    logger.warning("[FumoQoder] ffmpeg timed out for %s", post.get("id"))
+                    continue
+                except Exception as exc:
+                    logger.warning("[FumoQoder] ffmpeg failed for %s: %r", post.get("id"), exc)
+                    continue
+                if proc.returncode != 0:
+                    logger.warning(
+                        "[FumoQoder] ffmpeg rc=%s for %s: %s",
+                        proc.returncode, post.get("id"), (err or b"")[-300:],
+                    )
+                    continue
+                with open(tmp.name, "rb") as fh:
+                    data = fh.read()
+                if not data:
+                    continue
+                if len(data) > MAX_VIDEO_SIZE:
+                    logger.info("[FumoQoder] muxed video > %dMB, skipping", MAX_VIDEO_SIZE // (1024 * 1024))
+                    return None
+                return data
+            return None
+        finally:
+            try:
+                os.remove(tmp.name)
+            except OSError:
+                pass
+
     async def _send(self, entity, source: Optional[str] = None, count: Optional[int] = None,
                     schedule: Optional[float] = None, is_test: bool = False) -> list:
         if count is None:
@@ -539,17 +621,27 @@ class FumoQoder(loader.Module):
             files, sent, sizes = [], [], []
             last_err = None
             for post in posts:
-                # In an album an oversized photo can't be sent at all, so cap the
-                # download at 10 MB and skip it early instead of pulling 20 MB first.
-                cap = MAX_PHOTO_SIZE if (album and post["ext"] in PHOTO_EXTS) else MAX_IMAGE_SIZE
                 data = None
-                for _ in range(3):
-                    try:
-                        data = await self._download(post["url"], max_size=cap)
-                        break
-                    except Exception as exc:
-                        last_err = exc
-                        logger.warning("[FumoQoder] download failed for %s: %r", post["url"], exc)
+                if post.get("video_dash") or post.get("video_hls"):
+                    # Reddit video: merge the separate DASH audio track back in with
+                    # ffmpeg. No ffmpeg (or a failed mux) means we skip it rather than
+                    # post a silent video.
+                    data = await self._mux_video(post)
+                    if data is None:
+                        last_err = RuntimeError("video skipped: ffmpeg missing or mux failed")
+                        logger.info("[FumoQoder] skipping video %s: no ffmpeg / mux failed", post["id"])
+                        continue
+                else:
+                    # In an album an oversized photo can't be sent at all, so cap the
+                    # download at 10 MB and skip it early instead of pulling 20 MB first.
+                    cap = MAX_PHOTO_SIZE if (album and post["ext"] in PHOTO_EXTS) else MAX_IMAGE_SIZE
+                    for _ in range(3):
+                        try:
+                            data = await self._download(post["url"], max_size=cap)
+                            break
+                        except Exception as exc:
+                            last_err = exc
+                            logger.warning("[FumoQoder] download failed for %s: %r", post["url"], exc)
                 if data is None:
                     continue
                 size = len(data)
@@ -1139,7 +1231,11 @@ class FumoQoder(loader.Module):
             )
             return
         self._set("reddit_media", args)
-        await utils.answer(message, f"\U0001F4E1 <b>Reddit media:</b> <code>{args}</code>")
+        note = ""
+        if args in ("videos", "all") and not self._ffmpeg():
+            note = ("\n\u26A0\uFE0F <b>ffmpeg not found</b> — Reddit videos will be skipped "
+                    "(they need it to restore the sound). Install: <code>winget install Gyan.FFmpeg</code>")
+        await utils.answer(message, f"\U0001F4E1 <b>Reddit media:</b> <code>{args}</code>{note}")
 
     @loader.command(
         ru_doc="Reddit OAuth: .fumoredditauth <client_id> <client_secret> (пусто — сброс)",
@@ -1313,6 +1409,7 @@ class FumoQoder(loader.Module):
             f"<b>Post time:</b> <code>{utils.escape_html(self._get('post_time', '') or '—')}</code>\n"
             f"<b>Sources:</b> <code>{utils.escape_html(', '.join(active))}</code>\n"
             f"<b>Reddit media:</b> <code>{utils.escape_html(self._get('reddit_media', 'pics'))}</code>\n"
+            f"<b>ffmpeg (video sound):</b> <code>{'found' if self._ffmpeg() else 'NOT found — videos skipped'}</code>\n"
             f"<b>Reddit mode:</b> <code>{utils.escape_html(self._get('reddit_mode', 'auto'))}</code>\n"
             f"<b>Reddit client:</b> <code>{'curl_cffi (chrome TLS)' if cffi_requests else 'aiohttp (install curl_cffi!)'}</code>\n"
             f"<b>Reddit auth:</b> {'set' if self._get('reddit_id', '') else 'anonymous'}\n"
