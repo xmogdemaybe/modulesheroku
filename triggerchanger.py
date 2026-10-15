@@ -38,6 +38,7 @@
 #      или картинкой — тогда замена будет картинкой без текста
 #   3) бот спросит про картинку: ответь "да" и пришли картинку, или "нет"
 #      -> если картинка есть, она отправляется ответом на сработавшее сообщение
+#         (если сработало несколько правил с картинками — одной каруселью)
 # "отмена" на любом шаге — отмена. Отвечать нужно в том же чате, где вызван
 # .repadd: в других чатах визард твои сообщения не перехватывает.
 # Если вырезание («-») съело весь текст сообщения — сообщение удалится, а откат
@@ -51,6 +52,8 @@
 #   Картинка — исключение: её кнопкой не передать, поэтому после «🖼 загрузить»
 #   пришли фото сообщением в тот же чат, где открыто меню (фото из других чатов
 #   модуль не подхватывает).
+# Меню живёт 15 минут, форма отката — 10: по истечении срока они удаляются сами
+# (иначе в чате остаются сообщения с мёртвыми кнопками).
 
 import asyncio
 import base64
@@ -69,6 +72,7 @@ MODNAME = "TriggerChanger"
 # Heroku на каждый db.set переписывает весь json и держит 15 ревизий в памяти,
 # поэтому картинка в base64 дороже, чем выглядит: 2 МБ файла -> ~2.7 МБ текста
 MAX_PHOTO = 2 * 1024 * 1024
+ALBUM_MAX = 10  # столько файлов телега пускает в одну карусель
 PER_PAGE = 30
 MENU_PER_PAGE = 8
 BTN_TEXT = 60  # телега режет подпись кнопки на 64 символах — оставляем запас
@@ -112,11 +116,18 @@ URL_TAIL = ".,;:!?»'\""
 FORM_TTL = 600
 # откат доступен ровно пока висит форма — дольше помнить бессмысленно
 UNDO_TTL = FORM_TTL
+# меню правил живёт дольше: в нём читают список и правят карточки
+MENU_TTL = 900
 MAX_UNDO = 20
 # inline.form() ждёт подтверждения от инлайн-бота без таймаута: если оно не
 # придёт, навсегда зависнет и команда, и watcher. Ограничиваем ожидание.
 FORM_OPEN = 20
 LOG_MODULES = ("hikka_logs", "tester")
+
+
+def _is_flood(exc):
+    """FloodWait: немедленный повтор только удлинит блокировку."""
+    return "flood" in type(exc).__name__.lower() or "flood" in str(exc).lower()
 
 
 def _u16_len(text):
@@ -166,7 +177,8 @@ class TriggerChangerMod(loader.Module):
         self._photo_wait = {}  # uid юзера -> (uid правила, ts, chat_id): ждём картинку
         self._menu_forms = {}  # uid -> открытое меню, чтобы обновить его из watcher
         self._menu_chat = {}  # uid -> чат, где открыто меню: там же ждём картинку
-        self._form_timers = {}  # key -> задача автоудаления формы отката
+        self._form_timers = {}  # key -> задача автоудаления формы
+        self._bg_tasks = set()  # фоновые задачи: без ссылки их съедает сборщик мусора
         # pid -> файл телеги: повторно слать готовый объект быстрее, чем каждый
         # раз загружать байты из БД заново
         self._photo_cache = {}
@@ -196,6 +208,9 @@ class TriggerChangerMod(loader.Module):
         for task in self._form_timers.values():
             task.cancel()
         self._form_timers = {}
+        for task in self._bg_tasks:
+            task.cancel()
+        self._bg_tasks = set()
 
     # ---------- БД ----------
 
@@ -253,10 +268,6 @@ class TriggerChangerMod(loader.Module):
         pid = f"p{seq}"
         self._set(f"photo:{pid}", data_b64)
         return pid
-
-    def _photo_b64(self, entry):
-        pid = entry.get("pid")
-        return self._get(f"photo:{pid}") if pid else None
 
     def _drop_photo(self, entry, entries=None):
         """Удалить картинку правила.
@@ -585,11 +596,30 @@ class TriggerChangerMod(loader.Module):
     def _prune_undo(self):
         cutoff = time.time() - UNDO_TTL
         for key in [k for k, v in self._undo.items() if v["ts"] < cutoff]:
-            self._undo.pop(key, None)
+            self._forget_undo(key)
         if len(self._undo) > MAX_UNDO:
             oldest = sorted(self._undo, key=lambda k: self._undo[k]["ts"])
             for key in oldest[: len(self._undo) - MAX_UNDO]:
-                self._undo.pop(key, None)
+                self._forget_undo(key)
+
+    def _forget_undo(self, key):
+        """Запись отката больше не нужна — забираем с собой и форму из чата логов.
+
+        Иначе при переполнении MAX_UNDO старые формы остались бы висеть до конца
+        времён: таймер удалён вместе с записью, а кнопок форк уже не помнит.
+        """
+        entry = self._undo.pop(key, None)
+        self._form_timer_cancel(key)
+        form = (entry or {}).get("form")
+        if form is not None:
+            self._spawn(self._kill_form(form))
+
+    def _spawn(self, coro):
+        """Фоновая задача со ссылкой на неё: иначе её может съесть сборщик мусора."""
+        task = asyncio.ensure_future(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     async def _open_form(self, *args, **kwargs):
         """inline.form() с ограниченным ожиданием: без подтверждения инлайн-бота
@@ -627,15 +657,20 @@ class TriggerChangerMod(loader.Module):
             pass
         return True
 
-    def _form_timer(self, key, form):
-        """Через FORM_TTL форма отката удалится сама: форк по ttl только забывает
-        кнопки, сообщение в чате оставляет навсегда."""
+    def _form_timer(self, key, form, delay, on_expire=None):
+        """Форма удалится сама через delay секунд.
+
+        Форк по истечении ttl только забывает кнопки, а сообщение в чате
+        оставляет навсегда — поэтому срок держим мы.
+        on_expire() вызывается в момент срока и может вернуть False, если форму
+        уже убрали кнопкой: тогда второй раз лезть в телегу не нужно.
+        """
 
         async def expire():
-            await asyncio.sleep(FORM_TTL)
+            await asyncio.sleep(delay)
             self._form_timers.pop(key, None)
-            if self._undo.pop(key, None) is None:
-                return  # кнопку уже нажали — форму убрали там
+            if on_expire is not None and not on_expire():
+                return
             await self._kill_form(form)
 
         self._form_timer_cancel(key)
@@ -646,17 +681,17 @@ class TriggerChangerMod(loader.Module):
         if task is not None:
             task.cancel()
 
-    def _remember_undo(self, message, orig, deleted=False, photo_msg=None):
+    def _remember_undo(self, message, orig, deleted=False, photo_msgs=None):
         key = f"{message.chat_id}:{message.id}"
         self._undo[key] = {
             "msg": message,
             "orig": orig,
             "ts": time.time(),
             "deleted": deleted,
-            # без них откат вернёт голый текст и оставит картинку висеть в чате
+            # без них откат вернёт голый текст и оставит карусель висеть в чате
             "ents": list(getattr(message, "entities", None) or []),
             "reply_to": getattr(message, "reply_to_msg_id", None),
-            "photo_msg": photo_msg,
+            "photo_msgs": list(photo_msgs or []),
         }
         self._prune_undo()
         return key
@@ -698,7 +733,9 @@ class TriggerChangerMod(loader.Module):
         if not form:
             return
         entry["form"] = form
-        self._form_timer(key, form)
+        self._form_timer(
+            key, form, FORM_TTL, on_expire=lambda: self._undo.pop(key, None) is not None
+        )
 
     async def _inline_undo(self, call, key):
         self._form_timer_cancel(key)
@@ -725,8 +762,7 @@ class TriggerChangerMod(loader.Module):
             await call.answer(f"не откатилось: {exc}"[:ALERT_MAX], alert=True)
             await self._kill_form(call)
             return
-        photo_msg = entry.get("photo_msg")
-        if photo_msg is not None:
+        for photo_msg in entry.get("photo_msgs") or []:
             try:
                 await photo_msg.delete()
             except Exception as exc:
@@ -835,10 +871,10 @@ class TriggerChangerMod(loader.Module):
                         logger.warning("[TriggerChanger] edit failed (msg %s): %r", message.id, exc)
                         return
 
-            photo_msg = None
+            photo_msgs = []
             if photo_entries:
-                photo_msg = await self._send_rule_photo(message, photo_entries[0], gone)
-                if photo_msg is not None:
+                photo_msgs = await self._send_rule_photos(message, photo_entries, gone)
+                if photo_msgs:
                     self._mark_edited(key)
 
             if applied:
@@ -847,38 +883,89 @@ class TriggerChangerMod(loader.Module):
                 # держать в памяти объект сообщения
                 if self.config["undo"] and self._logchat() is not None:
                     await self._notify_undo(
-                        message, self._remember_undo(message, text, gone, photo_msg)
+                        message, self._remember_undo(message, text, gone, photo_msgs)
                     )
         except Exception as exc:
             logger.exception("[TriggerChanger] watcher error: %r", exc)
 
-    async def _send_rule_photo(self, message, entry, gone=False):
-        """Картинка правила: реплаем на сообщение, а если его удалили — просто в чат.
+    async def _send_rule_photos(self, message, entries, gone=False):
+        """Картинки всех сработавших правил одной каруселью.
 
-        Первый раз грузим байты из БД, дальше переиспользуем файл телеги —
-        повторная загрузка того же фото и есть главная задержка.
+        Реплаем на сообщение, а если его удалили — просто в чат. Первый раз
+        грузим байты из БД, дальше переиспользуем файл телеги: повторная
+        загрузка того же фото и есть главная задержка.
         """
-        pid = entry.get("pid")
         send = message.respond if gone else message.reply
-        cached = self._photo_cache.get(pid)
-        if cached is not None:
-            try:
-                return await send(file=cached)
-            except Exception as exc:
-                # ссылка на файл могла протухнуть — шлём байты и обновляем кэш
-                logger.info("[TriggerChanger] кэш фото %s не сработал (%r)", pid, exc)
-                self._photo_cache.pop(pid, None)
-        b64 = self._photo_b64(entry)
+        pids, files = [], []
+        for entry in entries:
+            pid = entry.get("pid")
+            if not pid or pid in pids:
+                continue
+            f = self._photo_file(pid)
+            if f is None:
+                continue
+            pids.append(pid)
+            files.append(f)
+            if len(files) >= ALBUM_MAX:
+                break
+        if not files:
+            return []
+        if len(files) == 1:
+            sent = await self._send_photo(send, pids[0], files[0])
+            return [] if sent is None else [sent]
+        try:
+            album = await send(file=files)
+        except Exception as exc:
+            # альбом мог не пойти из-за смешанных типов медиа — тогда шлём по одной
+            if _is_flood(exc):
+                logger.warning("[TriggerChanger] карусель не ушла (флуд): %r", exc)
+                return []
+            logger.info("[TriggerChanger] карусель не ушла (%r), шлю по одной", exc)
+            msgs = []
+            for pid, f in zip(pids, files):
+                one = await self._send_photo(send, pid, f)
+                if one is not None:
+                    msgs.append(one)
+            return msgs
+        # телега на альбом отдаёт список сообщений — кэшируем каждый файл отдельно
+        msgs = [m for m in (album if isinstance(album, (list, tuple)) else [album]) if m]
+        for pid, msg in zip(pids, msgs):
+            media = getattr(msg, "photo", None) or getattr(msg, "document", None)
+            if media is not None:
+                self._photo_cache[pid] = media
+        return msgs
+
+    def _photo_bytes(self, pid):
+        b64 = self._get(f"photo:{pid}")
         if not b64:
             return None
+        bio = io.BytesIO(base64.b64decode(b64))
+        # без имени Telethon шлёт поток безымянным документом
+        bio.name = "photo.jpg"
+        return bio
+
+    def _photo_file(self, pid):
+        """Чем слать картинку: файл телеги из кэша или байты из БД."""
+        cached = self._photo_cache.get(pid)
+        return cached if cached is not None else self._photo_bytes(pid)
+
+    async def _send_photo(self, send, pid, file):
         try:
-            bio = io.BytesIO(base64.b64decode(b64))
-            # без имени Telethon шлёт поток безымянным документом
-            bio.name = "photo.jpg"
-            sent = await send(file=bio)
+            sent = await send(file=file)
         except Exception as exc:
-            logger.warning("[TriggerChanger] photo send failed: %r", exc)
-            return None
+            # ссылка на файл могла протухнуть: кэш сбрасываем и пробуем байтами,
+            # иначе правило останется без мема
+            self._photo_cache.pop(pid, None)
+            retry = None if _is_flood(exc) else self._photo_bytes(pid)
+            if retry is None:
+                logger.warning("[TriggerChanger] photo %s send failed: %r", pid, exc)
+                return None
+            logger.info("[TriggerChanger] кэш фото %s не сработал (%r), шлю байты", pid, exc)
+            try:
+                sent = await send(file=retry)
+            except Exception as exc2:
+                logger.warning("[TriggerChanger] photo %s send failed: %r", pid, exc2)
+                return None
         media = getattr(sent, "photo", None) or getattr(sent, "document", None)
         if media is not None:
             self._photo_cache[pid] = media
@@ -1357,8 +1444,16 @@ class TriggerChangerMod(loader.Module):
     async def _menu_close(self, call):
         # закрыл меню — значит и картинку для правила уже не ждём,
         # иначе следующее фото юзера прилипнет к правилу
+        self._form_timer_cancel(f"menu:{call.sender_id}")
         self._menu_state_clear(call.sender_id)
         await self._kill_form(call)
+
+    def _menu_expired(self, uid, form):
+        """Срок меню вышел: чистим состояния, если это всё то же меню."""
+        if self._menu_forms.get(uid) is not form:
+            return False  # его уже закрыли или открыли заново
+        self._menu_state_clear(uid)
+        return True
 
     def _menu_state_clear(self, uid):
         self._photo_wait.pop(uid, None)
@@ -1594,7 +1689,7 @@ class TriggerChangerMod(loader.Module):
                 text,
                 message=message,
                 reply_markup=markup,
-                ttl=FORM_TTL,
+                ttl=MENU_TTL,
                 force_me=True,
                 on_unload=lambda *_: self._menu_state_clear(uid),
             )
@@ -1612,6 +1707,11 @@ class TriggerChangerMod(loader.Module):
         # чат запоминаем, чтобы картинку правила ждать именно здесь
         self._menu_forms[uid] = form
         self._menu_chat[uid] = message.chat_id
+        # по истечении ttl кнопки глохнут, а мёртвое меню остаётся в чате —
+        # убираем его сами
+        self._form_timer(
+            f"menu:{uid}", form, MENU_TTL, on_expire=lambda: self._menu_expired(uid, form)
+        )
 
     @loader.command(
         ru_doc="Вкл/выкл чистку ссылок от трекеров: .repclean [on|off]; без аргументов — переключить",
@@ -1883,11 +1983,20 @@ class TriggerChangerMod(loader.Module):
         self.config["undo"] = True
         self._pending = {}
         self._edited = {}
-        self._undo = {}
+        # после _drop_all_photos кэш указывает на файлы удалённых правил
+        self._photo_cache = {}
         for task in self._form_timers.values():
             task.cancel()
         self._form_timers = {}
         self._photo_wait = {}
+        # живые меню и формы отката остаются в чатах с мёртвыми кнопками —
+        # убираем их до того, как забудем ссылки
+        for form in [e.get("form") for e in self._undo.values()] + list(
+            self._menu_forms.values()
+        ):
+            if form is not None:
+                self._spawn(self._kill_form(form))
+        self._undo = {}
         self._menu_forms = {}
         self._menu_chat = {}
         await utils.answer(
