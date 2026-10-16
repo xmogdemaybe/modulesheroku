@@ -1,4 +1,5 @@
 import logging
+from collections import deque
 from datetime import datetime, timedelta
 
 from .. import loader, utils
@@ -20,12 +21,17 @@ class SleepMod(loader.Module):
     DEFAULT_SCHEDULE = {"enabled": False, "start": None, "end": None}
     DEFAULT_EXCLUDED = {}
     DEFAULT_PERSONAL = {}
+    DEFAULT_ACTIVE_GRACE = 300
 
     async def client_ready(self, client, db):
         self.logger = logging.getLogger("Sleep")
         self.client = client
         self.db = db
         self.last_response_time = {}
+        self._owner_last_active = None
+        # id наших же автоответов: они приходят в watcher как исходящие,
+        # и без этого списка каждый автоответ считался бы активностью владельца
+        self._auto_reply_ids = deque(maxlen=64)
         self._my_id = (await client.get_me()).id
         self._init_db()
 
@@ -38,6 +44,7 @@ class SleepMod(loader.Module):
             "excluded_users": dict(self.DEFAULT_EXCLUDED),
             "personal_replies": dict(self.DEFAULT_PERSONAL),
             "schedule": dict(self.DEFAULT_SCHEDULE),
+            "active_grace": self.DEFAULT_ACTIVE_GRACE,
         }
         for key, value in defaults.items():
             try:
@@ -137,7 +144,14 @@ class SleepMod(loader.Module):
         if auto_off is None:
             return
 
-        if datetime.now().timestamp() >= float(auto_off):
+        try:
+            expired = datetime.now().timestamp() >= float(auto_off)
+        except (TypeError, ValueError):
+            self._set_db("sleep_auto_off_time", None)
+            self.logger.error("[Sleep] Битое значение sleep_auto_off_time, сброшено: %r", auto_off)
+            return
+
+        if expired:
             self._set_db("sleep_enabled", False)
             self._set_db("sleep_auto_off_time", None)
             self.logger.info("[Sleep] Время сна окончено, ручной режим автовыключен")
@@ -148,6 +162,8 @@ class SleepMod(loader.Module):
         try:
             # 1. Базовые проверки сообщения
             if getattr(message, "out", False):
+                if message.id not in self._auto_reply_ids:
+                    self._owner_last_active = datetime.now().timestamp()
                 return
             if not hasattr(message, "text") or not hasattr(message, "sender_id"):
                 return
@@ -175,20 +191,31 @@ class SleepMod(loader.Module):
             if isinstance(excluded, dict) and sender_id in excluded:
                 return
 
-            # 5. Проверка задержки (delay)
+            now_ts = datetime.now().timestamp()
+
+            # 5. Владелец недавно сам писал — значит он онлайн, молчим
+            grace = self._get_db("active_grace", self.DEFAULT_ACTIVE_GRACE)
+            try:
+                grace = int(grace)
+            except (ValueError, TypeError):
+                grace = self.DEFAULT_ACTIVE_GRACE
+
+            if grace > 0 and self._owner_last_active is not None and now_ts - self._owner_last_active < grace:
+                return
+
+            # 6. Проверка задержки (delay)
             delay = self._get_db("sleep_delay", self.DEFAULT_DELAY)
             try:
                 delay = int(delay)
             except (ValueError, TypeError):
                 delay = self.DEFAULT_DELAY
 
-            now_ts = datetime.now().timestamp()
             if delay > 0:
                 last_time = self.last_response_time.get(sender_id)
                 if last_time and (now_ts - last_time < delay):
                     return
 
-            # 6. Формирование текста: персональный ответ > общий текст
+            # 7. Формирование текста: персональный ответ > общий текст
             response_text = None
             personal = self._get_db("personal_replies", self.DEFAULT_PERSONAL)
             if isinstance(personal, dict):
@@ -202,8 +229,19 @@ class SleepMod(loader.Module):
             if not response_text or not isinstance(response_text, str):
                 return
 
-            await message.respond(response_text)
+            sent = await message.respond(response_text)
+            if sent is not None:
+                self._auto_reply_ids.append(sent.id)
             self.last_response_time[sender_id] = now_ts
+
+            # Задержка максимум час, поэтому сутки — гарантированно мёртвые записи
+            if len(self.last_response_time) > 500:
+                cutoff = now_ts - 86400
+                self.last_response_time = {uid: ts for uid, ts in self.last_response_time.items() if ts > cutoff}
+
+            # Жёсткий потолок: шквал сообщений от разных юзеров за сутки не должен есть память
+            if len(self.last_response_time) > 2000:
+                self.last_response_time = dict(sorted(self.last_response_time.items(), key=lambda kv: kv[1])[-2000:])
 
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в watcher: %s", e)
@@ -247,6 +285,8 @@ class SleepMod(loader.Module):
             "<code>.sleeptext я сплю, отвечу утром</code> — задать текст (макс 1000 симв.)\n"
             "<code>.sleepdelay</code> — показать задержку между ответами одному юзеру\n"
             "<code>.sleepdelay 60</code> — задать задержку в секундах (0 — без задержки)\n"
+            "<code>.sleepactive</code> — показать окно «владелец онлайн»\n"
+            "<code>.sleepactive 300</code> — не отвечать, если ты сам писал в последние 300 сек (0 — выкл)\n"
             "<code>.sleepschedule</code> — вкл/выкл расписание\n"
             "<code>.sleepschedule 22:00 08:00</code> — диапазон (с 22:00 до 08:00)\n"
             "<code>.sleepschedule 08:00</code> — одно время = ДО 08:00\n"
@@ -257,7 +297,9 @@ class SleepMod(loader.Module):
             "<code>.sleepreply 123456 спи давай</code> — личный текст ответа для ID\n"
             "<code>.sleepreply 123456</code> — удалить личный текст\n\n"
             "ℹ️ Ручной режим (<code>.sleep</code>) и расписание — два независимых "
-            "переключателя: автоответ идёт, если включено хотя бы одно из них.\n\n"
+            "переключателя: автоответ идёт, если включено хотя бы одно из них.\n"
+            "ℹ️ Но если ты сам недавно писал где угодно — автоответ молчит "
+            "(окно настраивается через <code>.sleepactive</code>).\n\n"
             "dev: @xmogde, это упоминание только в этом ебучем скрипте, мб будет в других"
         )
         await utils.answer(message, text)
@@ -279,7 +321,7 @@ class SleepMod(loader.Module):
                 return
 
             self._set_db("sleep_text", text)
-            await utils.answer(message, f"✅ Текст установлен")
+            await utils.answer(message, "✅ Текст установлен")
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleeptextcmd: %s", e)
             await utils.answer(message, f"❌ Ошибка: {e}")
@@ -314,6 +356,42 @@ class SleepMod(loader.Module):
             await utils.answer(message, f"✅ Задержка установлена: {delay} сек")
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleepdelaycmd: %s", e)
+            await utils.answer(message, f"❌ Ошибка: {e}")
+
+    async def sleepactivecmd(self, message):
+        """Окно «владелец онлайн»: .sleepactive | .sleepactive 300 (сек) | .sleepactive 0 (выкл)"""
+        try:
+            args = utils.get_args(message)
+
+            if not args:
+                grace = self._get_db("active_grace", self.DEFAULT_ACTIVE_GRACE)
+                await utils.answer(message, f"👀 Окно активности владельца: {grace} сек")
+                return
+
+            try:
+                grace = int(args[0])
+            except (ValueError, TypeError):
+                await utils.answer(message, "❌ Укажи число (секунды)")
+                return
+
+            if grace < 0:
+                await utils.answer(message, "❌ Значение не может быть отрицательным")
+                return
+
+            if grace > 86400:
+                await utils.answer(message, "❌ Максимум 86400 сек (сутки)")
+                return
+
+            self._set_db("active_grace", grace)
+            if grace == 0:
+                await utils.answer(message, "✅ Проверка активности владельца выключена")
+            else:
+                await utils.answer(
+                    message,
+                    f"✅ Если ты сам писал в последние {grace} сек — автоответ молчит",
+                )
+        except Exception as e:
+            self.logger.error("[Sleep] Ошибка в sleepactivecmd: %s", e)
             await utils.answer(message, f"❌ Ошибка: {e}")
 
     async def sleepschedulecmd(self, message):
