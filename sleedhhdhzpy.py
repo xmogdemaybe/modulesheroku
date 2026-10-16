@@ -239,6 +239,10 @@ class SleepMod(loader.Module):
                 cutoff = now_ts - 86400
                 self.last_response_time = {uid: ts for uid, ts in self.last_response_time.items() if ts > cutoff}
 
+            # Жёсткий потолок: шквал сообщений от разных юзеров за сутки не должен есть память
+            if len(self.last_response_time) > 2000:
+                self.last_response_time = dict(sorted(self.last_response_time.items(), key=lambda kv: kv[1])[-2000:])
+
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в watcher: %s", e)
 
