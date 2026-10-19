@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .. import loader, utils
 
@@ -22,6 +23,13 @@ class SleepMod(loader.Module):
     DEFAULT_EXCLUDED = {}
     DEFAULT_PERSONAL = {}
     DEFAULT_ACTIVE_GRACE = 300
+    DEFAULT_MAX_AGE = 3600
+
+    # Сколько храним отметки «кому уже ответили»
+    RESPONSE_RETENTION = 86400
+    RESPONSE_PRUNE_AT = 500
+    RESPONSE_HARD_CAP = 2000
+    ANSWERED_IDS_CAP = 512
 
     async def client_ready(self, client, db):
         self.logger = logging.getLogger("Sleep")
@@ -32,8 +40,15 @@ class SleepMod(loader.Module):
         # id наших же автоответов: они приходят в watcher как исходящие,
         # и без этого списка каждый автоответ считался бы активностью владельца
         self._auto_reply_ids = deque(maxlen=64)
+        # id сообщений, на которые мы уже ответили: диспетчер хикки может
+        # повторно доставить тот же апдейт после обрыва соединения
+        self._answered_ids = deque(maxlen=self.ANSWERED_IDS_CAP)
+        # вотчеры запускаются параллельно (dispatcher.py:692, ensure_future),
+        # поэтому проверка «не отвечали ли уже» и запись должны быть атомарными
+        self._send_lock = asyncio.Lock()
         self._my_id = (await client.get_me()).id
         self._init_db()
+        self._restore_state()
 
     def _init_db(self):
         """Инициализировать БД если её нет (без перезаписи уже заданных значений)"""
@@ -45,6 +60,8 @@ class SleepMod(loader.Module):
             "personal_replies": dict(self.DEFAULT_PERSONAL),
             "schedule": dict(self.DEFAULT_SCHEDULE),
             "active_grace": self.DEFAULT_ACTIVE_GRACE,
+            "max_age": self.DEFAULT_MAX_AGE,
+            "last_response": {},
         }
         for key, value in defaults.items():
             try:
@@ -62,6 +79,14 @@ class SleepMod(loader.Module):
             return value
         except Exception as e:
             self.logger.error("[Sleep] Ошибка чтения БД ключ %s: %s", key, e)
+            return default
+
+    def _int_db(self, key, default):
+        """Получить число из БД, мусор не роняет модуль"""
+        try:
+            return int(self._get_db(key, default))
+        except (TypeError, ValueError):
+            self.logger.error("[Sleep] Битое число в БД ключ %s, беру %s", key, default)
             return default
 
     def _set_db(self, key, value):
@@ -129,6 +154,61 @@ class SleepMod(loader.Module):
         except Exception:
             return None
 
+    def _epoch(self):
+        """Абсолютные секунды сейчас (в той же шкале, что и message.date)"""
+        return datetime.now(timezone.utc).timestamp()
+
+    def _msg_ts(self, message):
+        """Абсолютные секунды сообщения. Telethon отдаёт aware UTC datetime"""
+        date = getattr(message, "date", None)
+        if not isinstance(date, datetime):
+            return None
+        try:
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            return date.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    def _restore_state(self):
+        """Загрузить отметки из БД: без этого рестарт дина забывал, кому уже ответили"""
+        stored = self._get_db("last_response", {})
+        restored = {}
+        if isinstance(stored, dict):
+            for uid, ts in stored.items():
+                try:
+                    restored[str(uid)] = float(ts)
+                except (TypeError, ValueError):
+                    continue
+
+        cutoff = self._epoch() - self.RESPONSE_RETENTION
+        self.last_response_time = {uid: ts for uid, ts in restored.items() if ts > cutoff}
+        self._prune_state(self._epoch())
+
+        owner_active = self._get_db("owner_active", None)
+        try:
+            self._owner_last_active = None if owner_active is None else float(owner_active)
+        except (TypeError, ValueError):
+            self._owner_last_active = None
+
+    def _persist_state(self):
+        """Сохранить отметки в БД (значения должны быть JSON-serializable)"""
+        self._set_db("last_response", dict(self.last_response_time))
+        self._set_db("owner_active", self._owner_last_active)
+
+    def _prune_state(self, now_ts):
+        """Очистка старых записей, чтобы память не росла бесконечно"""
+        if len(self.last_response_time) > self.RESPONSE_PRUNE_AT:
+            cutoff = now_ts - self.RESPONSE_RETENTION
+            self.last_response_time = {
+                uid: ts for uid, ts in self.last_response_time.items() if ts > cutoff
+            }
+
+        if len(self.last_response_time) > self.RESPONSE_HARD_CAP:
+            self.last_response_time = dict(
+                sorted(self.last_response_time.items(), key=lambda kv: kv[1])[-self.RESPONSE_HARD_CAP :]
+            )
+
     @loader.loop(interval=15, autostart=True)
     async def _auto_off_loop(self):
         """Автовыключение ручного режима по времени окончания расписания.
@@ -163,7 +243,7 @@ class SleepMod(loader.Module):
             # 1. Базовые проверки сообщения
             if getattr(message, "out", False):
                 if message.id not in self._auto_reply_ids:
-                    self._owner_last_active = datetime.now().timestamp()
+                    self._owner_last_active = self._epoch()
                 return
             if not hasattr(message, "text") or not hasattr(message, "sender_id"):
                 return
@@ -191,31 +271,30 @@ class SleepMod(loader.Module):
             if isinstance(excluded, dict) and sender_id in excluded:
                 return
 
-            now_ts = datetime.now().timestamp()
+            now_ts = self._epoch()
 
-            # 5. Владелец недавно сам писал — значит он онлайн, молчим
-            grace = self._get_db("active_grace", self.DEFAULT_ACTIVE_GRACE)
-            try:
-                grace = int(grace)
-            except (ValueError, TypeError):
-                grace = self.DEFAULT_ACTIVE_GRACE
-
-            if grace > 0 and self._owner_last_active is not None and now_ts - self._owner_last_active < grace:
+            # 5. Офлайн-очередь: сообщение протухло, пока юзербота не было в сети
+            max_age = self._int_db("max_age", self.DEFAULT_MAX_AGE)
+            msg_ts = self._msg_ts(message)
+            if max_age > 0 and msg_ts is not None and now_ts - msg_ts > max_age:
+                self.logger.info(
+                    "[Sleep] Сообщение от %s старше %s сек — не отвечаем", sender_id, max_age
+                )
                 return
 
-            # 6. Проверка задержки (delay)
-            delay = self._get_db("sleep_delay", self.DEFAULT_DELAY)
-            try:
-                delay = int(delay)
-            except (ValueError, TypeError):
-                delay = self.DEFAULT_DELAY
+            # 6. Владелец недавно сам писал — значит он онлайн, молчим
+            grace = self._int_db("active_grace", self.DEFAULT_ACTIVE_GRACE)
+            if (
+                grace > 0
+                and self._owner_last_active is not None
+                and now_ts - self._owner_last_active < grace
+            ):
+                return
 
-            if delay > 0:
-                last_time = self.last_response_time.get(sender_id)
-                if last_time and (now_ts - last_time < delay):
-                    return
+            # 7. Задержка между ответами одному юзеру
+            delay = self._int_db("sleep_delay", self.DEFAULT_DELAY)
 
-            # 7. Формирование текста: персональный ответ > общий текст
+            # 8. Формирование текста: персональный ответ > общий текст
             response_text = None
             personal = self._get_db("personal_replies", self.DEFAULT_PERSONAL)
             if isinstance(personal, dict):
@@ -229,19 +308,35 @@ class SleepMod(loader.Module):
             if not response_text or not isinstance(response_text, str):
                 return
 
-            sent = await message.respond(response_text)
-            if sent is not None:
-                self._auto_reply_ids.append(sent.id)
-            self.last_response_time[sender_id] = now_ts
+            # 9. Проверка «уже отвечали» и отправка — под локом. Диспетчер хикки
+            #    запускает каждый вотчер через ensure_future (dispatcher.py:692),
+            #    поэтому вся очередь после подключения разбирается параллельно:
+            #    без лока все копии успевают прочесть пустой last_response_time
+            #    и ответить залпом. Отметку ставим ДО отправки, иначе неудачная
+            #    попытка при обрыве соединения повторяется на каждом следующем
+            #    сообщении этого же юзера.
+            async with self._send_lock:
+                if message.id in self._answered_ids:
+                    return
 
-            # Задержка максимум час, поэтому сутки — гарантированно мёртвые записи
-            if len(self.last_response_time) > 500:
-                cutoff = now_ts - 86400
-                self.last_response_time = {uid: ts for uid, ts in self.last_response_time.items() if ts > cutoff}
+                if delay > 0:
+                    last_time = self.last_response_time.get(sender_id)
+                    if last_time and (now_ts - last_time < delay):
+                        return
 
-            # Жёсткий потолок: шквал сообщений от разных юзеров за сутки не должен есть память
-            if len(self.last_response_time) > 2000:
-                self.last_response_time = dict(sorted(self.last_response_time.items(), key=lambda kv: kv[1])[-2000:])
+                self._answered_ids.append(message.id)
+                self.last_response_time[sender_id] = now_ts
+                self._prune_state(now_ts)
+                self._persist_state()
+
+                try:
+                    sent = await message.respond(response_text)
+                except Exception as e:
+                    self.logger.error("[Sleep] Автоответ для %s не ушел: %s", sender_id, e)
+                    return
+
+                if sent is not None:
+                    self._auto_reply_ids.append(sent.id)
 
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в watcher: %s", e)
@@ -287,6 +382,8 @@ class SleepMod(loader.Module):
             "<code>.sleepdelay 60</code> — задать задержку в секундах (0 — без задержки)\n"
             "<code>.sleepactive</code> — показать окно «владелец онлайн»\n"
             "<code>.sleepactive 300</code> — не отвечать, если ты сам писал в последние 300 сек (0 — выкл)\n"
+            "<code>.sleepmaxage</code> — показать, сколько секунд сообщение ещё свежее\n"
+            "<code>.sleepmaxage 1800</code> — игнорировать лежалое (приехал позже 30 мин после отправки); 0 — выкл\n"
             "<code>.sleepschedule</code> — вкл/выкл расписание\n"
             "<code>.sleepschedule 22:00 08:00</code> — диапазон (с 22:00 до 08:00)\n"
             "<code>.sleepschedule 08:00</code> — одно время = ДО 08:00\n"
@@ -298,8 +395,13 @@ class SleepMod(loader.Module):
             "<code>.sleepreply 123456</code> — удалить личный текст\n\n"
             "ℹ️ Ручной режим (<code>.sleep</code>) и расписание — два независимых "
             "переключателя: автоответ идёт, если включено хотя бы одно из них.\n"
-            "ℹ️ Но если ты сам недавно писал где угодно — автоответ молчит "
-            "(окно настраивается через <code>.sleepactive</code>).\n\n"
+            "ℹ️ Но если ты сам недавно писал где-нибудь — автоответ молчит "
+            "(окно настраивается через <code>.sleepactive</code>).\n"
+            "ℹ️ Если юзербот был без сети и человек писал несколько раз, то после "
+            "подключения он получит максимум один ответ: на лежалое старше "
+            "<code>.sleepmaxage</code> не отвечаем вообще, а дубли одного и того же "
+            "сообщения режем по id. Отметки «кому ответили» лежат в БД, поэтому "
+            "перезапуск дина залпа не устраивает.\n\n"
             "dev: @xmogde, это упоминание только в этом ебучем скрипте, мб будет в других"
         )
         await utils.answer(message, text)
@@ -392,6 +494,52 @@ class SleepMod(loader.Module):
                 )
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleepactivecmd: %s", e)
+            await utils.answer(message, f"❌ Ошибка: {e}")
+
+    async def sleepmaxagecmd(self, message):
+        """Сколько секунд сообщение ещё свежее: .sleepmaxage | .sleepmaxage 1800 | 0 (выкл)"""
+        try:
+            args = utils.get_args(message)
+
+            if not args:
+                max_age = self._int_db("max_age", self.DEFAULT_MAX_AGE)
+                if max_age == 0:
+                    await utils.answer(
+                        message, "🕰️ Проверка возраста сообщений выключена — отвечаем и на лежалые"
+                    )
+                else:
+                    await utils.answer(
+                        message,
+                        f"🕰️ Не отвечаем на сообщения, которые приехали позже {max_age} сек "
+                        f"(~{round(max_age / 60)} мин) после отправки",
+                    )
+                return
+
+            try:
+                max_age = int(args[0])
+            except (ValueError, TypeError):
+                await utils.answer(message, "❌ Укажи число (секунды)")
+                return
+
+            if max_age < 0:
+                await utils.answer(message, "❌ Значение не может быть отрицательным")
+                return
+
+            if max_age > 86400:
+                await utils.answer(message, "❌ Максимум 86400 сек (сутки)")
+                return
+
+            self._set_db("max_age", max_age)
+            if max_age == 0:
+                await utils.answer(message, "✅ Проверка возраста сообщений выключена")
+            else:
+                await utils.answer(
+                    message,
+                    f"✅ Сообщения старше {max_age} сек игнорируем — при подключении после обрыва "
+                    f"лежалое не отвечаем",
+                )
+        except Exception as e:
+            self.logger.error("[Sleep] Ошибка в sleepmaxagecmd: %s", e)
             await utils.answer(message, f"❌ Ошибка: {e}")
 
     async def sleepschedulecmd(self, message):
