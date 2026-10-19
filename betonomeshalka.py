@@ -962,12 +962,31 @@ class Betonomeshalka(loader.Module):
             return f"ошибка реакции: {type(exc).__name__}: {exc}"
         return f"реакция {em} поставлена на #{mid}"
 
-    async def _tool_delete(self, peer, ids, allowed) -> str:
+    async def _still_there(self, peer, ids) -> list:
+        """Какие id остались после удаления.
+
+        Telegram может ответить ok и снести сообщение только со своей стороны
+        (чужие сообщения в личке, нет прав на revoke в группе) — без этой проверки
+        мы врать будем, что удалили.
+        """
+        try:
+            got = await self.client.get_messages(peer, ids=ids)
+        except Exception:
+            logger.exception("[betonomeshalka] delete verify failed")
+            return []
+        msgs = got if isinstance(got, (list, tuple)) else [got]
+        return [mid for mid, m in zip(sorted(ids), msgs) if m is not None]
+
+    async def _tool_delete(self, peer, ids, allowed, forbidden=()) -> str:
         ids = [i for i in (self._as_id(x) for x in (ids or [])) if i is not None]
         if not ids:
             return "отклонено: список id пуст"
         if len(ids) > MAX_AGENT_DELETE:
             return f"отклонено: максимум {MAX_AGENT_DELETE} сообщений за раз"
+        touched = [i for i in ids if i in forbidden]
+        if touched:
+            # снесёт сообщение с командой — и ответ вписывать будет некуда
+            return f"отклонено: id {touched} — это сообщение с запросом, его не удаляем"
         bad = [i for i in ids if i not in allowed]
         if bad:
             return (f"отклонено: id {bad} недоступны, можно только {sorted(allowed)}")
@@ -975,6 +994,13 @@ class Betonomeshalka(loader.Module):
             await self.client.delete_messages(peer, ids, revoke=True)
         except Exception as exc:
             return f"ошибка удаления: {type(exc).__name__}: {exc}"
+        left = await self._still_there(peer, ids)
+        logger.info("[betonomeshalka] delete peer=%s ids=%s left=%s",
+                    type(peer).__name__, ids, left)
+        if left:
+            return ("Telegram принял запрос, но "
+                    + ", ".join(f"#{i}" for i in left)
+                    + " остались в чате — они не мои или нет прав на revoke")
         return "удалено " + ", ".join(f"#{i}" for i in sorted(ids))
 
     async def _tool_edit(self, peer, msg_id, new_text, by_id) -> str:
@@ -991,7 +1017,7 @@ class Betonomeshalka(loader.Module):
             return f"ошибка редактирования: {type(exc).__name__}: {exc}"
         return f"сообщение #{mid} отредактировано"
 
-    async def _run_tool(self, call, peer, by_id) -> str:
+    async def _run_tool(self, call, peer, by_id, forbidden=()) -> str:
         """Выполнить один function_call модели, вернуть строку-результат."""
         name = call.get("name") or ""
         args = call.get("arguments") or {}
@@ -1002,13 +1028,13 @@ class Betonomeshalka(loader.Module):
             return await self._tool_react(peer, args.get("message_id"),
                                           args.get("emoji"), allowed)
         if name == "delete_messages":
-            return await self._tool_delete(peer, args.get("message_ids"), allowed)
+            return await self._tool_delete(peer, args.get("message_ids"), allowed,
+                                           set(forbidden))
         if name == "edit_message":
             return await self._tool_edit(peer, args.get("message_id"),
                                          args.get("new_text"), by_id)
         return f"отклонено: неизвестный инструмент {name}"
 
-    @staticmethod
     @staticmethod
     def _describe_calls(calls: list) -> str:
         lines = []
@@ -1118,7 +1144,8 @@ class Betonomeshalka(loader.Module):
         if model.lower() not in THINK_UNSUPPORTED:
             body["generation_config"] = {"thinking_level": self._think()}
         si = self._system_instruction()
-        body["system_instruction"] = f"{si}\n{AGENT_CAUTION}" if si else AGENT_CAUTION
+        sys_txt = f"{si}\n{AGENT_CAUTION}" if si else AGENT_CAUTION
+        body["system_instruction"] = sys_txt
         ctx_on = bool(self._get("ctx", False))
         if ctx_on:
             saved = self._get(f"ctx_{ctx_key}", "") or ""
@@ -1126,8 +1153,15 @@ class Betonomeshalka(loader.Module):
             if prev and m == model:
                 body["previous_interaction_id"] = prev
 
-        dbg = ({"req": self._describe_body(body), "attempts": []}
-               if self._debug_on() else None)
+        dbg = None
+        if self._debug_on():
+            ids = sorted(by_id)
+            dbg = {"req": (
+                f"peer={type(message.peer_id).__name__} chat={message.chat_id} "
+                f"msg={message.id} out={bool(getattr(message, 'out', False))} "
+                f"thread={getattr(message, 'message_thread_id', None)}\n"
+                f"окно({len(ids)}): {ids}\n" + self._describe_body(body)),
+                "attempts": []}
         t0 = time.monotonic()
         actions: list = []
         try:
@@ -1143,13 +1177,15 @@ class Betonomeshalka(loader.Module):
                             if approved is None else "❌ Отменено — ничего не выполнено.")
                 results = []
                 for c in calls:
-                    res = await self._run_tool(c, message.peer_id, by_id)
+                    res = await self._run_tool(c, message.peer_id, by_id, (message.id,))
                     actions.append(res)
                     results.append({"type": "function_result",
                                     "name": c.get("name", ""),
                                     "call_id": c.get("id", ""), "result": res})
                 body = {"model": model, "previous_interaction_id": data.get("id", ""),
-                        "input": results, "tools": AGENT_TOOLS, "store": True}
+                        "input": results, "tools": AGENT_TOOLS, "store": True,
+                        # nasledующие раунды тоже должны знать про ограничение окна
+                        "system_instruction": sys_txt}
                 if model.lower() not in THINK_UNSUPPORTED:
                     body["generation_config"] = {"thinking_level": self._think()}
                 if dbg is not None:
@@ -1228,12 +1264,15 @@ class Betonomeshalka(loader.Module):
                     status_box.pop("m")
                     await _send_box(text)
                 return
-            if not has_media:
+            if not has_media and status_box.get("edit_ok", True) \
+                    and getattr(message, "out", False):
                 try:
                     await message.edit(text)
                     return
-                except Exception:
-                    logger.exception("[betonomeshalka] show: edit command failed")
+                except Exception as exc:
+                    # удалённое/не моё/нет прав — пробуем один раз и больше не лезем
+                    logger.warning("[betonomeshalka] show: edit команды недоступна: %s", exc)
+                    status_box["edit_ok"] = False
             await _send_box(text)
 
         async def _send_box(text):
