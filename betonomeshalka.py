@@ -74,7 +74,7 @@ MAX_NOTE_LEN = 4_000     # потолок длины одной заметки
 MAX_AGENT_DELETE = 10    # максимум сообщений, удаляемых за один вызов инструмента
 MAX_AGENT_ROUNDS = 5     # потолок раундов requires_action↔function_result
 DEFAULT_AGENT_WINDOW = 12  # сколько недавних сообщений показывать модели
-AGENT_WINDOW_CAP = 20
+AGENT_WINDOW_CAP = 50
 EDIT_MARKER = "✏️ "      # пометка в начале сообщения, отредактированного агентом
 AGENT_TTL = 600          # сколько секунд ждать подтверждения действий
 AGENT_CAUTION = (
@@ -897,11 +897,12 @@ class Betonomeshalka(loader.Module):
 
     # ---------- агент-инструменты ----------
 
-    async def _recent_window(self, message):
+    async def _recent_window(self, message, extra=()):
         """Окно недавних сообщений: (текст для модели, {id: сообщение}).
 
         Модель видит только эти id — значит не может удалить или поправить то,
-        чего нет в списке.
+        чего нет в списке. `extra` — сообщения, важные для запроса (то, на что
+        ответили), даже если они старше окна.
         """
         size = self._get("agent_window", DEFAULT_AGENT_WINDOW)
         try:
@@ -913,9 +914,9 @@ class Betonomeshalka(loader.Module):
             fetched = await self.client.get_messages(message.peer_id, limit=size)
         except Exception:
             logger.exception("[betonomeshalka] window fetch failed")
-            return "", {}
+            fetched = []
         by_id = {}
-        for m in fetched or []:
+        for m in list(extra) + list(fetched or []):
             # команду не показываем: снесёт «.gemini удали это» — и отвечать будет
             # некуда (message.edit по удалённому = MessageIdInvalidError)
             if m is not None and m.id != message.id:
@@ -945,9 +946,10 @@ class Betonomeshalka(loader.Module):
             return None
 
     async def _tool_react(self, peer, msg_id, emoji, allowed) -> str:
-        msg_id = self._as_id(msg_id)
-        if msg_id is None or msg_id not in allowed:
-            return f"отклонено: id {msg_id} вне окна недавних"
+        mid = self._as_id(msg_id)
+        if mid is None or mid not in allowed:
+            return (f"отклонено: id {msg_id} недоступен, можно только "
+                    f"{sorted(allowed)}")
         em = (emoji or "").replace("️", "").strip()
         if em not in REACTION_WHITELIST:
             return f"отклонено: реакция «{emoji}» не поддерживается Telegram"
@@ -955,10 +957,10 @@ class Betonomeshalka(loader.Module):
             from telethon.tl.functions.messages import SendReactionRequest
             from telethon.tl.types import ReactionEmoji
             await self.client(SendReactionRequest(
-                peer=peer, msg_id=msg_id, reaction=[ReactionEmoji(emoticon=em)]))
+                peer=peer, msg_id=mid, reaction=[ReactionEmoji(emoticon=em)]))
         except Exception as exc:
             return f"ошибка реакции: {type(exc).__name__}: {exc}"
-        return f"реакция {em} поставлена на #{msg_id}"
+        return f"реакция {em} поставлена на #{mid}"
 
     async def _tool_delete(self, peer, ids, allowed) -> str:
         ids = [i for i in (self._as_id(x) for x in (ids or [])) if i is not None]
@@ -968,7 +970,7 @@ class Betonomeshalka(loader.Module):
             return f"отклонено: максимум {MAX_AGENT_DELETE} сообщений за раз"
         bad = [i for i in ids if i not in allowed]
         if bad:
-            return f"отклонено: id {bad} вне окна недавних"
+            return (f"отклонено: id {bad} недоступны, можно только {sorted(allowed)}")
         try:
             await self.client.delete_messages(peer, ids, revoke=True)
         except Exception as exc:
@@ -976,17 +978,18 @@ class Betonomeshalka(loader.Module):
         return "удалено " + ", ".join(f"#{i}" for i in sorted(ids))
 
     async def _tool_edit(self, peer, msg_id, new_text, by_id) -> str:
-        msg_id = self._as_id(msg_id)
-        if msg_id is None or msg_id not in by_id:
-            return f"отклонено: id {msg_id} вне окна недавних"
-        if not getattr(by_id[msg_id], "out", False):
-            return f"отклонено: #{msg_id} не моё сообщение, редактировать нельзя"
+        mid = self._as_id(msg_id)
+        if mid is None or mid not in by_id:
+            return (f"отклонено: id {msg_id} недоступен, можно только "
+                    f"{sorted(by_id)}")
+        if not getattr(by_id[mid], "out", False):
+            return f"отклонено: #{mid} не моё сообщение, редактировать нельзя"
         try:
             await self.client.edit_message(
-                peer, msg_id, EDIT_MARKER + (new_text or ""))
+                peer, mid, EDIT_MARKER + (new_text or ""))
         except Exception as exc:
             return f"ошибка редактирования: {type(exc).__name__}: {exc}"
-        return f"сообщение #{msg_id} отредактировано"
+        return f"сообщение #{mid} отредактировано"
 
     async def _run_tool(self, call, peer, by_id) -> str:
         """Выполнить один function_call модели, вернуть строку-результат."""
@@ -1194,6 +1197,7 @@ class Betonomeshalka(loader.Module):
         # медиа: либо в самом сообщении (подпись к фото), либо в том, на что отвечаем
         media_msg = message if self._media_kind(message) else None
         reply_text = ""
+        reply = None
         if media_msg is None and getattr(message, "is_reply", False):
             reply = await message.get_reply_message()
             if reply is not None:
@@ -1211,26 +1215,42 @@ class Betonomeshalka(loader.Module):
         status_box = {}
 
         async def show(text):
-            """Статус/ответ. Никогда не бросает: если правка невозможна (сообщение
-            удалено, залито лимитом, недоступен edit) — шлём отдельным сообщением."""
-            try:
-                if has_media:
-                    if "m" in status_box:
-                        await status_box["m"].edit(text)
-                        return
-                    status_box["m"] = await message.respond(text)
+            """Статус/ответ. Правим своё сообщение; если правка невозможна (команда
+            отправлена от имени канала, сообщение удалено, нет прав на edit) —
+            заводим ОДНО отдельное сообщение и правим дальше его, а не плодим дубли.
+            Никогда не бросает."""
+            box = status_box.get("m")
+            if box is not None:
+                try:
+                    await box.edit(text)
+                except Exception:
+                    logger.exception("[betonomeshalka] show: edit box failed")
+                    status_box.pop("m")
+                    await _send_box(text)
+                return
+            if not has_media:
+                try:
+                    await message.edit(text)
                     return
-                await message.edit(text)
-            except Exception:
-                logger.exception("[betonomeshalka] show: edit/respond failed")
+                except Exception:
+                    logger.exception("[betonomeshalka] show: edit command failed")
+            await _send_box(text)
+
+        async def _send_box(text):
+            # в форумах без топия ответ уедет в General
+            thread = getattr(message, "message_thread_id", None)
+            kw = {"parse_mode": "HTML"}
+            if thread:
+                kw["message_thread_id"] = thread
             try:
-                # в форумах без топика ответ уедет в General
-                thread = getattr(message, "message_thread_id", None)
-                await self.client.send_message(
-                    message.peer_id, text, parse_mode="HTML",
-                    **({"message_thread_id": thread} if thread else {}))
+                status_box["m"] = await self.client.send_message(
+                    message.peer_id, text, reply_to=message.id, **kw)
             except Exception:
-                logger.exception("[betonomeshalka] show: send_message failed")
+                try:
+                    status_box["m"] = await self.client.send_message(
+                        message.peer_id, text, **kw)
+                except Exception:
+                    logger.exception("[betonomeshalka] show: send failed")
 
         parts = []
         kind = self._media_kind(album[0]) if album else None
@@ -1304,7 +1324,12 @@ class Betonomeshalka(loader.Module):
         thread = getattr(message, "message_thread_id", None)
         ctx_key = f"{message.chat_id}_{thread}" if thread else str(message.chat_id)
         agent_on = bool(self._get("agent", False))
-        win_text, by_id = await self._recent_window(message) if agent_on else ("", {})
+        win_text, by_id = ("", {})
+        if agent_on:
+            # цель запроса (то, на что ответили) должна быть видна модели даже если
+            # она старше окна, иначе «удали это» на сообщении пониже не сработает
+            targets = [m for m in (media_msg, reply) if m is not None]
+            win_text, by_id = await self._recent_window(message, targets)
         await show(head + f"⏳ <i>{m_esc} думает…</i>")
         try:
             answer = (await self._ask_agent(message, parts, ctx_key, key,
@@ -1536,8 +1561,8 @@ class Betonomeshalka(loader.Module):
         await utils.answer(message, "🧹 Контекст сброшен.")
 
     @loader.command(
-        ru_doc="Агент-режим: .gagent on|off | .gagent window N (1-20)",
-        en_doc="Agent mode: .gagent on|off | .gagent window N (1-20)",
+        ru_doc="Агент-режим: .gagent on|off | .gagent window N (1-50)",
+        en_doc="Agent mode: .gagent on|off | .gagent window N (1-50)",
     )
     async def gagent(self, message):
         """Toggle tool-calling agent mode and its recent-messages window"""
