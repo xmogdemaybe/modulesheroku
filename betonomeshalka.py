@@ -75,13 +75,16 @@ MAX_AGENT_DELETE = 10    # максимум сообщений, удаляемы
 MAX_AGENT_ROUNDS = 5     # потолок раундов requires_action↔function_result
 DEFAULT_AGENT_WINDOW = 12  # сколько недавних сообщений показывать модели
 AGENT_WINDOW_CAP = 50
+ANCHOR_SPAN = 10         # соседей цели запроса: ±N сообщений вокруг того, на что ответили
 EDIT_MARKER = "✏️ "      # пометка в начале сообщения, отредактированного агентом
 AGENT_TTL = 600          # сколько секунд ждать подтверждения действий
 AGENT_CAUTION = (
     "У тебя есть инструменты для действий в чате (реакция/удаление/редактирование). "
     "Используй их ТОЛЬКО когда пользователь явно просит совершить действие. "
     "На обычный вопрос просто отвечай текстом, без инструментов. "
-    "Действуй только над сообщениями из списка «Недавние сообщения» (их id).")
+    "Действуй только над сообщениями из списка «Недавние сообщения» (их id). "
+    "Все сообщения одного действия собирай в ОДИН вызов delete_messages — "
+    "не дробить на несколько раундов.")
 # Стандартные emoji-реакции Telegram (без variation selector U+FE0F).
 REACTION_WHITELIST = {
     "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩",
@@ -901,8 +904,10 @@ class Betonomeshalka(loader.Module):
         """Окно недавних сообщений: (текст для модели, {id: сообщение}).
 
         Модель видит только эти id — значит не может удалить или поправить то,
-        чего нет в списке. `extra` — сообщения, важные для запроса (то, на что
-        ответили), даже если они старше окна.
+        чего нет в списке. `extra` — цель запроса (то, на что ответили); её всегда
+        отдаём вместе с соседями ±ANCHOR_SPAN, даже если она глубоко в истории:
+        «удали это и связанные» иначе упирается не в права, а в размер окна.
+        Цель помечаем ◄, чтобы модель понимала, от чего считать «связанные».
         """
         size = self._get("agent_window", DEFAULT_AGENT_WINDOW)
         try:
@@ -921,7 +926,26 @@ class Betonomeshalka(loader.Module):
             # некуда (message.edit по удалённому = MessageIdInvalidError)
             if m is not None and m.id != message.id:
                 by_id[m.id] = m
+        # цель запроса может лежать глубоко в истории, куда окно не дотягивается:
+        # тянем её соседей ±ANCHOR_SPAN — иначе «удали это и связанные» упирается не
+        # в права, а в то, что модели просто не показали id
+        for anchor in [m.id for m in extra if m is not None and m.id != message.id]:
+            cand = [i for i in range(anchor - ANCHOR_SPAN, anchor + ANCHOR_SPAN + 1)
+                    if i > 0 and i not in by_id and i != message.id]
+            if not cand:
+                continue
+            try:
+                got = await self.client.get_messages(message.peer_id, ids=cand)
+            except Exception:
+                logger.exception("[betonomeshalka] anchor fetch failed")
+                continue
+            if not isinstance(got, (list, tuple)):
+                got = [got]
+            for mid, mm in zip(cand, got):
+                if mm is not None:
+                    by_id[mid] = mm
         lines = []
+        anchors = {m.id for m in extra if m is not None and m.id != message.id}
         for mid in sorted(by_id):
             m = by_id[mid]
             body = " ".join((m.raw_text or "").split())[:120]
@@ -929,7 +953,8 @@ class Betonomeshalka(loader.Module):
                 kind = self._media_kind(m)
                 body = f"[{kind or 'без текста'}]"
             lines.append(
-                f"#{mid} | {'я' if getattr(m, 'out', False) else 'друг'} | {body}"
+                f"{'◄' if mid in anchors else ' '} #{mid} | "
+                f"{'я' if getattr(m, 'out', False) else 'друг'} | {body}"
             )
         return "\n".join(lines), by_id
 
@@ -1036,7 +1061,31 @@ class Betonomeshalka(loader.Module):
         return f"отклонено: неизвестный инструмент {name}"
 
     @staticmethod
-    def _describe_calls(calls: list) -> str:
+    def _link_of(message):
+        """Функция mid -> ссылка на сообщение, если чат её умеет.
+
+        t.me/c/<число>/<id> существует только для супергрупп и каналов (PeerChannel);
+        в личке и обычных группах ссылок на конкретное сообщение нет.
+        """
+        try:
+            from telethon.tl.types import PeerChannel
+        except Exception:
+            return None
+        peer = getattr(message, "peer_id", None)
+        if not isinstance(peer, PeerChannel):
+            return None
+        base = f"https://t.me/c/{int(message.chat_id) - 1000000000000}/"
+        return lambda mid: f"{base}{int(mid)}"
+
+    def _describe_calls(self, calls: list, link=None) -> str:
+        def ref(value):
+            mid = Betonomeshalka._as_id(value)
+            if mid is None:
+                return "?"
+            if link is None:
+                return f"#{mid}"
+            return f'<a href="{link(mid)}">#{mid}</a>'
+
         lines = []
         for c in calls:
             a = c.get("arguments") or {}
@@ -1047,13 +1096,16 @@ class Betonomeshalka(loader.Module):
                 ids = sorted(i for i in (Betonomeshalka._as_id(x)
                                          for x in (a.get("message_ids") or []))
                              if i is not None)
-                lines.append(f"• удалить {', '.join(f'#{i}' for i in ids) or '—'}")
+                lines.append(f"• удалить "
+                             f"{', '.join(ref(i) for i in ids) or '—'}")
             elif name == "set_reaction":
                 lines.append(
-                    f"• реакция {a.get('emoji', '?')} на #{a.get('message_id', '?')}")
+                    f"• реакция {a.get('emoji', '?')} на "
+                    f"{ref(a.get('message_id'))}")
             elif name == "edit_message":
                 txt = " ".join(str(a.get("new_text", "")).split())[:80]
-                lines.append(f"• отредактировать #{a.get('message_id', '?')}: {txt}")
+                lines.append(
+                    f"• отредактировать {ref(a.get('message_id'))}: {txt}")
             else:
                 lines.append(f"• {name} {a}")
         return "\n".join(lines)
@@ -1081,6 +1133,10 @@ class Betonomeshalka(loader.Module):
         True — разрешено, False — отказ, None — не дождались.
         """
         desc = self._describe_calls(calls)
+        # в форме ссылки кликабельны (HTML там поддерживается); в текстовом
+        # фолбэке тот же desc экранируется, поэтому там — без тегов
+        link = self._link_of(message)
+        desc_form = desc if link is None else self._describe_calls(calls, link)
         fut = asyncio.get_running_loop().create_future()
         token = f"{int(time.time() * 1000)}-{id(fut) % 1000000}"
         self._pending()[token] = {"fut": fut, "chat": message.chat_id}
@@ -1089,7 +1145,7 @@ class Betonomeshalka(loader.Module):
         if inline is not None:
             try:
                 shown = bool(await inline.form(
-                    f"🔧 Gemini предлагает выполнить:\n{desc}\n\nРазрешить?",
+                    f"🔧 Gemini предлагает выполнить:\n{desc_form}\n\nРазрешить?",
                     message,
                     reply_markup=[[
                         {"text": "✅ Выполнить", "callback": self._agent_approve,
@@ -1139,7 +1195,9 @@ class Betonomeshalka(loader.Module):
             "model": model, "store": True, "tools": AGENT_TOOLS,
             "input": [{"type": "text",
                        "text": "Недавние сообщения (только их id доступны "
-                               f"инструментам):\n{win_text or '— пусто —'}"}] + parts,
+                               "инструментам). ◄ — цель запроса, «связанные» = "
+                               f"соседи вокруг неё:\n{win_text or '— пусто —'}"}]
+                     + parts,
         }
         if model.lower() not in THINK_UNSUPPORTED:
             body["generation_config"] = {"thinking_level": self._think()}
@@ -1365,8 +1423,8 @@ class Betonomeshalka(loader.Module):
         agent_on = bool(self._get("agent", False))
         win_text, by_id = ("", {})
         if agent_on:
-            # цель запроса (то, на что ответили) должна быть видна модели даже если
-            # она старше окна, иначе «удали это» на сообщении пониже не сработает
+            # цель запроса (то, на что ответили) отдаётся модели вместе с её
+            # соседями ±ANCHOR_SPAN — даже если она старше окна
             targets = [m for m in (media_msg, reply) if m is not None]
             win_text, by_id = await self._recent_window(message, targets)
         await show(head + f"⏳ <i>{m_esc} думает…</i>")
