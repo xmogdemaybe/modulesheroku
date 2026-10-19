@@ -1211,24 +1211,44 @@ class Betonomeshalka(loader.Module):
             if prev and m == model:
                 body["previous_interaction_id"] = prev
 
+        # служебная инфо о чате — только в лог: публичный debug-блок виден всем в чате
+        logger.info(
+            "[betonomeshalka] agent chat: peer=%s chat=%s msg=%s out=%s thread=%s",
+            type(message.peer_id).__name__, message.chat_id, message.id,
+            bool(getattr(message, "out", False)),
+            getattr(message, "message_thread_id", None))
         dbg = None
         if self._debug_on():
             ids = sorted(by_id)
-            dbg = {"req": (
-                f"peer={type(message.peer_id).__name__} chat={message.chat_id} "
-                f"msg={message.id} out={bool(getattr(message, 'out', False))} "
-                f"thread={getattr(message, 'message_thread_id', None)}\n"
-                f"окно({len(ids)}): {ids}\n" + self._describe_body(body)),
-                "attempts": []}
+            dbg = {"req": f"окно({len(ids)}): {ids}\n" + self._describe_body(body),
+                   "attempts": []}
         t0 = time.monotonic()
         actions: list = []
+        stop_msg = ""
+        asked_plain = False
         try:
             for _ in range(MAX_AGENT_ROUNDS):
                 data = await self._post_and_poll(body, key, dbg)
                 calls = (self._extract_calls(data)
                          if data.get("status") == "requires_action" else [])
                 if not calls:
-                    break
+                    if data.get("status") != "requires_action":
+                        break
+                    # модели часто бракует вызов на полуне (перегруз): один раз
+                    # переспрашиваем текстом, чтобы юзер не получил «пустой ответ»
+                    if asked_plain:
+                        stop_msg = ("⚠️ не смог собрать вызов инструмента дважды "
+                                    "(похоже, модель перегружена) — повтори запрос.")
+                        break
+                    asked_plain = True
+                    actions.append("вызов не собрался — переспрашиваю без инструментов")
+                    body = {"model": model, "store": True, "system_instruction": sys_txt,
+                            "input": [{"type": "text", "text":
+                                       "Предыдущая попытка вызвать инструмент не дошла. "
+                                       "Одним предложением: что удалось и что нет."}]}
+                    if model.lower() not in THINK_UNSUPPORTED:
+                        body["generation_config"] = {"thinking_level": self._think()}
+                    continue
                 approved = await self._await_approval(message, calls)
                 if approved is not True:
                     return ("⏳ Не дождался подтверждения — ничего не выполнено."
@@ -1242,7 +1262,7 @@ class Betonomeshalka(loader.Module):
                                     "call_id": c.get("id", ""), "result": res})
                 body = {"model": model, "previous_interaction_id": data.get("id", ""),
                         "input": results, "tools": AGENT_TOOLS, "store": True,
-                        # nasledующие раунды тоже должны знать про ограничение окна
+                        # последующие раунды тоже должны знать про границы окна
                         "system_instruction": sys_txt}
                 if model.lower() not in THINK_UNSUPPORTED:
                     body["generation_config"] = {"thinking_level": self._think()}
@@ -1257,7 +1277,8 @@ class Betonomeshalka(loader.Module):
                 raise GeminiError(f"{exc}\n\n{self._render_debug(dbg)}") from exc
             raise
 
-        text = self._extract_text(data)
+        # stop_msg — когда цикл вышел досрочно (вызов не собрался); текста тогда нет
+        text = stop_msg or self._extract_text(data)
         iid = data.get("id", "")
         # незакрытый requires_action в ctx цепочку не кладём: следующий запрос
         # с таким previous_interaction_id Google бракует
