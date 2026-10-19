@@ -25,6 +25,9 @@
 #   .gmodel [имя]         показать/сменить модель
 #   .gchat [on|off]       контекст диалога на чат (previous_interaction_id)
 #   .gclear               сбросить контекст текущего чата
+#   .gagent [on|off]      агент-режим: функция-call инструментов (реакция/удалить/править)
+#   .gagent window N      сколько недавних сообщений видно модели (её whitelist id)
+#   .gconfirm / .gcancel  подтвердить/отменить действия, если инлайн-бота нет
 #   .gdebug [on|off]      дебаг: дамп запроса/ответа Gemini с таймингами к ответам
 #   .gbot <запрос>        то же, но ответ принудительно rich-ом через heroku-бота
 #   .gbotset [auto on|off] статус rich-доставки; авто = таблицы/код/заголовки сами
@@ -66,6 +69,76 @@ THINK_LEVELS = ("minimal", "low", "medium", "high")
 THINK_UNSUPPORTED = set()
 MAX_NOTES = 200          # потолок числа заметок
 MAX_NOTE_LEN = 4_000     # потолок длины одной заметки
+
+# ---------- агент-режим (function-calling) ----------
+MAX_AGENT_DELETE = 10    # максимум сообщений, удаляемых за один вызов инструмента
+MAX_AGENT_ROUNDS = 5     # потолок раундов requires_action↔function_result
+DEFAULT_AGENT_WINDOW = 12  # сколько недавних сообщений показывать модели
+AGENT_WINDOW_CAP = 20
+EDIT_MARKER = "✏️ "      # пометка в начале сообщения, отредактированного агентом
+AGENT_TTL = 600          # сколько секунд ждать подтверждения действий
+AGENT_CAUTION = (
+    "У тебя есть инструменты для действий в чате (реакция/удаление/редактирование). "
+    "Используй их ТОЛЬКО когда пользователь явно просит совершить действие. "
+    "На обычный вопрос просто отвечай текстом, без инструментов. "
+    "Действуй только над сообщениями из списка «Недавние сообщения» (их id).")
+# Стандартные emoji-реакции Telegram (без variation selector U+FE0F).
+REACTION_WHITELIST = {
+    "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩",
+    "🤮", "💩", "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳", "❤‍🔥", "🌚", "🌭",
+    "💯", "🤣", "⚡", "🍌", "🏆", "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈",
+    "😴", "😭", "🤓", "👻", "👨‍💻", "👀", "🎃", "🙈", "😇", "😨", "🤝", "✍", "🤗",
+    "🎄", "🎅", "☃", "💪", "🤪", "🗿", "🥇", "💅",
+}
+
+# Объявления инструментов для Interactions API (flat REST-форма: type=function).
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "name": "set_reaction",
+        "description": "Поставить одну emoji-реакцию на сообщение в текущем чате "
+                       "(например оценить мем). message_id — из списка недавних сообщений.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "integer",
+                               "description": "ID сообщения из окна недавних"},
+                "emoji": {"type": "string",
+                          "description": "Стандартная emoji-реакция Telegram: ❤ 👍 😂 🔥 🎉 и т.п."},
+            },
+            "required": ["message_id", "emoji"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "delete_messages",
+        "description": "Удалить сообщения в текущем чате (можно несколько, до 10). "
+                       "Только когда пользователь явно просит удалить. Все id — из окна недавних.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message_ids": {"type": "array", "items": {"type": "integer"},
+                                "description": "Список ID сообщений из окна недавних (до 10)"},
+            },
+            "required": ["message_ids"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "edit_message",
+        "description": "Изменить текст СВОЕГО (исходящего, outgoing=true) сообщения "
+                       "в текущем чате. message_id — из окна недавних.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "integer",
+                               "description": "ID своего сообщения из окна недавних"},
+                "new_text": {"type": "string", "description": "Новый текст сообщения"},
+            },
+            "required": ["message_id", "new_text"],
+        },
+    },
+]
 
 IMAGE_MIMES = {
     "image/png", "image/jpeg", "image/webp", "image/heic", "image/heif",
@@ -302,6 +375,7 @@ class Betonomeshalka(loader.Module):
         self.client = client
         self.db = db
         self._session: Optional[aiohttp.ClientSession] = None
+        self._agent_pending: dict = {}
 
     async def on_unload(self):
         session = getattr(self, "_session", None)
@@ -525,12 +599,28 @@ class Betonomeshalka(loader.Module):
     def _extract_text(data: dict) -> str:
         chunks = []
         for step in data.get("steps", []) or []:
-            if step.get("type") != "model_output":
+            if not isinstance(step, dict) or step.get("type") != "model_output":
                 continue
             for block in step.get("content", []) or []:
                 if block.get("type") == "text" and block.get("text"):
                     chunks.append(block["text"])
         return "\n".join(chunks).strip()
+
+    @staticmethod
+    def _extract_calls(data: dict) -> list:
+        """function_call-шаги ответа: [{name, arguments, id}] (для агент-режима)."""
+        calls = []
+        for step in data.get("steps", []) or []:
+            if not isinstance(step, dict):
+                continue
+            fc = step if step.get("type") == "function_call" else step.get("function_call")
+            if isinstance(fc, dict) and (fc.get("name") or fc.get("arguments")):
+                calls.append({
+                    "name": fc.get("name", ""),
+                    "arguments": fc.get("arguments") or {},
+                    "id": fc.get("id", "") or step.get("id", ""),
+                })
+        return calls
 
     async def _post(self, url: str, key: str, body: Optional[dict] = None) -> dict:
         session = await self._http()
@@ -573,12 +663,17 @@ class Betonomeshalka(loader.Module):
             if t == "text":
                 s = p.get("text", "")
                 inp.append(f"text[{len(s)}]:{s[:80]!r}")
+            elif t == "function_result":
+                r = str(p.get("result", ""))
+                inp.append(f"result[{p.get('name')}]:{r[:60]!r}")
             else:
                 inp.append(f"{t}[{len(p.get('data', '')) // 1024}КБ base64]")
         gen = body.get("generation_config") or {}
+        tools = body.get("tools") or []
         return (f"model={body.get('model')} thinking={gen.get('thinking_level', 'НЕТ')}\n"
                 f"store={body.get('store')} prev={body.get('previous_interaction_id') or 'НЕТ'} "
-                f"sys_instr={len(body.get('system_instruction') or '')} симв\n"
+                f"sys_instr={len(body.get('system_instruction') or '')} симв"
+                + (f", tools={len(tools)}" if tools else "") + "\n"
                 f"input: {'; '.join(inp) or 'пусто'}")
 
     @staticmethod
@@ -587,37 +682,24 @@ class Betonomeshalka(loader.Module):
         lines += [f"• {a}" for a in dbg["attempts"]]
         return "\n".join(lines)
 
-    async def _ask(self, parts: list, ctx_key: str, key: str) -> str:
-        model = self._model()
-        body: dict = {"model": model, "input": parts}
-        # thinking_level понимают только Gemini 3; gemma и компания отвечают ошибкой
-        if model.lower() not in THINK_UNSUPPORTED:
-            body["generation_config"] = {"thinking_level": self._think()}
-        si = self._system_instruction()
-        if si:
-            body["system_instruction"] = si
-        ctx_on = bool(self._get("ctx", False))
-        body["store"] = ctx_on  # без контекста запросы не хранятся на сервере
-        if ctx_on:
-            # цепочка хранится как «модель|id»: чужой interaction_id Google бракует
-            saved = self._get(f"ctx_{ctx_key}", "") or ""
-            m, _, prev = saved.partition("|")
-            if prev and m == model:
-                body["previous_interaction_id"] = prev
+    async def _post_and_poll(self, body: dict, key: str, dbg=None) -> dict:
+        """POST /interactions + опрос до терминального статуса.
 
-        dbg = ({"req": self._describe_body(body), "attempts": []}
-               if self._debug_on() else None)
-        t0 = time.monotonic()
+        Возвращает data. Терминальные статусы: completed / requires_action
+        (агент) / failed (поднимается как GeminiError). Ретраи на «thinking level
+        is not supported» и «invalid argument previous_interaction_id» мутируют
+        body и повторяют запрос — цикл конечен.
+        """
+        model = (body.get("model") or "").lower()
+        headers = {"x-goog-api-key": key}
         while True:
             try:
                 t1 = time.monotonic()
                 data = _as_dict(await self._post(f"{API_BASE}/interactions", key, body))
                 t_post = time.monotonic() - t1
-
                 status = data.get("status", "")
                 iid = data.get("id", "")
                 waited = 0
-                headers = {"x-goog-api-key": key}
                 while status in ("in_progress", "queued") and iid and waited < POLL_TIMEOUT:
                     await asyncio.sleep(3)
                     waited += 3
@@ -651,23 +733,20 @@ class Betonomeshalka(loader.Module):
                         or "запрос не удался"
                     raise GeminiError(friendly_error(0, msg))
 
-                text = self._extract_text(data)
-                if not text:
-                    raise GeminiError("Gemini вернул пустой ответ (возможно, сработал фильтр)")
                 if dbg is not None:
                     usage = data.get("usage") or data.get("usage_metadata") or {}
                     dbg["attempts"].append(
                         f"HTTP 200 за {t_post:.1f}с (id={iid or '-'}, "
                         f"статус сразу: {status or '-'})\n"
                         f"опрос до «{data.get('status', '?')}»: {waited}с\n"
-                        f"ответ: {len(text)} симв"
+                        f"ответ: {len(self._extract_text(data))} симв"
                         + (f", токены: {usage}" if usage else ""))
-                break
+                return data
             except GeminiError as exc:
                 msg = str(exc).lower()
                 # каждый ретрай удаляет из body то, на что ругнулись, — цикл конечен
                 if "thinking level is not supported" in msg and "generation_config" in body:
-                    THINK_UNSUPPORTED.add(model.lower())
+                    THINK_UNSUPPORTED.add(model)
                     del body["generation_config"]
                     logger.warning("[betonomeshalka] %s: thinking_level не поддержан — "
                                    "повторяю без него", model)
@@ -679,10 +758,41 @@ class Betonomeshalka(loader.Module):
                     continue
                 if dbg is not None:
                     dbg["attempts"].append(f"ошибка: {str(exc)[:200]}")
-                    dbg["attempts"].append(f"ИТОГ: ошибка через {time.monotonic() - t0:.1f}с")
-                    raise GeminiError(f"{exc}\n\n{self._render_debug(dbg)}")
                 raise
 
+    async def _ask(self, parts: list, ctx_key: str, key: str) -> str:
+        model = self._model()
+        body: dict = {"model": model, "input": parts}
+        # thinking_level понимают только Gemini 3; gemma и компания отвечают ошибкой
+        if model.lower() not in THINK_UNSUPPORTED:
+            body["generation_config"] = {"thinking_level": self._think()}
+        si = self._system_instruction()
+        if si:
+            body["system_instruction"] = si
+        ctx_on = bool(self._get("ctx", False))
+        body["store"] = ctx_on  # без контекста запросы не хранятся на сервере
+        if ctx_on:
+            # цепочка хранится как «модель|id»: чужой interaction_id Google бракует
+            saved = self._get(f"ctx_{ctx_key}", "") or ""
+            m, _, prev = saved.partition("|")
+            if prev and m == model:
+                body["previous_interaction_id"] = prev
+
+        dbg = ({"req": self._describe_body(body), "attempts": []}
+               if self._debug_on() else None)
+        t0 = time.monotonic()
+        try:
+            data = await self._post_and_poll(body, key, dbg)
+        except GeminiError as exc:
+            if dbg is not None:
+                dbg["attempts"].append(f"ИТОГ: ошибка через {time.monotonic() - t0:.1f}с")
+                raise GeminiError(f"{exc}\n\n{self._render_debug(dbg)}")
+            raise
+
+        text = self._extract_text(data)
+        if not text:
+            raise GeminiError("Gemini вернул пустой ответ (возможно, сработал фильтр)")
+        iid = data.get("id", "")
         if ctx_on and iid:
             self._set(f"ctx_{ctx_key}", f"{model}|{iid}")
         if dbg is not None:
@@ -785,6 +895,286 @@ class Betonomeshalka(loader.Module):
         desc = (data or {}).get("description") if isinstance(data, dict) else ""
         return False, desc or "sendRichMessage не удался"
 
+    # ---------- агент-инструменты ----------
+
+    async def _recent_window(self, message):
+        """Окно недавних сообщений: (текст для модели, {id: сообщение}).
+
+        Модель видит только эти id — значит не может удалить или поправить то,
+        чего нет в списке.
+        """
+        size = self._get("agent_window", DEFAULT_AGENT_WINDOW)
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            size = DEFAULT_AGENT_WINDOW
+        size = min(AGENT_WINDOW_CAP, max(1, size))
+        try:
+            fetched = await self.client.get_messages(message.peer_id, limit=size)
+        except Exception:
+            logger.exception("[betonomeshalka] window fetch failed")
+            return "", {}
+        by_id = {}
+        for m in fetched or []:
+            if m is not None:
+                by_id[m.id] = m
+        lines = []
+        for mid in sorted(by_id):
+            m = by_id[mid]
+            body = " ".join((m.raw_text or "").split())[:120]
+            if not body:
+                kind = self._media_kind(m)
+                body = f"[{kind or 'без текста'}]"
+            lines.append(
+                f"#{mid} | {'я' if getattr(m, 'out', False) else 'друг'} | {body}"
+            )
+        return "\n".join(lines), by_id
+
+    @staticmethod
+    def _as_id(value):
+        """id сообщения из arguments: модель иногда шлёт число строкой."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    async def _tool_react(self, peer, msg_id, emoji, allowed) -> str:
+        msg_id = self._as_id(msg_id)
+        if msg_id is None or msg_id not in allowed:
+            return f"отклонено: id {msg_id} вне окна недавних"
+        em = (emoji or "").replace("️", "").strip()
+        if em not in REACTION_WHITELIST:
+            return f"отклонено: реакция «{emoji}» не поддерживается Telegram"
+        try:
+            from telethon.tl.functions.messages import SendReactionRequest
+            from telethon.tl.types import ReactionEmoji
+            await self.client(SendReactionRequest(
+                peer=peer, msg_id=msg_id, reaction=[ReactionEmoji(emoticon=em)]))
+        except Exception as exc:
+            return f"ошибка реакции: {type(exc).__name__}: {exc}"
+        return f"реакция {em} поставлена на #{msg_id}"
+
+    async def _tool_delete(self, peer, ids, allowed) -> str:
+        ids = [i for i in (self._as_id(x) for x in (ids or [])) if i is not None]
+        if not ids:
+            return "отклонено: список id пуст"
+        if len(ids) > MAX_AGENT_DELETE:
+            return f"отклонено: максимум {MAX_AGENT_DELETE} сообщений за раз"
+        bad = [i for i in ids if i not in allowed]
+        if bad:
+            return f"отклонено: id {bad} вне окна недавних"
+        try:
+            await self.client.delete_messages(peer, ids, revoke=True)
+        except Exception as exc:
+            return f"ошибка удаления: {type(exc).__name__}: {exc}"
+        return "удалено " + ", ".join(f"#{i}" for i in sorted(ids))
+
+    async def _tool_edit(self, peer, msg_id, new_text, by_id) -> str:
+        msg_id = self._as_id(msg_id)
+        if msg_id is None or msg_id not in by_id:
+            return f"отклонено: id {msg_id} вне окна недавних"
+        if not getattr(by_id[msg_id], "out", False):
+            return f"отклонено: #{msg_id} не моё сообщение, редактировать нельзя"
+        try:
+            await self.client.edit_message(
+                peer, msg_id, EDIT_MARKER + (new_text or ""))
+        except Exception as exc:
+            return f"ошибка редактирования: {type(exc).__name__}: {exc}"
+        return f"сообщение #{msg_id} отредактировано"
+
+    async def _run_tool(self, call, peer, by_id) -> str:
+        """Выполнить один function_call модели, вернуть строку-результат."""
+        name = call.get("name") or ""
+        args = call.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {}
+        allowed = set(by_id)
+        if name == "set_reaction":
+            return await self._tool_react(peer, args.get("message_id"),
+                                          args.get("emoji"), allowed)
+        if name == "delete_messages":
+            return await self._tool_delete(peer, args.get("message_ids"), allowed)
+        if name == "edit_message":
+            return await self._tool_edit(peer, args.get("message_id"),
+                                         args.get("new_text"), by_id)
+        return f"отклонено: неизвестный инструмент {name}"
+
+    @staticmethod
+    @staticmethod
+    def _describe_calls(calls: list) -> str:
+        lines = []
+        for c in calls:
+            a = c.get("arguments") or {}
+            if not isinstance(a, dict):
+                a = {}
+            name = c.get("name") or "?"
+            if name == "delete_messages":
+                ids = sorted(i for i in (Betonomeshalka._as_id(x)
+                                         for x in (a.get("message_ids") or []))
+                             if i is not None)
+                lines.append(f"• удалить {', '.join(f'#{i}' for i in ids) or '—'}")
+            elif name == "set_reaction":
+                lines.append(
+                    f"• реакция {a.get('emoji', '?')} на #{a.get('message_id', '?')}")
+            elif name == "edit_message":
+                txt = " ".join(str(a.get("new_text", "")).split())[:80]
+                lines.append(f"• отредактировать #{a.get('message_id', '?')}: {txt}")
+            else:
+                lines.append(f"• {name} {a}")
+        return "\n".join(lines)
+
+    # ---------- агент-цикл ----------
+
+    def _pending(self) -> dict:
+        p = getattr(self, "_agent_pending", None)
+        if p is None:
+            p = self._agent_pending = {}
+        return p
+
+    def _resolve_approval(self, token: str, value: bool) -> bool:
+        p = self._pending().get(token)
+        if not p:
+            return False
+        fut = p["fut"]
+        if not fut.done():
+            fut.set_result(value)
+        return True
+
+    async def _await_approval(self, message, calls: list) -> Optional[bool]:
+        """Гейт перед действиями: форма ✅/❌, без инлайн-бота — .gconfirm/.gcancel.
+
+        True — разрешено, False — отказ, None — не дождались.
+        """
+        desc = self._describe_calls(calls)
+        fut = asyncio.get_running_loop().create_future()
+        token = f"{int(time.time() * 1000)}-{id(fut) % 1000000}"
+        self._pending()[token] = {"fut": fut, "chat": message.chat_id}
+        shown = False
+        inline = getattr(self, "inline", None)
+        if inline is not None:
+            try:
+                shown = bool(await inline.form(
+                    f"🔧 Gemini предлагает выполнить:\n{desc}\n\nРазрешить?",
+                    message,
+                    reply_markup=[[
+                        {"text": "✅ Выполнить", "callback": self._agent_approve,
+                         "args": (token,)},
+                        {"text": "❌ Отмена", "callback": self._agent_reject,
+                         "args": (token,)},
+                    ]],
+                    force_me=True, ttl=AGENT_TTL))
+            except Exception:
+                logger.exception("[betonomeshalka] inline.form failed")
+        if not shown:
+            try:
+                await message.respond(
+                    "🔧 Gemini предлагает выполнить:\n"
+                    + utils.escape_html(desc)
+                    + "\n\n<i>Инлайн-бота нет: </i><code>.gconfirm</code>"
+                      "<i> — выполнить, </i><code>.gcancel</code><i> — отмена"
+                      f" (через {AGENT_TTL // 60} мин само отменится).</i>")
+            except Exception:
+                logger.exception("[betonomeshalka] approval prompt failed")
+        try:
+            return await asyncio.wait_for(fut, AGENT_TTL)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._pending().pop(token, None)
+
+    async def _agent_approve(self, call, token: str):
+        if not self._resolve_approval(token, True):
+            await call.answer("Это подтверждение уже не активно")
+            return
+        await call.edit("✅ Подтверждено — выполняю.")
+        await call.unload()
+
+    async def _agent_reject(self, call, token: str):
+        if not self._resolve_approval(token, False):
+            await call.answer("Это подтверждение уже не активно")
+            return
+        await call.edit("❌ Отменено.")
+        await call.unload()
+
+    async def _ask_agent(self, message, parts: list, ctx_key: str, key: str,
+                         win_text: str, by_id: dict) -> str:
+        """Запрос с инструментами: requires_action → гейт → function_result → …"""
+        model = self._model()
+        body: dict = {
+            "model": model, "store": True, "tools": AGENT_TOOLS,
+            "input": [{"type": "text",
+                       "text": "Недавние сообщения (только их id доступны "
+                               f"инструментам):\n{win_text or '— пусто —'}"}] + parts,
+        }
+        if model.lower() not in THINK_UNSUPPORTED:
+            body["generation_config"] = {"thinking_level": self._think()}
+        si = self._system_instruction()
+        body["system_instruction"] = f"{si}\n{AGENT_CAUTION}" if si else AGENT_CAUTION
+        ctx_on = bool(self._get("ctx", False))
+        if ctx_on:
+            saved = self._get(f"ctx_{ctx_key}", "") or ""
+            m, _, prev = saved.partition("|")
+            if prev and m == model:
+                body["previous_interaction_id"] = prev
+
+        dbg = ({"req": self._describe_body(body), "attempts": []}
+               if self._debug_on() else None)
+        t0 = time.monotonic()
+        actions: list = []
+        try:
+            for _ in range(MAX_AGENT_ROUNDS):
+                data = await self._post_and_poll(body, key, dbg)
+                calls = (self._extract_calls(data)
+                         if data.get("status") == "requires_action" else [])
+                if not calls:
+                    break
+                approved = await self._await_approval(message, calls)
+                if approved is not True:
+                    return ("⏳ Не дождался подтверждения — ничего не выполнено."
+                            if approved is None else "❌ Отменено — ничего не выполнено.")
+                results = []
+                for c in calls:
+                    res = await self._run_tool(c, message.peer_id, by_id)
+                    actions.append(res)
+                    results.append({"type": "function_result",
+                                    "name": c.get("name", ""),
+                                    "call_id": c.get("id", ""), "result": res})
+                body = {"model": model, "previous_interaction_id": data.get("id", ""),
+                        "input": results, "tools": AGENT_TOOLS, "store": True}
+                if model.lower() not in THINK_UNSUPPORTED:
+                    body["generation_config"] = {"thinking_level": self._think()}
+                if dbg is not None:
+                    dbg["attempts"].append("→ " + self._describe_body(body))
+            else:
+                actions.append("⚠️ достиг лимита раундов, дальше не действовал")
+        except GeminiError as exc:
+            if dbg is not None:
+                dbg["attempts"].append(
+                    f"ИТОГ: ошибка через {time.monotonic() - t0:.1f}с")
+                raise GeminiError(f"{exc}\n\n{self._render_debug(dbg)}") from exc
+            raise
+
+        text = self._extract_text(data)
+        iid = data.get("id", "")
+        # незакрытый requires_action в ctx цепочку не кладём: следующий запрос
+        # с таким previous_interaction_id Google бракует
+        if ctx_on and iid and data.get("status") != "requires_action":
+            self._set(f"ctx_{ctx_key}", f"{model}|{iid}")
+        if actions:
+            text = (text + "\n\n" if text else "") + "\n".join(
+                f"🔧 {a}" for a in actions)
+        if not text:
+            raise GeminiError("Gemini вернул пустой ответ (возможно, сработал фильтр)")
+        if dbg is not None:
+            dbg["attempts"].append(f"ИТОГ: {time.monotonic() - t0:.1f}с")
+            block = self._render_debug(dbg)
+            text = self._fit(text, max(500, ANSWER_LIMIT - len(block) - 100)) + "\n\n" + block
+        return text
+
     # ---------- commands ----------
 
     async def _run(self, message, args: str, notes_text: Optional[str] = None,
@@ -863,6 +1253,11 @@ class Betonomeshalka(loader.Module):
             else:
                 active = self._get("active_prompt", "") or "глобальный"
                 model = self._model()
+                if self._get("agent", False):
+                    agent_disp = ("вкл, окно "
+                                  + str(self._get("agent_window", DEFAULT_AGENT_WINDOW)))
+                else:
+                    agent_disp = "выкл"
                 await utils.answer(
                     message,
                     f"🤖 <b>betonomeshalka</b>\n"
@@ -870,7 +1265,8 @@ class Betonomeshalka(loader.Module):
                     f"<b>Промпт:</b> <code>{utils.escape_html(str(active))}</code>\n"
                     f"<b>Раздумья:</b> <code>{self._think()}</code>\n"
                     f"<b>Ключ:</b> <code>{self._mask(key)}</code>\n"
-                    f"<b>Контекст чата:</b> {'вкл' if self._get('ctx', False) else 'выкл'}\n\n"
+                    f"<b>Контекст чата:</b> {'вкл' if self._get('ctx', False) else 'выкл'}\n"
+                    f"<b>Агент-режим:</b> {agent_disp}\n\n"
                     f"<b>Использование:</b> <code>.gemini &lt;запрос&gt;</code> — текстом, "
                     f"ответом на фото/войс/видео/док или в подписи к фото.\n"
                     f"Ответ появится прямо в этом сообщении, под запросом.\n"
@@ -892,9 +1288,13 @@ class Betonomeshalka(loader.Module):
         # с темами все топики делят один chat_id и смешивают диалоги.
         thread = getattr(message, "message_thread_id", None)
         ctx_key = f"{message.chat_id}_{thread}" if thread else str(message.chat_id)
+        agent_on = bool(self._get("agent", False))
+        win_text, by_id = await self._recent_window(message) if agent_on else ("", {})
         await show(head + f"⏳ <i>{m_esc} думает…</i>")
         try:
-            answer = await self._ask(parts, ctx_key, key)
+            answer = (await self._ask_agent(message, parts, ctx_key, key,
+                                            win_text, by_id)
+                      if agent_on else await self._ask(parts, ctx_key, key))
         except GeminiError as exc:
             logger.error("[betonomeshalka] api error: %s", exc)
             await show(head + f"❌ {utils.escape_html(str(exc))}")
@@ -1121,6 +1521,80 @@ class Betonomeshalka(loader.Module):
         await utils.answer(message, "🧹 Контекст сброшен.")
 
     @loader.command(
+        ru_doc="Агент-режим: .gagent on|off | .gagent window N (1-20)",
+        en_doc="Agent mode: .gagent on|off | .gagent window N (1-20)",
+    )
+    async def gagent(self, message):
+        """Toggle tool-calling agent mode and its recent-messages window"""
+        args = utils.get_args_raw(message).strip().lower()
+        if args.startswith("window"):
+            num = args[len("window"):].strip()
+            if num.isdigit() and 1 <= int(num) <= AGENT_WINDOW_CAP:
+                self._set("agent_window", int(num))
+                await utils.answer(
+                    message,
+                    f"🪟 Модель видит <b>{int(num)}</b> недавних сообщений — то, чего нет "
+                    "в окне, она удалить или изменить не сможет.",
+                )
+            else:
+                await utils.answer(
+                    message,
+                    f"ℹ️ Сейчас окно: <b>{self._get('agent_window', DEFAULT_AGENT_WINDOW)}</b>.\n"
+                    f"Задать: <code>.gagent window N</code> (1–{AGENT_WINDOW_CAP}).",
+                )
+            return
+        if args in ("on", "1", "enable"):
+            self._set("agent", True)
+            await utils.answer(
+                message,
+                "🟢 <b>Агент-режим включён.</b> <code>.gemini &lt;инструкция&gt;</code> теперь "
+                "может ставить реакции, удалять и править сообщения, но каждое действие "
+                "надо подтвердить кнопкой <b>✅</b> (без инлайн-бота — <code>.gconfirm</code>).\n"
+                "Окно недавних: <code>.gagent window N</code>.",
+            )
+        elif args in ("off", "0", "disable"):
+            self._set("agent", False)
+            await utils.answer(
+                message, "🔴 <b>Агент-режим выключен</b> — только текстовые ответы.")
+        else:
+            await utils.answer(
+                message,
+                f"🤖 Агент-режим: <b>{'вкл' if self._get('agent', False) else 'выкл'}</b>\n"
+                f"Окно недавних: <b>{self._get('agent_window', DEFAULT_AGENT_WINDOW)}</b> сообщ.\n"
+                f"<code>.gagent on|off</code>, <code>.gagent window 1..{AGENT_WINDOW_CAP}</code>",
+            )
+
+    async def _approve_by_command(self, message, value: bool):
+        """.gconfirm/.gcancel — ответ гейту, когда inline-форма недоступна."""
+        pend = [t for t, p in self._pending().items()
+                if p.get("chat") == message.chat_id]
+        if not pend:
+            await utils.answer(message, "ℹ️ Ничего не ждёт подтверждения.")
+            return
+        if self._resolve_approval(pend[-1], value):
+            await utils.answer(
+                message,
+                "✅ Подтверждено — выполняю." if value else "❌ Отменено.")
+        else:
+            await utils.answer(message, "ℹ️ Это подтверждение уже не активно.")
+
+    @loader.command(
+        ru_doc="Подтвердить действие агента (когда нет инлайн-бота)",
+        en_doc="Approve pending agent action (when no inline bot)",
+    )
+    async def gconfirm(self, message):
+        """Approve the agent's pending actions"""
+        await self._approve_by_command(message, True)
+
+    @loader.command(
+        ru_doc="Отменить действие агента (когда нет инлайн-бота)",
+        en_doc="Cancel pending agent action (when no inline bot)",
+    )
+    async def gcancel(self, message):
+        """Cancel the agent's pending actions"""
+        await self._approve_by_command(message, False)
+
+    @loader.command(
         ru_doc="Уровень раздумий: .gthink [minimal|low|medium|high] (ниже = быстрее)",
         en_doc="Thinking level: .gthink [minimal|low|medium|high] (lower = faster)",
     )
@@ -1336,6 +1810,12 @@ class Betonomeshalka(loader.Module):
             + self._think() + "</code>, ниже = быстрее)\n"
             "<code>.gchat on|off</code> — память диалога на чат\n"
             "<code>.gclear</code> — сбросить контекст чата\n"
+            "<code>.gagent on|off</code> — агент-режим: модель сама ставит реакции, удаляет и "
+            "правит сообщения, но каждое действие надо подтвердить кнопкой ✅\n"
+            "<code>.gagent window N</code> — сколько недавних сообщений ей видно (сейчас <code>"
+            + str(self._get("agent_window", DEFAULT_AGENT_WINDOW)) + "</code>); "
+            "вне окна id для неё недоступны\n"
+            "<code>.gconfirm</code> / <code>.gcancel</code> — ответ гейту, если инлайн-бота нет\n"
             "<code>.gdebug on|off</code> — дебаг: дамп запроса/ответа Gemini с таймингами\n"
             "<code>.gbot &lt;запрос&gt;</code> — как .gemini, но ответ rich-ом через heroku-бота\n"
             "<code>.gbotset</code> — статус rich-доставки; "
