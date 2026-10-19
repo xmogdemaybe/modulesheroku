@@ -916,7 +916,9 @@ class Betonomeshalka(loader.Module):
             return "", {}
         by_id = {}
         for m in fetched or []:
-            if m is not None:
+            # команду не показываем: снесёт «.gemini удали это» — и отвечать будет
+            # некуда (message.edit по удалённому = MessageIdInvalidError)
+            if m is not None and m.id != message.id:
                 by_id[m.id] = m
         lines = []
         for mid in sorted(by_id):
@@ -1209,13 +1211,26 @@ class Betonomeshalka(loader.Module):
         status_box = {}
 
         async def show(text):
-            if has_media:
-                if "m" in status_box:
-                    await status_box["m"].edit(text)
-                else:
+            """Статус/ответ. Никогда не бросает: если правка невозможна (сообщение
+            удалено, залито лимитом, недоступен edit) — шлём отдельным сообщением."""
+            try:
+                if has_media:
+                    if "m" in status_box:
+                        await status_box["m"].edit(text)
+                        return
                     status_box["m"] = await message.respond(text)
-            else:
+                    return
                 await message.edit(text)
+            except Exception:
+                logger.exception("[betonomeshalka] show: edit/respond failed")
+            try:
+                # в форумах без топика ответ уедет в General
+                thread = getattr(message, "message_thread_id", None)
+                await self.client.send_message(
+                    message.peer_id, text, parse_mode="HTML",
+                    **({"message_thread_id": thread} if thread else {}))
+            except Exception:
+                logger.exception("[betonomeshalka] show: send_message failed")
 
         parts = []
         kind = self._media_kind(album[0]) if album else None
