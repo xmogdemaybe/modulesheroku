@@ -31,18 +31,34 @@ class SleepMod(loader.Module):
     RESPONSE_HARD_CAP = 2000
     ANSWERED_IDS_CAP = 512
 
+    # Всё состояние — одним ключом: db.set в форке синхронно дёргает save()
+    # всей базы (heroku/database.py:396), лишний вызов — лишняя сериализация
+    STATE_KEY = "state"
+    OWNER_PERSIST_EVERY = 60
+
+    # Служебные аккаунты Telegram: код входа, уведомления о входах
+    SERVICE_IDS = (777000, 42777)
+
+    # Заметка к исключению — короткая подпись, а не хранилище текстов
+    NOTE_MAX_LEN = 100
+
     async def client_ready(self, client, db):
         self.logger = logging.getLogger("Sleep")
         self.client = client
         self.db = db
         self.last_response_time = {}
         self._owner_last_active = None
+        self._owner_persisted_at = 0.0
         # id наших же автоответов: они приходят в watcher как исходящие,
         # и без этого списка каждый автоответ считался бы активностью владельца
         self._auto_reply_ids = deque(maxlen=64)
         # id сообщений, на которые мы уже ответили: диспетчер хикки может
         # повторно доставить тот же апдейт после обрыва соединения
         self._answered_ids = deque(maxlen=self.ANSWERED_IDS_CAP)
+        # чаты, где прямо сейчас уходит автоответ. Нужны потому, что исходящая
+        # копия ответа прилетает в watcher ещё до возврата из await respond() —
+        # по id её в этот момент опознать нельзя
+        self._inflight_chats = {}
         # вотчеры запускаются параллельно (dispatcher.py:692, ensure_future),
         # поэтому проверка «не отвечали ли уже» и запись должны быть атомарными
         self._send_lock = asyncio.Lock()
@@ -61,7 +77,6 @@ class SleepMod(loader.Module):
             "schedule": dict(self.DEFAULT_SCHEDULE),
             "active_grace": self.DEFAULT_ACTIVE_GRACE,
             "max_age": self.DEFAULT_MAX_AGE,
-            "last_response": {},
         }
         for key, value in defaults.items():
             try:
@@ -172,10 +187,14 @@ class SleepMod(loader.Module):
 
     def _restore_state(self):
         """Загрузить отметки из БД: без этого рестарт дина забывал, кому уже ответили"""
-        stored = self._get_db("last_response", {})
+        stored = self._get_db(self.STATE_KEY, {})
+        if not isinstance(stored, dict):
+            stored = {}
+
         restored = {}
-        if isinstance(stored, dict):
-            for uid, ts in stored.items():
+        raw_last = stored.get("last_response")
+        if isinstance(raw_last, dict):
+            for uid, ts in raw_last.items():
                 try:
                     restored[str(uid)] = float(ts)
                 except (TypeError, ValueError):
@@ -185,16 +204,42 @@ class SleepMod(loader.Module):
         self.last_response_time = {uid: ts for uid, ts in restored.items() if ts > cutoff}
         self._prune_state(self._epoch())
 
-        owner_active = self._get_db("owner_active", None)
+        raw_answered = stored.get("answered_ids")
+        if isinstance(raw_answered, (list, tuple)):
+            ids = []
+            for mid in raw_answered:
+                try:
+                    ids.append(int(mid))
+                except (TypeError, ValueError):
+                    continue
+            self._answered_ids = deque(ids[-self.ANSWERED_IDS_CAP :], maxlen=self.ANSWERED_IDS_CAP)
+
+        raw_owner = stored.get("owner_active")
         try:
-            self._owner_last_active = None if owner_active is None else float(owner_active)
+            self._owner_last_active = None if raw_owner is None else float(raw_owner)
         except (TypeError, ValueError):
             self._owner_last_active = None
 
-    def _persist_state(self):
-        """Сохранить отметки в БД (значения должны быть JSON-serializable)"""
-        self._set_db("last_response", dict(self.last_response_time))
-        self._set_db("owner_active", self._owner_last_active)
+        self._owner_persisted_at = 0.0
+
+    def _persist_state(self, force=False):
+        """Сохранить отметки одним ключом.
+
+        Активность владельца пишем не чаще раза в минуту: исходящих сообщений
+        бывает много, а каждый db.set — это полная сериализация базы.
+        """
+        now = self._epoch()
+        if not force and now - self._owner_persisted_at < self.OWNER_PERSIST_EVERY:
+            return
+        self._owner_persisted_at = now
+        self._set_db(
+            self.STATE_KEY,
+            {
+                "last_response": dict(self.last_response_time),
+                "answered_ids": list(self._answered_ids),
+                "owner_active": self._owner_last_active,
+            },
+        )
 
     def _prune_state(self, now_ts):
         """Очистка старых записей, чтобы память не росла бесконечно"""
@@ -208,6 +253,54 @@ class SleepMod(loader.Module):
             self.last_response_time = dict(
                 sorted(self.last_response_time.items(), key=lambda kv: kv[1])[-self.RESPONSE_HARD_CAP :]
             )
+
+    def _is_bot(self, message):
+        """Бот в личке: автоответ ему запускает пинг-понг до FloodWait"""
+        try:
+            sender = message.sender
+        except Exception:
+            # сущности нет в кэше — из-за этого молчать не будем
+            return False
+        return bool(getattr(sender, "bot", False))
+
+    def _handle_outgoing(self, message):
+        """Исходящее: либо наш автоответ, либо владелец действительно проснулся"""
+        if message.id in self._auto_reply_ids:
+            return
+
+        chat_id = getattr(message, "chat_id", None)
+        if chat_id is not None and self._inflight_chats.get(chat_id):
+            return
+
+        # Отложка и посты в канал — это не «владелец сел за телефон»:
+        # автопостер или запланированное сообщение глушило бы автоответчик
+        if getattr(message, "from_scheduled", False) or getattr(message, "action", None):
+            return
+        if getattr(message, "is_channel", False):
+            return
+
+        # Метку берём из message.date: после реконнекта старое исходящее
+        # с телефона не должно выглядеть как «он пишет прямо сейчас»
+        ts = self._msg_ts(message)
+        if ts is None:
+            ts = self._epoch()
+        if self._owner_last_active is None or ts > self._owner_last_active:
+            self._owner_last_active = ts
+        self._persist_state()
+
+    def _reserve_inflight(self, chat_id):
+        if chat_id is None:
+            return
+        self._inflight_chats[chat_id] = self._inflight_chats.get(chat_id, 0) + 1
+
+    def _release_inflight(self, chat_id):
+        if chat_id is None:
+            return
+        left = self._inflight_chats.get(chat_id, 0) - 1
+        if left > 0:
+            self._inflight_chats[chat_id] = left
+        else:
+            self._inflight_chats.pop(chat_id, None)
 
     @loader.loop(interval=15, autostart=True)
     async def _auto_off_loop(self):
@@ -240,49 +333,65 @@ class SleepMod(loader.Module):
     async def watcher(self, message):
         """Следить за входящими ПМ и отправлять автоответ"""
         try:
-            # 1. Базовые проверки сообщения
+            # 1. Исходящие: наш автоответ или активность владельца
             if getattr(message, "out", False):
-                if message.id not in self._auto_reply_ids:
-                    self._owner_last_active = self._epoch()
+                self._handle_outgoing(message)
                 return
+
             if not hasattr(message, "text") or not hasattr(message, "sender_id"):
                 return
             if message.is_group or message.is_channel:
                 return
-            if message.sender_id is None or message.sender_id == self._my_id:
+
+            sender_id = message.sender_id
+            if sender_id is None or sender_id == self._my_id:
                 return
 
-            # 2. Ручной режим (автовыключением занимается _auto_off_loop)
+            # 2. Служебные аккаунты, инлайн-боты и обычные боты: автоответ боту
+            #    запускает пинг-понг «неизвестная команда» вплоть до FloodWait
+            if sender_id in self.SERVICE_IDS or getattr(message, "via_bot_id", None):
+                return
+            if self._is_bot(message):
+                return
+
+            # Служебные сообщения (звонок, «X вступил в чат») не трогаем
+            if getattr(message, "action", None):
+                return
+
+            # 3. Ручной режим (автовыключением занимается _auto_off_loop)
             manual_enabled = self._get_db("sleep_enabled", False)
 
             # Если ручной режим НЕ включен И по расписанию не время — МОЛЧИМ
             if not manual_enabled and not self._is_in_schedule():
                 return
 
-            # 3. Проверка текста сообщения
-            msg_text = getattr(message, "text", None)
-            if not msg_text or not isinstance(msg_text, str):
+            # 4. Отвечаем на текст И на медиа: голосовое, кружок, фото и стикер
+            #    без подписи имеют пустой text, но человек всё равно писал
+            msg_text = getattr(message, "text", "")
+            if not isinstance(msg_text, str):
+                msg_text = ""
+            if not msg_text.strip() and getattr(message, "media", None) is None:
                 return
 
-            sender_id = str(message.sender_id)
+            sender_key = str(sender_id)
 
-            # 4. Проверка исключений
+            # 5. Проверка исключений
             excluded = self._get_db("excluded_users", self.DEFAULT_EXCLUDED)
-            if isinstance(excluded, dict) and sender_id in excluded:
+            if isinstance(excluded, dict) and sender_key in excluded:
                 return
 
             now_ts = self._epoch()
 
-            # 5. Офлайн-очередь: сообщение протухло, пока юзербота не было в сети
+            # 6. Офлайн-очередь: сообщение протухло, пока юзербота не было в сети
             max_age = self._int_db("max_age", self.DEFAULT_MAX_AGE)
             msg_ts = self._msg_ts(message)
             if max_age > 0 and msg_ts is not None and now_ts - msg_ts > max_age:
                 self.logger.info(
-                    "[Sleep] Сообщение от %s старше %s сек — не отвечаем", sender_id, max_age
+                    "[Sleep] Сообщение от %s старше %s сек — не отвечаем", sender_key, max_age
                 )
                 return
 
-            # 6. Владелец недавно сам писал — значит он онлайн, молчим
+            # 7. Владелец недавно сам писал — значит он онлайн, молчим
             grace = self._int_db("active_grace", self.DEFAULT_ACTIVE_GRACE)
             if (
                 grace > 0
@@ -291,14 +400,14 @@ class SleepMod(loader.Module):
             ):
                 return
 
-            # 7. Задержка между ответами одному юзеру
+            # 8. Задержка между ответами одному юзеру
             delay = self._int_db("sleep_delay", self.DEFAULT_DELAY)
 
-            # 8. Формирование текста: персональный ответ > общий текст
+            # 9. Формирование текста: персональный ответ > общий текст
             response_text = None
             personal = self._get_db("personal_replies", self.DEFAULT_PERSONAL)
             if isinstance(personal, dict):
-                candidate = personal.get(sender_id)
+                candidate = personal.get(sender_key)
                 if isinstance(candidate, str) and candidate:
                     response_text = candidate
 
@@ -308,35 +417,39 @@ class SleepMod(loader.Module):
             if not response_text or not isinstance(response_text, str):
                 return
 
-            # 9. Проверка «уже отвечали» и отправка — под локом. Диспетчер хикки
-            #    запускает каждый вотчер через ensure_future (dispatcher.py:692),
-            #    поэтому вся очередь после подключения разбирается параллельно:
-            #    без лока все копии успевают прочесть пустой last_response_time
-            #    и ответить залпом. Отметку ставим ДО отправки, иначе неудачная
-            #    попытка при обрыве соединения повторяется на каждом следующем
-            #    сообщении этого же юзера.
+            # 10. Проверка «уже отвечали» и отметка — под локом, отправка снаружи.
+            #     Диспетчер хикки запускает каждый вотчер через ensure_future
+            #     (dispatcher.py:692), поэтому очередь после подключения разбирается
+            #     параллельно: без лока все копии читают пустой last_response_time
+            #     и отвечают залпом. Отметку ставим ДО отправки, иначе неудачная
+            #     попытка при обрыве повторяется на каждом следующем сообщении.
+            #     Сетевой вызов внутри лока держать нельзя: зависшая отправка
+            #     (FloodWait, таймаут) выстроила бы в очередь все входящие.
+            chat_id = getattr(message, "chat_id", None)
             async with self._send_lock:
                 if message.id in self._answered_ids:
                     return
 
                 if delay > 0:
-                    last_time = self.last_response_time.get(sender_id)
+                    last_time = self.last_response_time.get(sender_key)
                     if last_time and (now_ts - last_time < delay):
                         return
 
                 self._answered_ids.append(message.id)
-                self.last_response_time[sender_id] = now_ts
+                self.last_response_time[sender_key] = now_ts
                 self._prune_state(now_ts)
-                self._persist_state()
+                self._persist_state(force=True)
+                self._reserve_inflight(chat_id)
 
-                try:
-                    sent = await message.respond(response_text)
-                except Exception as e:
-                    self.logger.error("[Sleep] Автоответ для %s не ушел: %s", sender_id, e)
-                    return
-
+            sent = None
+            try:
+                sent = await message.respond(response_text)
+            except Exception as e:
+                self.logger.error("[Sleep] Автоответ для %s не ушел: %s", sender_key, e)
+            finally:
                 if sent is not None:
                     self._auto_reply_ids.append(sent.id)
+                self._release_inflight(chat_id)
 
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в watcher: %s", e)
@@ -369,7 +482,7 @@ class SleepMod(loader.Module):
                 await utils.answer(message, f"❌ <b>Режим ВЫКЛЮЧЕН</b>{note}")
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleepcmd: %s", e)
-            await utils.answer(message, f"❌ Ошибка: {e}")
+            await utils.answer(message, f"❌ Ошибка: {utils.escape_html(str(e))}")
 
     async def sleepfaqcmd(self, message):
         """Справка по командам: .sleepfaq"""
@@ -401,7 +514,13 @@ class SleepMod(loader.Module):
             "подключения он получит максимум один ответ: на лежалое старше "
             "<code>.sleepmaxage</code> не отвечаем вообще, а дубли одного и того же "
             "сообщения режем по id. Отметки «кому ответили» лежат в БД, поэтому "
-            "перезапуск дина залпа не устраивает.\n\n"
+            "перезапуск дина залпа не устраивает.\n"
+            "ℹ️ Ботам, инлайн-ботам и служебным аккаунтам Telegram (777000) не "
+            "отвечаем — иначе начинается пинг-понг «неизвестная команда».\n"
+            "ℹ️ Отвечаем и на голосовые, кружки, фото и стикеры без подписи. "
+            "Служебные сообщения (звонок, «вступил в чат») игнорируем.\n"
+            "ℹ️ Активностью владельца считаются только живые сообщения: отложка и "
+            "посты в каналы (автопостеры) автоответчик не глушат.\n\n"
             "dev: @xmogde, это упоминание только в этом ебучем скрипте, мб будет в других"
         )
         await utils.answer(message, text)
@@ -415,7 +534,9 @@ class SleepMod(loader.Module):
                 current = self._get_db("sleep_text", self.DEFAULT_TEXT)
                 if not current:
                     current = self.DEFAULT_TEXT
-                await utils.answer(message, f"📝 Текущий текст:\n{current}")
+                await utils.answer(
+                    message, f"📝 Текущий текст:\n{utils.escape_html(current)}"
+                )
                 return
 
             if len(text) > 1000:
@@ -426,7 +547,7 @@ class SleepMod(loader.Module):
             await utils.answer(message, "✅ Текст установлен")
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleeptextcmd: %s", e)
-            await utils.answer(message, f"❌ Ошибка: {e}")
+            await utils.answer(message, f"❌ Ошибка: {utils.escape_html(str(e))}")
 
     async def sleepdelaycmd(self, message):
         """Установить задержку между ответами: .sleepdelay 60 (в секундах)"""
@@ -458,7 +579,7 @@ class SleepMod(loader.Module):
             await utils.answer(message, f"✅ Задержка установлена: {delay} сек")
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleepdelaycmd: %s", e)
-            await utils.answer(message, f"❌ Ошибка: {e}")
+            await utils.answer(message, f"❌ Ошибка: {utils.escape_html(str(e))}")
 
     async def sleepactivecmd(self, message):
         """Окно «владелец онлайн»: .sleepactive | .sleepactive 300 (сек) | .sleepactive 0 (выкл)"""
@@ -494,7 +615,7 @@ class SleepMod(loader.Module):
                 )
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleepactivecmd: %s", e)
-            await utils.answer(message, f"❌ Ошибка: {e}")
+            await utils.answer(message, f"❌ Ошибка: {utils.escape_html(str(e))}")
 
     async def sleepmaxagecmd(self, message):
         """Сколько секунд сообщение ещё свежее: .sleepmaxage | .sleepmaxage 1800 | 0 (выкл)"""
@@ -540,7 +661,7 @@ class SleepMod(loader.Module):
                 )
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleepmaxagecmd: %s", e)
-            await utils.answer(message, f"❌ Ошибка: {e}")
+            await utils.answer(message, f"❌ Ошибка: {utils.escape_html(str(e))}")
 
     async def sleepschedulecmd(self, message):
         """
@@ -608,11 +729,20 @@ class SleepMod(loader.Module):
             else:
                 range_str = "диапазон не задан"
 
-            await utils.answer(message, f"{status_str}\n⏱️ Диапазон: <b>{range_str}</b>")
+            # _is_in_schedule() с пустыми границами всегда False, поэтому
+            # «включено» без диапазона — это не работающее расписание
+            warn = ""
+            if is_enabled and not start and not end:
+                warn = (
+                    "\n⚠️ <i>Без диапазона расписание не сработает никогда. "
+                    "Задай время: <code>.sleepschedule 22:00 08:00</code></i>"
+                )
+
+            await utils.answer(message, f"{status_str}\n⏱️ Диапазон: <b>{range_str}</b>{warn}")
 
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleepschedulecmd: %s", e)
-            await utils.answer(message, f"❌ Ошибка: {e}")
+            await utils.answer(message, f"❌ Ошибка: {utils.escape_html(str(e))}")
 
     async def sleepexcludecmd(self, message):
         """Управление исключениями: .sleepexclude (список) или .sleepexclude ID [заметка] (добавить/удалить)"""
@@ -632,14 +762,22 @@ class SleepMod(loader.Module):
                             note = data.get("note", "без заметки")
                         else:
                             note = str(data)
-                        text += f"• <code>{uid_str}</code>: {note}\n"
+                        text += f"• <code>{utils.escape_html(uid_str)}</code>: {utils.escape_html(note)}\n"
                     await utils.answer(message, text)
                 else:
                     await utils.answer(message, "📋 Список исключений пуст")
                 return
 
             user_id = args[0]
+            # Исключение сверяется в вотчере по str(message.sender_id), поэтому
+            # @username сюда записать нельзя — запись просто не сработала бы
+            if not user_id.isdigit():
+                await utils.answer(message, "❌ ID должен быть числом (узнать: .id в ответ на сообщение)")
+                return
+
             note = args[1] if len(args) > 1 else "без заметки"
+            if len(note) > self.NOTE_MAX_LEN:
+                note = note[: self.NOTE_MAX_LEN]
 
             # Переключатель: если уже есть — удаляем, если нет — добавляем
             if user_id in excluded:
@@ -649,11 +787,15 @@ class SleepMod(loader.Module):
             else:
                 excluded[user_id] = {"note": note}
                 self._set_db("excluded_users", excluded)
-                await utils.answer(message, f"✅ Юзер <code>{user_id}</code> добавлен в исключения (<i>{note}</i>)")
+                await utils.answer(
+                    message,
+                    f"✅ Юзер <code>{user_id}</code> добавлен в исключения "
+                    f"(<i>{utils.escape_html(note)}</i>)",
+                )
 
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleepexcludecmd: %s", e)
-            await utils.answer(message, f"❌ Ошибка: {e}")
+            await utils.answer(message, f"❌ Ошибка: {utils.escape_html(str(e))}")
 
     async def sleepreplycmd(self, message):
         """Персональный ответ: .sleepreply (список) | .sleepreply ID текст (задать) | .sleepreply ID (удалить)"""
@@ -669,7 +811,10 @@ class SleepMod(loader.Module):
                 if replies:
                     text = "💬 <b>Персональные ответы:</b>\n"
                     for uid_str, personal_text in replies.items():
-                        text += f"• <code>{uid_str}</code>: {personal_text}\n"
+                        text += (
+                            f"• <code>{utils.escape_html(uid_str)}</code>: "
+                            f"{utils.escape_html(personal_text)}\n"
+                        )
                     await utils.answer(message, text)
                 else:
                     await utils.answer(message, "💬 Персональных ответов нет")
@@ -709,4 +854,4 @@ class SleepMod(loader.Module):
 
         except Exception as e:
             self.logger.error("[Sleep] Ошибка в sleepreplycmd: %s", e)
-            await utils.answer(message, f"❌ Ошибка: {e}")
+            await utils.answer(message, f"❌ Ошибка: {utils.escape_html(str(e))}")
