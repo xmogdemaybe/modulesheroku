@@ -54,6 +54,12 @@
 #   модуль не подхватывает).
 # Меню живёт 15 минут, форма отката — 10: по истечении срока они удаляются сами
 # (иначе в чате остаются сообщения с мёртвыми кнопками).
+#
+# Анти-флуд: когда связи не было (ноут закрыли, инет лёг на ночь), телега на
+# reconnect отдаёт накопившиеся сообщения разом. Модуль правит их по одному с
+# паузой, для «ночных» сообщений не кидает мемы и формы отката, а на FloodWait
+# или зависший инлайн-бот вовсе замолкает на время. Одинаковые ошибки в чат
+# логов пишутся не чаще раза в 5 минут, а не каждой правкой.
 
 import asyncio
 import base64
@@ -63,6 +69,7 @@ import io
 import logging
 import re
 import time
+from datetime import datetime, timezone
 
 from .. import loader, utils
 
@@ -122,12 +129,35 @@ MAX_UNDO = 20
 # inline.form() ждёт подтверждения от инлайн-бота без таймаута: если оно не
 # придёт, навсегда зависнет и команда, и watcher. Ограничиваем ожидание.
 FORM_OPEN = 20
+# Анти-флуд после обрыва связи. Пока инета не было, телега копит апдейты и на
+# reconnect отдаёт их залпом: watcher получил бы сотни сообщений сразу. Поэтому
+# исходящие запросы идут по одному с паузой, «ночные» хвосты правим молча
+# (без мемов и форм), а на FloodWait вообще замолкаем.
+SEND_GAP = 0.5
+BACKLOG_AGE = 180
+FLOOD_PAUSE = 60
+FLOOD_MAX = 900
+# не больше N форм отката за окно: в активном чате правок много, и каждая форма —
+# это отдельное сообщение в чате логов
+MAX_FORMS = 5
+FORMS_WINDOW = 20
+# форк отдаёт каждый лог уровня INFO+ сообщением в чат логов, а исключение —
+# отдельным сообщением с кнопками. Одинаковую ошибку шлём не чаще раза в 5 минут.
+LOG_GAP = 300
 LOG_MODULES = ("hikka_logs", "tester")
 
 
 def _is_flood(exc):
     """FloodWait: немедленный повтор только удлинит блокировку."""
     return "flood" in type(exc).__name__.lower() or "flood" in str(exc).lower()
+
+
+def _flood_seconds(exc):
+    secs = getattr(exc, "seconds", 0)
+    try:
+        return max(0, int(secs))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _u16_len(text):
@@ -179,6 +209,12 @@ class TriggerChangerMod(loader.Module):
         self._menu_chat = {}  # uid -> чат, где открыто меню: там же ждём картинку
         self._form_timers = {}  # key -> задача автоудаления формы
         self._bg_tasks = set()  # фоновые задачи: без ссылки их съедает сборщик мусора
+        # анти-флуд: очередь исходящих и пауза после FloodWait
+        self._send_lock = asyncio.Lock()
+        self._last_send = 0.0
+        self._flood_until = 0.0
+        self._log_at = {}  # kind -> ts: одинаковые ошибки в чат логов пачкой не шлём
+        self._form_times = []  # ts последних форм отката, чтобы не спамить в логи
         # pid -> файл телеги: повторно слать готовый объект быстрее, чем каждый
         # раз загружать байты из БД заново
         self._photo_cache = {}
@@ -219,7 +255,7 @@ class TriggerChangerMod(loader.Module):
             value = self.db.get(MODNAME, key)
             return default if value is None else value
         except Exception as exc:
-            logger.error("[TriggerChanger] db read %s: %r", key, exc)
+            self._log_once("db-read", logging.ERROR, "[TriggerChanger] db read %s: %r", key, exc)
             return default
 
     def _set(self, key, value):
@@ -237,7 +273,7 @@ class TriggerChangerMod(loader.Module):
                 return
             self.db.set(MODNAME, key, value)
         except Exception as exc:
-            logger.error("[TriggerChanger] db write %s: %r", key, exc)
+            self._log_once("db-write", logging.ERROR, "[TriggerChanger] db write %s: %r", key, exc)
 
     def _store_entries(self, entries):
         """Сохранить правила, пересобрав нумерацию подряд: 1..N (без дырок).
@@ -304,7 +340,7 @@ class TriggerChangerMod(loader.Module):
                 if isinstance(k, str) and k.startswith("photo:")
             ]
         except Exception as exc:
-            logger.error("[TriggerChanger] photo keys scan: %r", exc)
+            self._log_once("photo-keys", logging.ERROR, "[TriggerChanger] photo keys scan: %r", exc)
             return []
 
     def _drop_keys(self, keys):
@@ -324,7 +360,7 @@ class TriggerChangerMod(loader.Module):
             if removed:
                 self.db.save()
         except Exception as exc:
-            logger.error("[TriggerChanger] db bulk delete: %r", exc)
+            self._log_once("db-del", logging.ERROR, "[TriggerChanger] db bulk delete: %r", exc)
 
     def _gc_photos(self, entries):
         """Убрать photo:*-ключи, на которые не ссылается ни одно правило.
@@ -621,6 +657,90 @@ class TriggerChangerMod(loader.Module):
         task.add_done_callback(self._bg_tasks.discard)
         return task
 
+    # ---------- анти-флуд ----------
+    def _online(self):
+        """Есть ли смысл стучаться в телегу. Если коннект лежит, запрос всё равно
+        не пройдёт, а каждая попытка — это сообщение с трейсбеком в чат логов."""
+        try:
+            return bool(self.client.is_online())
+        except Exception:
+            return True  # не смогли проверить — действуем как обычно
+
+    async def _pace(self):
+        """Пропустить очередной исходящий запрос или нет.
+
+        После обрыва телега отдаёт накопившиеся за ночь апдейты залпом: без паузы
+        watcher выстрелил бы сотней правок/мемов подряд и получил FloodWait, а
+        следом сотню трейсбеков в чат логов. Заодно здесь сидим молча, пока
+        телега сама не разрешит повторить.
+        """
+        if self._flood_until > time.time():
+            return False
+        if not self._online():
+            self._log_once("offline", logging.DEBUG, "[TriggerChanger] связи нет — пропускаем запрос")
+            return False
+        async with self._send_lock:
+            gap = self._last_send + SEND_GAP - time.monotonic()
+            if gap > 0:
+                await asyncio.sleep(gap)
+            self._last_send = time.monotonic()
+        return True
+
+    def _note_flood(self, exc):
+        """Телега попросила паузу — запоминаем и до её конца ничего не шлём.
+
+        Заодно сюда же идут таймауты: если инлайн-бот или телега не ответили за
+        FORM_OPEN секунд, следующая сотня таких же запросов после reconnect
+        зависнет так же — дешевле замолчать самой.
+        """
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            pause = FLOOD_PAUSE
+        elif _is_flood(exc):
+            pause = min(_flood_seconds(exc) or FLOOD_PAUSE, FLOOD_MAX)
+        else:
+            return 0
+        self._flood_until = max(self._flood_until, time.time() + pause)
+        self._log_once("flood", logging.WARNING, "[TriggerChanger] пауза %s сек: %r", pause, exc)
+        return pause
+
+    def _log_once(self, kind, level, fmt, *args):
+        """Лог одного и того же рода не чаще раза в LOG_GAP секунд.
+
+        Форк каждое сообщение уровня INFO и выше отправляет в чат логов, а
+        исключение — отдельным сообщением с кнопками. Залпом после обрыва это и
+        есть флуд, поэтому шумные ветки тут режем.
+        """
+        now = time.time()
+        if now - self._log_at.get(kind, 0) < LOG_GAP:
+            return
+        self._log_at[kind] = now
+        logger.log(level, fmt, *args)
+
+    def _msg_age(self, message):
+        """Сколько секунд сообщению: телега на reconnect отдаёт вчерашние пачкой."""
+        date = getattr(message, "date", None)
+        if not isinstance(date, datetime):
+            return 0
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - date).total_seconds())
+
+    def _form_budget(self):
+        """Разрешить ещё одну форму отката (не больше MAX_FORMS за FORMS_WINDOW)."""
+        now = time.time()
+        self._form_times = [ts for ts in self._form_times if now - ts < FORMS_WINDOW]
+        if len(self._form_times) >= MAX_FORMS:
+            self._log_once(
+                "forms",
+                logging.DEBUG,
+                "[TriggerChanger] форм отката слишком много (%s за %s сек) — пропускаем",
+                MAX_FORMS,
+                FORMS_WINDOW,
+            )
+            return False
+        self._form_times.append(now)
+        return True
+
     async def _open_form(self, *args, **kwargs):
         """inline.form() с ограниченным ожиданием: без подтверждения инлайн-бота
         форк висит вечно и утаскивает за собой watcher/команду."""
@@ -637,18 +757,27 @@ class TriggerChangerMod(loader.Module):
         unit = units.get(getattr(obj, "unit_id", None)) or {}
         return unit.get("chat"), unit.get("message_id")
 
-    async def _kill_form(self, obj):
-        """Убрать форму из чата так, чтобы обработчик кнопки не упал."""
+    async def _kill_form(self, obj, pace=True):
+        """Убрать форму из чата так, чтобы обработчик кнопки не упал.
+
+        pace=False — для нажатия кнопки: там запрос ровно один и пользователь
+        ждёт результата, а по таймеру их может набежать сотня.
+        """
         if obj is None:
             return False
         chat, mid = self._form_ids(obj)
         if chat is None or mid is None:
-            logger.info("[TriggerChanger] форму не удалить: форк не запомнил сообщение")
+            self._log_once(
+                "form-ids", logging.DEBUG, "[TriggerChanger] форму не удалить: форк не запомнил сообщение"
+            )
+            return False
+        if pace and not await self._pace():
             return False
         try:
             await obj.delete()
         except Exception as exc:
-            logger.info("[TriggerChanger] форма не удалилась: %r", exc)
+            self._note_flood(exc)
+            self._log_once("form-del", logging.DEBUG, "[TriggerChanger] форма не удалилась: %r", exc)
             return False
         # delete() юнит из памяти не убирает — кнопки живут до ttl
         try:
@@ -700,7 +829,19 @@ class TriggerChangerMod(loader.Module):
         """В TG летит только форма отката — остальное остаётся в терминале."""
         chat = self._logchat()
         if chat is None:
-            logger.info("[TriggerChanger] msg %s поправлено, но чат логов не задан", message.id)
+            self._log_once(
+                "nologchat",
+                logging.DEBUG,
+                "[TriggerChanger] msg %s поправлено, но чат логов не задан",
+                message.id,
+            )
+            return
+        if not await self._pace():
+            # после обрыва формы прилетели бы пачкой в чат логов — просто молчим
+            self._forget_undo(key)
+            return
+        if not self._form_budget():
+            self._forget_undo(key)
             return
         entry = self._undo.get(key) or {}
         orig = entry.get("orig", "")
@@ -728,7 +869,10 @@ class TriggerChangerMod(loader.Module):
                 ),
             )
         except Exception as exc:
-            logger.warning("[TriggerChanger] undo form failed: %r", exc)
+            self._note_flood(exc)
+            self._log_once(
+                "undo-form", logging.WARNING, "[TriggerChanger] undo form failed: %r", exc
+            )
             return
         if not form:
             return
@@ -742,7 +886,7 @@ class TriggerChangerMod(loader.Module):
         entry = self._undo.pop(key, None)
         if entry is None:
             await call.answer("поздно — правка уже забыта", alert=True)
-            await self._kill_form(call)
+            await self._kill_form(call, pace=False)
             return
         ents = entry.get("ents") or []
         try:
@@ -760,7 +904,7 @@ class TriggerChangerMod(loader.Module):
         except Exception as exc:
             logger.warning("[TriggerChanger] revert failed (%s): %r", key, exc)
             await call.answer(f"не откатилось: {exc}"[:ALERT_MAX], alert=True)
-            await self._kill_form(call)
+            await self._kill_form(call, pace=False)
             return
         for photo_msg in entry.get("photo_msgs") or []:
             try:
@@ -768,13 +912,13 @@ class TriggerChangerMod(loader.Module):
             except Exception as exc:
                 logger.info("[TriggerChanger] картинку отката не удалить: %r", exc)
         await call.answer("откатил")
-        await self._kill_form(call)
+        await self._kill_form(call, pace=False)
 
     async def _inline_keep(self, call, key):
         self._form_timer_cancel(key)
         self._undo.pop(key, None)
         await call.answer("ок")
-        await self._kill_form(call)
+        await self._kill_form(call, pace=False)
 
     # ---------- watcher ----------
 
@@ -845,10 +989,15 @@ class TriggerChangerMod(loader.Module):
 
             new_text, matched = self._apply(text)
             photo_entries = [e for e in matched if e.get("pid")]
+            # после обрыва телега отдаёт ночные сообщения залпом: текст поправим,
+            # а мемы и формы отката в чат логов за них кидать не будем
+            stale = self._msg_age(message) > BACKLOG_AGE
 
             gone = False
             applied = False
             if new_text != text:
+                if not await self._pace():
+                    return
                 if not new_text.strip() and message.media is None:
                     # правило вырезало весь текст — пустое сообщение не оставляем
                     try:
@@ -856,7 +1005,14 @@ class TriggerChangerMod(loader.Module):
                         gone = True
                         applied = True
                     except Exception as exc:
-                        logger.warning("[TriggerChanger] delete failed (msg %s): %r", message.id, exc)
+                        self._note_flood(exc)
+                        self._log_once(
+                            "delete",
+                            logging.WARNING,
+                            "[TriggerChanger] delete failed (msg %s): %r",
+                            message.id,
+                            exc,
+                        )
                         return
                 elif 0 < len(new_text) <= 4096:
                     ents = self._remap_entities(
@@ -868,11 +1024,18 @@ class TriggerChangerMod(loader.Module):
                         await message.edit(new_text, parse_mode=lambda t: (t, ents))
                         applied = True
                     except Exception as exc:
-                        logger.warning("[TriggerChanger] edit failed (msg %s): %r", message.id, exc)
+                        self._note_flood(exc)
+                        self._log_once(
+                            "edit",
+                            logging.WARNING,
+                            "[TriggerChanger] edit failed (msg %s): %r",
+                            message.id,
+                            exc,
+                        )
                         return
 
             photo_msgs = []
-            if photo_entries:
+            if photo_entries and not stale:
                 photo_msgs = await self._send_rule_photos(message, photo_entries, gone)
                 if photo_msgs:
                     self._mark_edited(key)
@@ -881,12 +1044,19 @@ class TriggerChangerMod(loader.Module):
                 self._mark_edited(key)
                 # без чата логов форма отката всё равно не уйдёт — нечего
                 # держать в памяти объект сообщения
-                if self.config["undo"] and self._logchat() is not None:
+                if (
+                    self.config["undo"]
+                    and not stale
+                    and self._logchat() is not None
+                ):
                     await self._notify_undo(
                         message, self._remember_undo(message, text, gone, photo_msgs)
                     )
         except Exception as exc:
-            logger.exception("[TriggerChanger] watcher error: %r", exc)
+            self._note_flood(exc)
+            self._log_once(
+                "watcher", logging.ERROR, "[TriggerChanger] watcher error: %r", exc
+            )
 
     async def _send_rule_photos(self, message, entries, gone=False):
         """Картинки всех сработавших правил одной каруселью.
@@ -910,19 +1080,28 @@ class TriggerChangerMod(loader.Module):
                 break
         if not files:
             return []
+        if not await self._pace():
+            return []
         if len(files) == 1:
             sent = await self._send_photo(send, pids[0], files[0])
             return [] if sent is None else [sent]
         try:
             album = await send(file=files)
         except Exception as exc:
-            # альбом мог не пойти из-за смешанных типов медиа — тогда шлём по одной
+            self._note_flood(exc)
+            # альбом мог не пойти из-за смешанных типов медиа или попросить паузу
             if _is_flood(exc):
-                logger.warning("[TriggerChanger] карусель не ушла (флуд): %r", exc)
+                self._log_once("album-flood", logging.DEBUG, "[TriggerChanger] карусель не ушла (флуд): %r", exc)
                 return []
-            logger.info("[TriggerChanger] карусель не ушла (%r), шлю по одной", exc)
+            if self._flood_until > time.time() or not await self._pace():
+                return []
+            self._log_once(
+                "album", logging.DEBUG, "[TriggerChanger] карусель не ушла (%r), шлю по одной", exc
+            )
             msgs = []
             for pid, f in zip(pids, files):
+                if not await self._pace():
+                    break
                 one = await self._send_photo(send, pid, f)
                 if one is not None:
                     msgs.append(one)
@@ -953,18 +1132,32 @@ class TriggerChangerMod(loader.Module):
         try:
             sent = await send(file=file)
         except Exception as exc:
+            self._note_flood(exc)
             # ссылка на файл могла протухнуть: кэш сбрасываем и пробуем байтами,
             # иначе правило останется без мема
             self._photo_cache.pop(pid, None)
             retry = None if _is_flood(exc) else self._photo_bytes(pid)
             if retry is None:
-                logger.warning("[TriggerChanger] photo %s send failed: %r", pid, exc)
+                self._log_once(
+                    "photo", logging.DEBUG, "[TriggerChanger] photo %s send failed: %r", pid, exc
+                )
                 return None
-            logger.info("[TriggerChanger] кэш фото %s не сработал (%r), шлю байты", pid, exc)
+            if not await self._pace():
+                return None
+            self._log_once(
+                "photo-retry",
+                logging.DEBUG,
+                "[TriggerChanger] кэш фото %s не сработал (%r), шлю байты",
+                pid,
+                exc,
+            )
             try:
                 sent = await send(file=retry)
             except Exception as exc2:
-                logger.warning("[TriggerChanger] photo %s send failed: %r", pid, exc2)
+                self._note_flood(exc2)
+                self._log_once(
+                    "photo", logging.DEBUG, "[TriggerChanger] photo %s send failed: %r", pid, exc2
+                )
                 return None
         media = getattr(sent, "photo", None) or getattr(sent, "document", None)
         if media is not None:
@@ -1446,7 +1639,7 @@ class TriggerChangerMod(loader.Module):
         # иначе следующее фото юзера прилипнет к правилу
         self._form_timer_cancel(f"menu:{call.sender_id}")
         self._menu_state_clear(call.sender_id)
-        await self._kill_form(call)
+        await self._kill_form(call, pace=False)
 
     def _menu_expired(self, uid, form):
         """Срок меню вышел: чистим состояния, если это всё то же меню."""
@@ -1983,6 +2176,8 @@ class TriggerChangerMod(loader.Module):
         self.config["undo"] = True
         self._pending = {}
         self._edited = {}
+        self._flood_until = 0.0
+        self._form_times = []
         # после _drop_all_photos кэш указывает на файлы удалённых правил
         self._photo_cache = {}
         for task in self._form_timers.values():
