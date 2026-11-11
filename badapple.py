@@ -4,6 +4,7 @@
 # анимацию. Курсор (last_id сообщения) хранится в БД, рестарт продолжает с того
 # же места. Флуд-вейт: спим ровно сколько просит Telegram, курсор не двигаем.
 # Дошли до начала канала — уведомление в сохраненки и стоп.
+# После загрузки модуль на паузе: запуск — .badapple_start.
 #
 # Команды:
 #   .badapple                  статус
@@ -71,7 +72,7 @@ class BadAppleMod(loader.Module):
 
     @loader.loop(interval=5, autostart=True, wait_before=True)
     async def _worker(self):
-        if not self.get("enabled", True) or self.get("done", False):
+        if not self.get("enabled", False) or self.get("done", False):
             return
         if time.time() < self.get("next_at", 0):
             return
@@ -93,7 +94,7 @@ class BadAppleMod(loader.Module):
             "завершено"
             if self.get("done", False)
             else "работает"
-            if self.get("enabled", True)
+            if self.get("enabled", False)
             else "пауза"
         )
         await utils.answer(

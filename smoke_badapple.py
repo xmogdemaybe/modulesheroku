@@ -162,7 +162,7 @@ MSGS = [FakeMsg(10, True), FakeMsg(9, False), FakeMsg(8, True), FakeMsg(7, True)
 
 async def test_order_and_cursor():
     client = FakeClient(MSGS)
-    store = {}
+    store = {"enabled": True}
     mod = make_mod(client, store)
     for _ in range(4):
         tick(store)
@@ -193,7 +193,7 @@ async def test_resume_after_restart():
 
 async def test_flood_wait():
     client = FakeClient(MSGS, flood_times=1)
-    store = {}
+    store = {"enabled": True}
     mod = make_mod(client, store)
     tick(store)
     await mod._worker()
@@ -210,6 +210,15 @@ async def test_flood_wait():
 async def test_pause():
     client = FakeClient(MSGS)
     store = {"enabled": False}
+    mod = make_mod(client, store)
+    tick(store)
+    await mod._worker()
+    assert client.iter_calls == [] and client.uploaded == []
+
+
+async def test_default_paused():
+    client = FakeClient(MSGS)
+    store = {}
     mod = make_mod(client, store)
     tick(store)
     await mod._worker()
@@ -238,6 +247,7 @@ TESTS = [
     test_resume_after_restart,
     test_flood_wait,
     test_pause,
+    test_default_paused,
     test_interval_command,
     test_channel_command,
 ]
