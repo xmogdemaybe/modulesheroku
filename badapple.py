@@ -25,7 +25,7 @@ from .. import loader, utils
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CHANNEL = "badappleintg"
+DEFAULT_CHANNEL = "badappletg"
 DEFAULT_INTERVAL = 60
 
 
