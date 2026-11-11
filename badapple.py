@@ -15,6 +15,7 @@
 #   .badapple_interval <сек>   интервал между заливками (мин. 5, дефолт 15)
 #   .badapple_channel <user>   сменить канал (курсор сбрасывается)
 #   .badapple_reset            залить канал заново (будут дубли в галерее)
+#   .badapple_wipe [confirm]   полный сброс настроек (двухэтапно, авы не трогает)
 
 import io
 import logging
@@ -165,4 +166,24 @@ class BadAppleMod(loader.Module):
         self._reset_cursor()
         await utils.answer(
             message, "<b>Курсор сброшен, заливка пойдет с конца канала.</b>"
+        )
+
+    @loader.command()
+    async def badapple_wipe(self, message: Message):
+        """[confirm] — полный сброс настроек модуля, двухэтапно"""
+        if utils.get_args_raw(message).strip().lower() != "confirm":
+            await utils.answer(
+                message,
+                "<b>BadApple: полный сброс настроек.</b>\n"
+                "Сотрутся: канал, интервал, курсор, счетчик залитого, состояние.\n"
+                "Уже залитые аватарки в профиле НЕ удаляются.\n"
+                f"Подтверждение: <code>{self.get_prefix()}badapple_wipe confirm</code>",
+            )
+            return
+        self._db.pop(self.__class__.__name__, None)
+        self._db.save()
+        await utils.answer(
+            message,
+            "<b>BadApple: настройки сброшены.</b> "
+            "Модуль на паузе, канал и интервал — дефолтные.",
         )
