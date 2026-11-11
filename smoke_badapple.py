@@ -35,15 +35,27 @@ def build_env():
     (pkg / "__init__.py").write_text("", encoding="utf-8")
     (pkg / "badapple.py").write_text(MODULE_SRC, encoding="utf-8")
     (outer / "loader.py").write_text(
+        "class _DB(dict):\n"
+        "    def get(self, owner, key, default=None):\n"
+        "        try:\n"
+        "            return self[owner][key]\n"
+        "        except KeyError:\n"
+        "            return default\n"
+        "    def set(self, owner, key, value):\n"
+        "        self.setdefault(owner, {})[key] = value\n"
+        "        self.save()\n"
+        "    def save(self):\n"
+        "        return True\n"
         "class Module:\n"
         "    strings = {}\n"
         "    def __init__(self):\n"
-        "        self._store = {}\n"
+        "        self._db = _DB()\n"
         "        self.tg_id = 0\n"
+        "        self.get_prefix = lambda: '.'\n"
         "    def get(self, key, default=None):\n"
-        "        return self._store.get(key, default)\n"
+        "        return self._db.get(self.__class__.__name__, key, default)\n"
         "    def set(self, key, value):\n"
-        "        self._store[key] = value\n"
+        "        self._db.set(self.__class__.__name__, key, value)\n"
         "def command(*a, **k):\n"
         "    def deco(f):\n"
         "        return f\n"
@@ -151,7 +163,7 @@ class FakeMessage:
 
 def make_mod(client, store):
     mod = badapple.BadAppleMod()
-    mod._store = store
+    mod._db[mod.__class__.__name__] = store
     mod._client = client
     mod.tg_id = 42
     return mod
@@ -258,20 +270,54 @@ async def test_error_streak_reset():
 
 async def test_interval_command():
     assert badapple.DEFAULT_INTERVAL == 15
-    mod = make_mod(FakeClient(MSGS), {})
+    store = {}
+    mod = make_mod(FakeClient(MSGS), store)
     msg = FakeMessage("3")
     await mod.badapple_interval(msg)
-    assert "interval" not in mod._store and msg.replies
+    assert "interval" not in store and msg.replies
     msg = FakeMessage("120")
     await mod.badapple_interval(msg)
-    assert mod._store["interval"] == 120
+    assert store["interval"] == 120
 
 
 async def test_channel_command():
-    mod = make_mod(FakeClient(MSGS), {"last_id": 555, "uploaded": 9, "done": True})
+    store = {"last_id": 555, "uploaded": 9, "done": True}
+    mod = make_mod(FakeClient(MSGS), store)
     await mod.badapple_channel(FakeMessage("https://t.me/somechan"))
-    assert mod._store["channel"] == "somechan", mod._store
-    assert mod._store["last_id"] == 0 and mod._store["done"] is False
+    assert store["channel"] == "somechan", store
+    assert store["last_id"] == 0 and store["done"] is False
+
+
+async def test_wipe_requires_confirm():
+    mod = make_mod(FakeClient(MSGS), {})
+    assert hasattr(mod, "badapple_wipe")
+    store = {"channel": "x", "interval": 99, "enabled": True, "last_id": 555}
+    mod = make_mod(FakeClient(MSGS), store)
+    msg = FakeMessage("")
+    await mod.badapple_wipe(msg)
+    assert store["last_id"] == 555 and store["interval"] == 99, store
+    assert msg.replies and "confirm" in msg.replies[0]
+
+
+async def test_wipe_confirm():
+    mod = make_mod(FakeClient(MSGS), {})
+    assert hasattr(mod, "badapple_wipe")
+    store = {
+        "channel": "x",
+        "interval": 99,
+        "enabled": True,
+        "last_id": 555,
+        "uploaded": 9,
+        "done": True,
+    }
+    mod = make_mod(FakeClient(MSGS), store)
+    await mod.badapple_wipe(FakeMessage("confirm"))
+    assert mod.get("last_id", 0) == 0
+    assert mod.get("uploaded", 0) == 0
+    assert mod.get("enabled", False) is False
+    assert mod.get("done", False) is False
+    assert mod.get("interval", badapple.DEFAULT_INTERVAL) == badapple.DEFAULT_INTERVAL
+    assert mod.get("channel", badapple.DEFAULT_CHANNEL) == badapple.DEFAULT_CHANNEL
 
 
 TESTS = [
@@ -284,6 +330,8 @@ TESTS = [
     test_error_streak_reset,
     test_interval_command,
     test_channel_command,
+    test_wipe_requires_confirm,
+    test_wipe_confirm,
 ]
 PREDICTED_MUTATION_FAILURES = {"test_order_and_cursor", "test_resume_after_restart"}
 
