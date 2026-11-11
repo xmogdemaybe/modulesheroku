@@ -257,6 +257,7 @@ async def test_error_streak_reset():
 
 
 async def test_interval_command():
+    assert badapple.DEFAULT_INTERVAL == 15
     mod = make_mod(FakeClient(MSGS), {})
     msg = FakeMessage("3")
     await mod.badapple_interval(msg)
