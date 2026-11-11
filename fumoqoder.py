@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# requires: aiohttp curl_cffi
+# requires: aiohttp
 # FumoQoder — random Touhou fumo autoposter for Hikka / Heroku.
 #
 # Sources (all fetched together and mixed, unless a single one is requested):
 #   Safebooru / Konachan             -> boorus (safe-only)
-#   Reddit (r/Fumofumo)              -> toggleable source; listing via direct JSON or
-#                                       the Arctic Shift archive (.fumoredditmode)
+#   Reddit (r/Fumofumo)              -> toggleable source; listing via public archives
+#                                       (Arctic Shift / PullPush), since Reddit itself
+#                                       blocks datacenter & RU IPs outright (.fumoredditmode)
 #
 # Commands:
 #   .fumo on|off                 toggle autoposting
@@ -20,9 +21,7 @@
 #   .fumoreddit on|off           toggle the Reddit source
 #   .fumoredditmedia pics|videos|all   what to fetch from Reddit (videos need
 #                                       ffmpeg installed to restore their sound)
-#   .fumoredditauth <id> <secret>      Reddit OAuth app credentials (403 fallback)
-#   .fumoredditcookie <cookie>         browser cookie for Reddit (403 fallback)
-#   .fumoredditmode auto|json|arctic   listing via direct JSON or Arctic Shift archive
+#   .fumoredditmode auto|arctic|pullpush   which Reddit archive to list from
 #   .fumosub <subreddit>         set subreddit (default Fumofumo)
 #   .fumoschedule on|off         use Telegram scheduled messages for autoposting
 #   .fumotime 07:00|off          wall-clock publish time for scheduled posts (local)
@@ -48,13 +47,6 @@ from typing import Any, Optional
 
 import aiohttp
 
-try:
-    # Reddit's anti-scraper checks the TLS fingerprint (JA3) + HTTP/2, which
-    # aiohttp cannot fake; curl_cffi impersonates a real Chrome down to TLS.
-    from curl_cffi import requests as cffi_requests
-except ImportError:
-    cffi_requests = None
-
 from telethon.errors import (
     ChatAdminRequiredError,
     ChatWriteForbiddenError,
@@ -79,27 +71,6 @@ MIN_INTERVAL = 60
 MAX_INTERVAL = 7 * 24 * 3600
 DEFAULT_INTERVAL = 3600
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FumoQoder/1.2"
-# Reddit blocks browser-like UAs; it requires a distinct bot-style one.
-REDDIT_USER_AGENT = "linux:FumoQoder:1.2 (by /u/xmogdemaybe)"
-# 2026: Reddit 403s non-browser clients on listing endpoints even with valid
-# cookies (anti-AI-scraper), so the JSON path mimics a real Chrome navigation.
-REDDIT_BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
-              "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Language": "ru-RU,ru;q=0.9",
-    "Cache-Control": "max-age=0",
-    "Priority": "u=0, i",
-    "Sec-Ch-Ua": '"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
 
 SAFE_EXTS = {
     ".jpg": "image/jpeg",
@@ -281,31 +252,8 @@ class FumoQoder(loader.Module):
                 return posts
         return []
 
-    async def _reddit_token(self) -> str:
-        """App-only OAuth token (client_credentials), cached in memory until expiry."""
-        now = time.time()
-        token = getattr(self, "_rd_token", None)
-        if token and now < getattr(self, "_rd_token_exp", 0) - 60:
-            return token
-        session = await self._http()
-        auth = aiohttp.BasicAuth(self._get("reddit_id", ""), self._get("reddit_secret", ""))
-        async with session.post(
-            "https://www.reddit.com/api/v1/access_token",
-            auth=auth,
-            data={"grant_type": "client_credentials"},
-            headers={"User-Agent": REDDIT_USER_AGENT},
-        ) as resp:
-            resp.raise_for_status()
-            payload = await resp.json(content_type=None)
-        if not isinstance(payload, dict) or "access_token" not in payload:
-            err = payload.get("error") if isinstance(payload, dict) else payload
-            raise RuntimeError(f"reddit oauth failed: {err!r}")
-        self._rd_token = payload["access_token"]
-        self._rd_token_exp = now + int(payload.get("expires_in", 3600))
-        return self._rd_token
-
     def _reddit_parse(self, items: list, sub: str) -> list:
-        """Shared parser for reddit post dicts (listing JSON children data or Arctic Shift rows)."""
+        """Shared parser for reddit post dicts from an archive (Arctic Shift / PullPush)."""
         media = self._get("reddit_media", "pics")
         posts = []
         for d in items:
@@ -342,47 +290,6 @@ class FumoQoder(loader.Module):
             posts.append(item)
         return posts
 
-    async def _reddit_listing(self, sub: str) -> Any:
-        """www hot.json via curl_cffi (real Chrome TLS fingerprint) or aiohttp fallback."""
-        url = f"https://www.reddit.com/r/{sub}/hot.json"
-        params = {"limit": "50", "raw_json": "1"}
-        cookie = (self._get("reddit_cookie", "") or "").strip()
-        if cffi_requests is not None:
-            # impersonate supplies its own consistent Chrome headers; only add the cookie.
-            async with cffi_requests.AsyncSession(impersonate="chrome") as session:
-                resp = await session.get(
-                    url, params=params,
-                    headers={"Cookie": cookie} if cookie else None,
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                return resp.json()
-        headers = dict(REDDIT_BROWSER_HEADERS)
-        if cookie:
-            headers["Cookie"] = cookie
-        return await self._json(url, params, headers=headers)
-
-    async def _src_reddit_json(self, sub: str) -> list:
-        """Direct Reddit listing: OAuth if creds are set, else www JSON with full browser headers (+cookie)."""
-        payload = None
-        if self._get("reddit_id", "") and self._get("reddit_secret", ""):
-            try:
-                token = await self._reddit_token()
-                payload = await self._json(
-                    f"https://oauth.reddit.com/r/{sub}/hot", {"limit": "50", "raw_json": "1"},
-                    headers={
-                        "User-Agent": REDDIT_USER_AGENT,
-                        "Authorization": f"Bearer {token}",
-                    },
-                )
-            except Exception as exc:
-                logger.warning("[FumoQoder] reddit oauth failed: %r", exc)
-        if payload is None:
-            payload = await self._reddit_listing(sub)
-        children = (payload or {}).get("data", {}).get("children", []) if isinstance(payload, dict) else []
-        items = [c.get("data", {}) for c in children if isinstance(c, dict)]
-        return self._reddit_parse(items, sub)
-
     async def _src_reddit_arctic(self, sub: str) -> list:
         """Arctic Shift (arctic-shift.photon-reddit.com): a third-party Reddit archive.
 
@@ -399,21 +306,43 @@ class FumoQoder(loader.Module):
         items = payload.get("data", []) if isinstance(payload, dict) else []
         return self._reddit_parse(items, sub)
 
-    async def _src_reddit(self) -> list:
-        sub = self._get("subreddit", DEFAULT_SUBREDDIT) or DEFAULT_SUBREDDIT
+    async def _src_reddit_pullpush(self, sub: str) -> list:
+        """PullPush (api.pullpush.io): the Pushshift successor, a second Reddit archive.
+
+        Kept as redundancy next to Arctic Shift — different host/operator, so when one
+        archive is down or rate-limited the other usually still answers. Like Arctic it
+        serves i.redd.it image URLs, which aren't IP-blocked the way reddit.com is.
+        """
+        payload = await self._json(
+            "https://api.pullpush.io/reddit/search/submission/",
+            {"subreddit": sub, "size": "100", "sort": "desc"},
+            headers={"User-Agent": USER_AGENT},
+        )
+        items = payload.get("data", []) if isinstance(payload, dict) else []
+        return self._reddit_parse(items, sub)
+
+    def _reddit_mode(self) -> str:
+        """Effective reddit listing mode; legacy 'json' (direct Reddit) maps to auto."""
         mode = self._get("reddit_mode", "auto")
+        return mode if mode in ("auto", "arctic", "pullpush") else "auto"
+
+    async def _src_reddit(self) -> list:
+        """List Reddit posts from a public archive (Reddit itself is IP-blocked)."""
+        sub = self._get("subreddit", DEFAULT_SUBREDDIT) or DEFAULT_SUBREDDIT
+        mode = self._reddit_mode()
+        if mode == "pullpush":
+            return await self._src_reddit_pullpush(sub)
         if mode == "arctic":
             return await self._src_reddit_arctic(sub)
+        # auto: Arctic first (proven reliable), PullPush as the backup.
         try:
-            posts = await self._src_reddit_json(sub)
+            posts = await self._src_reddit_arctic(sub)
         except Exception as exc:
-            if mode == "json":
-                raise
-            logger.warning("[FumoQoder] reddit json failed (%r), trying Arctic Shift", exc)
+            logger.warning("[FumoQoder] arctic failed (%r), trying PullPush", exc)
             posts = []
         if posts:
             return posts
-        return await self._src_reddit_arctic(sub)
+        return await self._src_reddit_pullpush(sub)
 
     @staticmethod
     def _dapi_parse(payload: Any) -> list:
@@ -1255,69 +1184,18 @@ class FumoQoder(loader.Module):
         await utils.answer(message, f"\U0001F4E1 <b>Reddit media:</b> <code>{args}</code>{note}")
 
     @loader.command(
-        ru_doc="Reddit OAuth: .fumoredditauth <client_id> <client_secret> (пусто — сброс)",
-        en_doc="Reddit OAuth app credentials: .fumoredditauth <client_id> <client_secret>",
-    )
-    async def fumoredditauth(self, message):
-        """Reddit app-only OAuth credentials; used when anonymous JSON is blocked (403)"""
-        parts = utils.get_args_raw(message).split()
-        if not parts:
-            self._set("reddit_id", "")
-            self._set("reddit_secret", "")
-            self._rd_token = None
-            await utils.answer(message, "\U0001F4E1 <b>Reddit auth cleared (anonymous mode).</b>")
-            return
-        if len(parts) != 2:
-            await utils.answer(
-                message, "\u26A0\uFE0F <b>Usage:</b> <code>.fumoredditauth &lt;client_id&gt; &lt;client_secret&gt;</code>"
-            )
-            return
-        self._set("reddit_id", parts[0])
-        self._set("reddit_secret", parts[1])
-        self._rd_token = None
-        await utils.answer(
-            message, f"\U0001F4E1 <b>Reddit auth set</b> (id <code>{utils.escape_html(parts[0])}</code>). "
-            "Testing token...\n" + await self._test_reddit_token()
-        )
-
-    async def _test_reddit_token(self) -> str:
-        try:
-            await self._reddit_token()
-            return "\u2705 <b>Token OK.</b>"
-        except Exception as exc:
-            logger.warning("[FumoQoder] reddit token test failed: %r", exc)
-            return f"\u274C <b>Token failed:</b> <code>{utils.escape_html(repr(exc))}</code>"
-
-    @loader.command(
-        ru_doc="Куки Reddit из браузера: .fumoredditcookie <cookie> (пусто — сброс)",
-        en_doc="Browser cookies for Reddit: .fumoredditcookie <cookie> (empty clears)",
-    )
-    async def fumoredditcookie(self, message):
-        """Cookie header for anonymous Reddit requests (copy from a logged-in browser)"""
-        cookie = utils.get_args_raw(message).strip()
-        self._set("reddit_cookie", cookie)
-        if not cookie:
-            await utils.answer(message, "\U0001F36A <b>Reddit cookie cleared.</b>")
-            return
-        await utils.answer(
-            message, f"\U0001F36A <b>Reddit cookie set</b> ({len(cookie)} chars). "
-            "Test it: <code>.fumotest reddit</code>"
-        )
-
-    @loader.command(
-        ru_doc="Способ брать список постов Reddit: .fumoredditmode auto|json|arctic",
-        en_doc="Reddit listing method: .fumoredditmode auto|json|arctic",
+        ru_doc="Способ брать список постов Reddit: .fumoredditmode auto|arctic|pullpush",
+        en_doc="Reddit listing method: .fumoredditmode auto|arctic|pullpush",
     )
     async def fumoredditmode(self, message):
-        """Where to get the Reddit post list: json (direct), arctic (archive mirror), auto"""
+        """Which public Reddit archive to list posts from (Reddit itself is IP-blocked)."""
         args = utils.get_args_raw(message).strip().lower()
-        if args not in ("auto", "json", "arctic"):
-            state = self._get("reddit_mode", "auto")
+        if args not in ("auto", "arctic", "pullpush"):
             await utils.answer(
-                message, f"<b>Reddit mode:</b> {state}\n"
-                "<code>.fumoredditmode auto|json|arctic</code>\n"
-                "<i>auto = direct JSON, on failure Arctic Shift archive;\n"
-                "arctic = archive only (works where Reddit listings are IP-blocked)</i>"
+                message, f"<b>Reddit mode:</b> {self._reddit_mode()}\n"
+                "<code>.fumoredditmode auto|arctic|pullpush</code>\n"
+                "<i>auto = Arctic Shift, on failure PullPush;\n"
+                "arctic / pullpush = that archive only</i>"
             )
             return
         self._set("reddit_mode", args)
@@ -1427,10 +1305,7 @@ class FumoQoder(loader.Module):
             f"<b>Sources:</b> <code>{utils.escape_html(', '.join(active))}</code>\n"
             f"<b>Reddit media:</b> <code>{utils.escape_html(self._get('reddit_media', 'pics'))}</code>\n"
             f"<b>ffmpeg (video sound):</b> <code>{'found' if self._ffmpeg() else 'NOT found — videos skipped'}</code>\n"
-            f"<b>Reddit mode:</b> <code>{utils.escape_html(self._get('reddit_mode', 'auto'))}</code>\n"
-            f"<b>Reddit client:</b> <code>{'curl_cffi (chrome TLS)' if cffi_requests else 'aiohttp (install curl_cffi!)'}</code>\n"
-            f"<b>Reddit auth:</b> {'set' if self._get('reddit_id', '') else 'anonymous'}\n"
-            f"<b>Reddit cookie:</b> {'set' if (self._get('reddit_cookie', '') or '').strip() else 'none'}\n"
+            f"<b>Reddit mode:</b> <code>{utils.escape_html(self._reddit_mode())}</code>\n"
             f"<b>Meta footer:</b> {'on' if self._get('meta', True) else 'off'}\n"
             f"<b>Caption:</b> <code>{utils.escape_html(self._get('caption', '') or '—')}</code>\n"
             f"<b>Exclude:</b> <code>{utils.escape_html(self._exclude() or '—')}</code>\n"
@@ -1470,12 +1345,8 @@ class FumoQoder(loader.Module):
             "<code>.fumoreddit on|off</code> — Reddit source (mixed with the boorus)\n"
             "<code>.fumosub Fumofumo</code> — subreddit\n"
             "<code>.fumoredditmedia pics|videos|all</code> — what to fetch\n"
-            "<code>.fumoredditauth &lt;client_id&gt; &lt;client_secret&gt;</code> — OAuth app "
-            "(saves you when anonymous access is 403-blocked); empty = clear\n"
-            "<code>.fumoredditcookie &lt;cookie&gt;</code> — browser cookie fallback "
-            "(dev tools → Network → any reddit request → Cookie header); empty = clear\n"
-            "<code>.fumoredditmode auto|json|arctic</code> — listing source: direct JSON "
-            "or Arctic Shift archive (works where Reddit listings are IP-blocked)\n\n"
+            "<code>.fumoredditmode auto|arctic|pullpush</code> — which Reddit archive to list "
+            "from (Reddit itself is IP-blocked; auto = Arctic, then PullPush)\n\n"
             "<b>Misc</b>\n"
             "<code>.fumotest</code> — post now\n"
             "<code>.fumotest reddit 2</code> — post 2 from a specific source\n"
