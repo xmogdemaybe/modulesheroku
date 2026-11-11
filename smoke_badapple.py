@@ -15,7 +15,7 @@ import time
 import types
 from pathlib import Path
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.CRITICAL)
 
 MUTATE = "--mutate" in sys.argv
 MODULE_SRC = Path(__file__).with_name("badapple.py").read_text(encoding="utf-8")
@@ -113,9 +113,10 @@ class FakeMsg:
 
 
 class FakeClient:
-    def __init__(self, msgs, flood_times=0):
+    def __init__(self, msgs, flood_times=0, fail_times=0):
         self.msgs = msgs
         self.flood_times = flood_times
+        self.fail_times = fail_times
         self.uploaded = []
         self.iter_calls = []
         self.sent = []
@@ -133,6 +134,9 @@ class FakeClient:
         if self.flood_times:
             self.flood_times -= 1
             raise FloodWaitError(42)
+        if self.fail_times:
+            self.fail_times -= 1
+            raise RuntimeError("upload failed")
         self.uploaded.append(request.file[1])
 
     async def send_message(self, peer, text):
@@ -200,6 +204,7 @@ async def test_flood_wait():
     assert client.uploaded == []
     assert store.get("last_id", 0) == 0
     assert store["next_at"] >= time.time() + 42, store
+    assert store.get("err_streak", 0) == 0, "flood must not count as error"
     await mod._worker()
     assert len(client.iter_calls) == 1, "next_at gate ignored"
     tick(store)
@@ -225,6 +230,32 @@ async def test_default_paused():
     assert client.iter_calls == [] and client.uploaded == []
 
 
+async def test_error_streak_notify():
+    client = FakeClient(MSGS, fail_times=100)
+    store = {"enabled": True}
+    mod = make_mod(client, store)
+    for _ in range(12):
+        tick(store)
+        await mod._worker()
+    assert store.get("err_streak", 0) == 12, store
+    assert len(client.sent) == 1, client.sent
+
+
+async def test_error_streak_reset():
+    client = FakeClient(MSGS, fail_times=3)
+    store = {"enabled": True}
+    mod = make_mod(client, store)
+    for _ in range(3):
+        tick(store)
+        await mod._worker()
+    assert store.get("err_streak", 0) == 3, store
+    assert client.sent == []
+    tick(store)
+    await mod._worker()
+    assert store["err_streak"] == 0
+    assert client.uploaded == ["badapple_10.jpg"], client.uploaded
+
+
 async def test_interval_command():
     mod = make_mod(FakeClient(MSGS), {})
     msg = FakeMessage("3")
@@ -248,6 +279,8 @@ TESTS = [
     test_flood_wait,
     test_pause,
     test_default_paused,
+    test_error_streak_notify,
+    test_error_streak_reset,
     test_interval_command,
     test_channel_command,
 ]
