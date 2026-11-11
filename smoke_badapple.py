@@ -188,7 +188,7 @@ async def test_resume_after_restart():
     tick(store)
     await mod._worker()
     assert client.uploaded == ["badapple_7.jpg"], client.uploaded
-    assert client.iter_calls == [("badappleintg", 8)], client.iter_calls
+    assert client.iter_calls == [("badappletg", 8)], client.iter_calls
 
 
 async def test_flood_wait():
