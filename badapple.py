@@ -12,7 +12,7 @@
 #   .badapple                  статус
 #   .badapple_start            возобновить
 #   .badapple_stop             пауза (курсор сохраняется)
-#   .badapple_interval <сек>   интервал между заливками (мин. 5, дефолт 60)
+#   .badapple_interval <сек>   интервал между заливками (мин. 5, дефолт 15)
 #   .badapple_channel <user>   сменить канал (курсор сбрасывается)
 #   .badapple_reset            залить канал заново (будут дубли в галерее)
 
@@ -29,7 +29,7 @@ from .. import loader, utils
 logger = logging.getLogger(__name__)
 
 DEFAULT_CHANNEL = "badappletg"
-DEFAULT_INTERVAL = 60
+DEFAULT_INTERVAL = 15
 ERROR_STREAK_LIMIT = 10
 
 
