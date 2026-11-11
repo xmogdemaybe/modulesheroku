@@ -5,6 +5,8 @@
 # же места. Флуд-вейт: спим ровно сколько просит Telegram, курсор не двигаем.
 # Дошли до начала канала — уведомление в сохраненки и стоп.
 # После загрузки модуль на паузе: запуск — .badapple_start.
+# Предохранитель: 10 ошибок подряд (flood-паузы не в счет) — уведомление
+# в сохраненки один раз на серию, успешный шаг сбрасывает счетчик.
 #
 # Команды:
 #   .badapple                  статус
@@ -28,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CHANNEL = "badappletg"
 DEFAULT_INTERVAL = 60
+ERROR_STREAK_LIMIT = 10
 
 
 class BadAppleMod(loader.Module):
@@ -83,8 +86,19 @@ class BadAppleMod(loader.Module):
         except FloodWaitError as e:
             delay = e.seconds + 5
             logger.warning("FloodWait, пауза %s с", e.seconds)
-        except Exception:
+        except Exception as e:
             logger.exception("Ошибка шага заливки BadApple")
+            streak = self.get("err_streak", 0) + 1
+            self.set("err_streak", streak)
+            if streak == ERROR_STREAK_LIMIT:
+                await self._client.send_message(
+                    self.tg_id,
+                    "<b>BadApple: заливка встала.</b> "
+                    f"{ERROR_STREAK_LIMIT} ошибок подряд, последняя: {e}. "
+                    "Ретраи продолжаются, курсор на месте.",
+                )
+        else:
+            self.set("err_streak", 0)
         self.set("next_at", round(time.time() + delay))
 
     @loader.command()
@@ -104,6 +118,7 @@ class BadAppleMod(loader.Module):
             f"Состояние: {state}\n"
             f"Залито: {self.get('uploaded', 0)}\n"
             f"Курсор (last_id): {self.get('last_id', 0)}\n"
+            f"Ошибок подряд: {self.get('err_streak', 0)}\n"
             f"Интервал: {self.get('interval', DEFAULT_INTERVAL)} с\n"
             f"Следующая заливка через: "
             f"{max(0, round(self.get('next_at', 0) - time.time()))} с",
