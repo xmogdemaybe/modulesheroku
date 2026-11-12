@@ -73,6 +73,12 @@ def build_env():
         "    message.replies.append(text)\n",
         encoding="utf-8",
     )
+    inline_pkg = outer / "inline"
+    inline_pkg.mkdir()
+    (inline_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (inline_pkg / "types.py").write_text(
+        "class InlineCall:\n    pass\n", encoding="utf-8"
+    )
 
     herokutl = types.ModuleType("herokutl")
     errors = types.ModuleType("herokutl.errors")
@@ -161,10 +167,29 @@ class FakeMessage:
         self.replies = []
 
 
+class FakeInline:
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.forms = []
+
+    async def form(self, text, message, reply_markup=None):
+        self.forms.append((text, message, reply_markup))
+        return self.ok
+
+
+class FakeCall:
+    def __init__(self):
+        self.answers = []
+
+    async def answer(self, text, show_alert=False):
+        self.answers.append(text)
+
+
 def make_mod(client, store):
     mod = badapple.BadAppleMod()
     mod._db[mod.__class__.__name__] = store
     mod._client = client
+    mod.inline = FakeInline()
     mod.tg_id = 42
     return mod
 
@@ -268,6 +293,40 @@ async def test_error_streak_reset():
     assert client.uploaded == ["badapple_10.jpg"], client.uploaded
 
 
+async def test_status_retry_button():
+    store = {"enabled": True, "next_at": time.time() + 80000}
+    mod = make_mod(FakeClient(MSGS), store)
+    msg = FakeMessage()
+    await mod.badapple(msg)
+    assert len(mod.inline.forms) == 1, "status must be an inline form"
+    markup = mod.inline.forms[0][2]
+    assert markup and "callback" in markup[0], markup
+    call = FakeCall()
+    await markup[0]["callback"](call)
+    assert store["next_at"] == 0, store
+    assert call.answers
+
+
+async def test_retry_button_paused():
+    store = {"enabled": False, "next_at": time.time() + 80000}
+    mod = make_mod(FakeClient(MSGS), store)
+    await mod.badapple(FakeMessage())
+    assert mod.inline.forms, "status must be an inline form"
+    call = FakeCall()
+    await mod.inline.forms[0][2][0]["callback"](call)
+    assert store["next_at"] != 0, "paused module must not be retried"
+    assert call.answers
+
+
+async def test_status_fallback_no_inline():
+    store = {"enabled": True}
+    mod = make_mod(FakeClient(MSGS), store)
+    mod.inline = FakeInline(ok=False)
+    msg = FakeMessage()
+    await mod.badapple(msg)
+    assert msg.replies, "must fall back to plain answer"
+
+
 async def test_interval_command():
     assert badapple.DEFAULT_INTERVAL == 15
     store = {}
@@ -332,6 +391,9 @@ TESTS = [
     test_channel_command,
     test_wipe_requires_confirm,
     test_wipe_confirm,
+    test_status_retry_button,
+    test_retry_button_paused,
+    test_status_fallback_no_inline,
 ]
 PREDICTED_MUTATION_FAILURES = {"test_order_and_cursor", "test_resume_after_restart"}
 
@@ -342,9 +404,9 @@ async def main():
         try:
             await test()
             print(f"PASS {test.__name__}")
-        except AssertionError as e:
+        except Exception as e:
             failed.add(test.__name__)
-            print(f"FAIL {test.__name__}: {e}")
+            print(f"FAIL {test.__name__}: {type(e).__name__}: {e}")
     shutil.rmtree(TMP, ignore_errors=True)
     if MUTATE:
         ok = failed == PREDICTED_MUTATION_FAILURES
