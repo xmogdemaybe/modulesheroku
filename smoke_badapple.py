@@ -35,15 +35,27 @@ def build_env():
     (pkg / "__init__.py").write_text("", encoding="utf-8")
     (pkg / "badapple.py").write_text(MODULE_SRC, encoding="utf-8")
     (outer / "loader.py").write_text(
+        "class _DB(dict):\n"
+        "    def get(self, owner, key, default=None):\n"
+        "        try:\n"
+        "            return self[owner][key]\n"
+        "        except KeyError:\n"
+        "            return default\n"
+        "    def set(self, owner, key, value):\n"
+        "        self.setdefault(owner, {})[key] = value\n"
+        "        self.save()\n"
+        "    def save(self):\n"
+        "        return True\n"
         "class Module:\n"
         "    strings = {}\n"
         "    def __init__(self):\n"
-        "        self._store = {}\n"
+        "        self._db = _DB()\n"
         "        self.tg_id = 0\n"
+        "        self.get_prefix = lambda: '.'\n"
         "    def get(self, key, default=None):\n"
-        "        return self._store.get(key, default)\n"
+        "        return self._db.get(self.__class__.__name__, key, default)\n"
         "    def set(self, key, value):\n"
-        "        self._store[key] = value\n"
+        "        self._db.set(self.__class__.__name__, key, value)\n"
         "def command(*a, **k):\n"
         "    def deco(f):\n"
         "        return f\n"
@@ -60,6 +72,12 @@ def build_env():
         "async def answer(message, text):\n"
         "    message.replies.append(text)\n",
         encoding="utf-8",
+    )
+    inline_pkg = outer / "inline"
+    inline_pkg.mkdir()
+    (inline_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (inline_pkg / "types.py").write_text(
+        "class InlineCall:\n    pass\n", encoding="utf-8"
     )
 
     herokutl = types.ModuleType("herokutl")
@@ -149,10 +167,29 @@ class FakeMessage:
         self.replies = []
 
 
+class FakeInline:
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.forms = []
+
+    async def form(self, text, message, reply_markup=None):
+        self.forms.append((text, message, reply_markup))
+        return self.ok
+
+
+class FakeCall:
+    def __init__(self):
+        self.answers = []
+
+    async def answer(self, text, show_alert=False):
+        self.answers.append(text)
+
+
 def make_mod(client, store):
     mod = badapple.BadAppleMod()
-    mod._store = store
+    mod._db[mod.__class__.__name__] = store
     mod._client = client
+    mod.inline = FakeInline()
     mod.tg_id = 42
     return mod
 
@@ -256,21 +293,90 @@ async def test_error_streak_reset():
     assert client.uploaded == ["badapple_10.jpg"], client.uploaded
 
 
+async def test_status_retry_button():
+    store = {"enabled": True, "next_at": time.time() + 80000}
+    mod = make_mod(FakeClient(MSGS), store)
+    msg = FakeMessage()
+    await mod.badapple(msg)
+    assert len(mod.inline.forms) == 1, "status must be an inline form"
+    markup = mod.inline.forms[0][2]
+    assert markup and "callback" in markup[0], markup
+    call = FakeCall()
+    await markup[0]["callback"](call)
+    assert store["next_at"] == 0, store
+    assert call.answers
+
+
+async def test_retry_button_paused():
+    store = {"enabled": False, "next_at": time.time() + 80000}
+    mod = make_mod(FakeClient(MSGS), store)
+    await mod.badapple(FakeMessage())
+    assert mod.inline.forms, "status must be an inline form"
+    call = FakeCall()
+    await mod.inline.forms[0][2][0]["callback"](call)
+    assert store["next_at"] != 0, "paused module must not be retried"
+    assert call.answers
+
+
+async def test_status_fallback_no_inline():
+    store = {"enabled": True}
+    mod = make_mod(FakeClient(MSGS), store)
+    mod.inline = FakeInline(ok=False)
+    msg = FakeMessage()
+    await mod.badapple(msg)
+    assert msg.replies, "must fall back to plain answer"
+
+
 async def test_interval_command():
-    mod = make_mod(FakeClient(MSGS), {})
+    assert badapple.DEFAULT_INTERVAL == 15
+    store = {}
+    mod = make_mod(FakeClient(MSGS), store)
     msg = FakeMessage("3")
     await mod.badapple_interval(msg)
-    assert "interval" not in mod._store and msg.replies
+    assert "interval" not in store and msg.replies
     msg = FakeMessage("120")
     await mod.badapple_interval(msg)
-    assert mod._store["interval"] == 120
+    assert store["interval"] == 120
 
 
 async def test_channel_command():
-    mod = make_mod(FakeClient(MSGS), {"last_id": 555, "uploaded": 9, "done": True})
+    store = {"last_id": 555, "uploaded": 9, "done": True}
+    mod = make_mod(FakeClient(MSGS), store)
     await mod.badapple_channel(FakeMessage("https://t.me/somechan"))
-    assert mod._store["channel"] == "somechan", mod._store
-    assert mod._store["last_id"] == 0 and mod._store["done"] is False
+    assert store["channel"] == "somechan", store
+    assert store["last_id"] == 0 and store["done"] is False
+
+
+async def test_wipe_requires_confirm():
+    mod = make_mod(FakeClient(MSGS), {})
+    assert hasattr(mod, "badapple_wipe")
+    store = {"channel": "x", "interval": 99, "enabled": True, "last_id": 555}
+    mod = make_mod(FakeClient(MSGS), store)
+    msg = FakeMessage("")
+    await mod.badapple_wipe(msg)
+    assert store["last_id"] == 555 and store["interval"] == 99, store
+    assert msg.replies and "confirm" in msg.replies[0]
+
+
+async def test_wipe_confirm():
+    mod = make_mod(FakeClient(MSGS), {})
+    assert hasattr(mod, "badapple_wipe")
+    store = {
+        "channel": "x",
+        "interval": 99,
+        "enabled": True,
+        "last_id": 555,
+        "uploaded": 9,
+        "done": True,
+    }
+    mod = make_mod(FakeClient(MSGS), store)
+    await mod.badapple_wipe(FakeMessage("confirm"))
+    assert mod.get("last_id", 0) == 0
+    assert mod.get("uploaded", 0) == 0
+    assert mod.get("enabled", False) is False
+    assert mod.get("done", False) is False
+    assert mod.get("interval", badapple.DEFAULT_INTERVAL) == badapple.DEFAULT_INTERVAL
+    assert mod.get("channel", badapple.DEFAULT_CHANNEL) == badapple.DEFAULT_CHANNEL
 
 
 TESTS = [
@@ -283,6 +389,11 @@ TESTS = [
     test_error_streak_reset,
     test_interval_command,
     test_channel_command,
+    test_wipe_requires_confirm,
+    test_wipe_confirm,
+    test_status_retry_button,
+    test_retry_button_paused,
+    test_status_fallback_no_inline,
 ]
 PREDICTED_MUTATION_FAILURES = {"test_order_and_cursor", "test_resume_after_restart"}
 
@@ -293,9 +404,9 @@ async def main():
         try:
             await test()
             print(f"PASS {test.__name__}")
-        except AssertionError as e:
+        except Exception as e:
             failed.add(test.__name__)
-            print(f"FAIL {test.__name__}: {e}")
+            print(f"FAIL {test.__name__}: {type(e).__name__}: {e}")
     shutil.rmtree(TMP, ignore_errors=True)
     if MUTATE:
         ok = failed == PREDICTED_MUTATION_FAILURES

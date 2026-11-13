@@ -7,14 +7,17 @@
 # После загрузки модуль на паузе: запуск — .badapple_start.
 # Предохранитель: 10 ошибок подряд (flood-паузы не в счет) — уведомление
 # в сохраненки один раз на серию, успешный шаг сбрасывает счетчик.
+# Статус .badapple — inline-форма с кнопкой «Попробовать сейчас»: сбрасывает
+# КД-паузу и пробует на ближайшем тике (лимит Telegram не обходит).
 #
 # Команды:
 #   .badapple                  статус
 #   .badapple_start            возобновить
 #   .badapple_stop             пауза (курсор сохраняется)
-#   .badapple_interval <сек>   интервал между заливками (мин. 5, дефолт 60)
+#   .badapple_interval <сек>   интервал между заливками (мин. 5, дефолт 15)
 #   .badapple_channel <user>   сменить канал (курсор сбрасывается)
 #   .badapple_reset            залить канал заново (будут дубли в галерее)
+#   .badapple_wipe [confirm]   полный сброс настроек (двухэтапно, авы не трогает)
 
 import io
 import logging
@@ -25,11 +28,12 @@ from herokutl.tl.functions.photos import UploadProfilePhotoRequest
 from herokutl.tl.types import Message
 
 from .. import loader, utils
+from ..inline.types import InlineCall
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CHANNEL = "badappletg"
-DEFAULT_INTERVAL = 60
+DEFAULT_INTERVAL = 15
 ERROR_STREAK_LIMIT = 10
 
 
@@ -103,7 +107,7 @@ class BadAppleMod(loader.Module):
 
     @loader.command()
     async def badapple(self, message: Message):
-        """— статус заливки аватарок"""
+        """— статус заливки аватарок + кнопка «попробовать сейчас»"""
         state = (
             "завершено"
             if self.get("done", False)
@@ -111,8 +115,7 @@ class BadAppleMod(loader.Module):
             if self.get("enabled", False)
             else "пауза"
         )
-        await utils.answer(
-            message,
+        text = (
             "<b>BadApple</b>\n"
             f"Канал: <code>{self.get('channel', DEFAULT_CHANNEL)}</code>\n"
             f"Состояние: {state}\n"
@@ -121,7 +124,29 @@ class BadAppleMod(loader.Module):
             f"Ошибок подряд: {self.get('err_streak', 0)}\n"
             f"Интервал: {self.get('interval', DEFAULT_INTERVAL)} с\n"
             f"Следующая заливка через: "
-            f"{max(0, round(self.get('next_at', 0) - time.time()))} с",
+            f"{max(0, round(self.get('next_at', 0) - time.time()))} с"
+        )
+        if not await self.inline.form(
+            text,
+            message,
+            reply_markup=[
+                {"text": "Попробовать сейчас", "callback": self._retry_now}
+            ],
+        ):
+            await utils.answer(message, text)
+
+    async def _retry_now(self, call: InlineCall):
+        if self.get("done", False):
+            await call.answer("Канал уже залит полностью.", show_alert=True)
+            return
+        if not self.get("enabled", False):
+            await call.answer(
+                "Заливка на паузе, запуск: .badapple_start", show_alert=True
+            )
+            return
+        self.set("next_at", 0)
+        await call.answer(
+            "Пробую на ближайшем тике. Если КД еще держит — снова уйду в паузу."
         )
 
     @loader.command()
@@ -165,4 +190,24 @@ class BadAppleMod(loader.Module):
         self._reset_cursor()
         await utils.answer(
             message, "<b>Курсор сброшен, заливка пойдет с конца канала.</b>"
+        )
+
+    @loader.command()
+    async def badapple_wipe(self, message: Message):
+        """[confirm] — полный сброс настроек модуля, двухэтапно"""
+        if utils.get_args_raw(message).strip().lower() != "confirm":
+            await utils.answer(
+                message,
+                "<b>BadApple: полный сброс настроек.</b>\n"
+                "Сотрутся: канал, интервал, курсор, счетчик залитого, состояние.\n"
+                "Уже залитые аватарки в профиле НЕ удаляются.\n"
+                f"Подтверждение: <code>{self.get_prefix()}badapple_wipe confirm</code>",
+            )
+            return
+        self._db.pop(self.__class__.__name__, None)
+        self._db.save()
+        await utils.answer(
+            message,
+            "<b>BadApple: настройки сброшены.</b> "
+            "Модуль на паузе, канал и интервал — дефолтные.",
         )
