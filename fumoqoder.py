@@ -34,6 +34,7 @@
 # Caption placeholders: {source} {post} {url} {tags} {id} {num} {date} {time}
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -116,6 +117,7 @@ class FumoQoder(loader.Module):
         self._session: Optional[aiohttp.ClientSession] = None
         self._stopping = False
         self._inflight: set = set()
+        self._source_status: dict = {}
         # On a fresh install last_post_ts is 0; anchor to now so enabling autopost
         # doesn't instantly fire a post before the user has set a target.
         last_ts = self._get("last_post_ts", 0.0) or time.time()
@@ -173,12 +175,11 @@ class FumoQoder(loader.Module):
         return (self._get("exclude", "") or "").strip()
 
     def _booru_tags(self, source: str) -> str:
-        """Search tags + site rating filter + global minus-tag blacklist."""
+        """Теги поиска; исключения Konachan применяются после получения ответа."""
         parts = [self._tags_for(source)]
-        if source == "konachan":
-            parts.append("rating:safe")
-        for t in self._exclude().split():
-            parts.append(t if t.startswith("-") else f"-{t}")
+        if source != "konachan":
+            for t in self._exclude().split():
+                parts.append(t if t.startswith("-") else f"-{t}")
         return " ".join(p for p in parts if p)
 
     # ---------- pagination helpers ----------
@@ -209,7 +210,7 @@ class FumoQoder(loader.Module):
         tags = self._booru_tags("safebooru")
         for pid in self._page_candidates(5, 0):
             posts = []
-            for p in self._dapi_parse(await self._dapi("https://safebooru.org/index.php", tags, pid)):
+            for p in await self._dapi("https://safebooru.org/index.php", tags, pid):
                 url = p.get("file_url") or ""
                 if url.startswith("//"):
                     url = "https:" + url
@@ -230,13 +231,19 @@ class FumoQoder(loader.Module):
     async def _src_konachan(self) -> list:
         # konachan.net = safe-only mirror, konachan.com = R-18 (filtered by rating).
         domain = self._get("konachan_domain", "konachan.net") or "konachan.net"
-        tags = self._booru_tags("konachan")
+        tags = self._tags_for("konachan")
+        if domain != "konachan.net":
+            tags = f"{tags} rating:safe".strip()
+        excluded = {t.lstrip("-").lower() for t in self._exclude().split() if t.lstrip("-")}
         for page in self._page_candidates(3, 1):
             posts = []
             for p in await self._moebooru(f"https://{domain}/post.json", tags, page):
                 if not isinstance(p, dict) or not p.get("file_url"):
                     continue
                 if domain != "konachan.net" and p.get("rating") != "s":
+                    continue
+                post_tags = {t.lower() for t in (p.get("tags") or "").split()}
+                if excluded.intersection(post_tags):
                     continue
                 url = p["file_url"]
                 if url.startswith("//"):
@@ -253,7 +260,7 @@ class FumoQoder(loader.Module):
         return []
 
     def _reddit_parse(self, items: list, sub: str) -> list:
-        """Shared parser for reddit post dicts from an archive (Arctic Shift / PullPush)."""
+        """Общий разбор записей Reddit из Arctic Shift / PullPush."""
         media = self._get("reddit_media", "pics")
         posts = []
         for d in items:
@@ -263,31 +270,47 @@ class FumoQoder(loader.Module):
             # can point .fumosub at any subreddit.
             if d.get("over_18"):
                 continue
-            img = d.get("url_overridden_by_dest") or d.get("url") or ""
+            raw_img = html.unescape(d.get("url_overridden_by_dest") or d.get("url") or "")
             rv = (d.get("secure_media") or {}).get("reddit_video") or {}
-            video = rv.get("fallback_url") or ""
+            video = html.unescape(rv.get("fallback_url") or "")
             is_video = bool(video) and media in ("videos", "all")
+            candidates = []
             if is_video:
-                img = video
-            ext = self._ext(img)
-            if not ext:
-                continue
-            if media == "pics" and (video or ext == ".mp4"):
-                continue
-            if media == "videos" and not is_video:
-                continue
-            item = {
-                "id": f"rd_{d.get('id')}", "url": img, "src": "Reddit",
-                "post_url": "https://reddit.com" + (d.get("permalink") or ""),
-                "tags": f"r/{sub}",
-            }
-            if is_video:
-                # Reddit serves video and audio as SEPARATE DASH tracks, so the
-                # plain fallback_url is muted. Keep the muxable stream URLs; _send
-                # merges them with ffmpeg to get the sound back.
-                item["video_dash"] = rv.get("dash_url") or ""
-                item["video_hls"] = rv.get("hls_url") or ""
-            posts.append(item)
+                candidates = [("", video)]
+            elif d.get("is_gallery") and media != "videos":
+                metadata = d.get("media_metadata") or {}
+                if isinstance(metadata, dict):
+                    for media_id, meta in metadata.items():
+                        if not isinstance(meta, dict):
+                            continue
+                        source = meta.get("s") or {}
+                        if not isinstance(source, dict):
+                            continue
+                        gallery_url = html.unescape(source.get("u") or "")
+                        if self._ext(gallery_url):
+                            candidates.append((f"_{media_id}", gallery_url))
+            if not candidates:
+                candidates = [("", raw_img)]
+            for suffix, img in candidates:
+                ext = self._ext(img)
+                if not ext:
+                    continue
+                if media == "pics" and (video or ext == ".mp4"):
+                    continue
+                if media == "videos" and not is_video:
+                    continue
+                item = {
+                    "id": f"rd_{d.get('id')}{suffix}", "url": img, "src": "Reddit",
+                    "post_url": "https://reddit.com" + (d.get("permalink") or ""),
+                    "tags": f"r/{sub}",
+                }
+                if is_video:
+                    # Reddit serves video and audio as SEPARATE DASH tracks, so the
+                    # plain fallback_url is muted. Keep the muxable stream URLs; _send
+                    # merges them with ffmpeg to get the sound back.
+                    item["video_dash"] = html.unescape(rv.get("dash_url") or "")
+                    item["video_hls"] = html.unescape(rv.get("hls_url") or "")
+                posts.append(item)
         return posts
 
     async def _src_reddit_arctic(self, sub: str) -> list:
@@ -298,9 +321,23 @@ class FumoQoder(loader.Module):
         (i.redd.it) is not blocked at all — so listing via archive + download via
         CDN works where direct Reddit does not. Data is newest-first, slightly delayed.
         """
+        params = {"subreddit": sub, "limit": "100", "sort": "desc"}
+        now = int(time.time())
+        params["before"] = str(random.randint(now - 2 * 365 * 24 * 3600, now))
         payload = await self._json(
             "https://arctic-shift.photon-reddit.com/api/posts/search",
-            {"subreddit": sub, "limit": "100", "sort": "desc"},
+            params,
+            headers={"User-Agent": USER_AGENT},
+        )
+        items = payload.get("data", []) if isinstance(payload, dict) else []
+        posts = self._reddit_parse(items, sub)
+        history = set(self._get("history", []) or [])
+        if any(p["id"] not in history for p in posts):
+            return posts
+        params.pop("before")
+        payload = await self._json(
+            "https://arctic-shift.photon-reddit.com/api/posts/search",
+            params,
             headers={"User-Agent": USER_AGENT},
         )
         items = payload.get("data", []) if isinstance(payload, dict) else []
@@ -313,9 +350,23 @@ class FumoQoder(loader.Module):
         archive is down or rate-limited the other usually still answers. Like Arctic it
         serves i.redd.it image URLs, which aren't IP-blocked the way reddit.com is.
         """
+        params = {"subreddit": sub, "size": "100", "sort": "desc"}
+        now = int(time.time())
+        params["before"] = str(random.randint(now - 2 * 365 * 24 * 3600, now))
         payload = await self._json(
             "https://api.pullpush.io/reddit/search/submission/",
-            {"subreddit": sub, "size": "100", "sort": "desc"},
+            params,
+            headers={"User-Agent": USER_AGENT},
+        )
+        items = payload.get("data", []) if isinstance(payload, dict) else []
+        posts = self._reddit_parse(items, sub)
+        history = set(self._get("history", []) or [])
+        if any(p["id"] not in history for p in posts):
+            return posts
+        params.pop("before")
+        payload = await self._json(
+            "https://api.pullpush.io/reddit/search/submission/",
+            params,
             headers={"User-Agent": USER_AGENT},
         )
         items = payload.get("data", []) if isinstance(payload, dict) else []
@@ -330,25 +381,49 @@ class FumoQoder(loader.Module):
         """List Reddit posts from a public archive (Reddit itself is IP-blocked)."""
         sub = self._get("subreddit", DEFAULT_SUBREDDIT) or DEFAULT_SUBREDDIT
         mode = self._reddit_mode()
+        status = getattr(self, "_source_status", None)
+        if status is None:
+            self._source_status = status = {}
+        history = set(self._get("history", []) or [])
+
         if mode == "pullpush":
-            return await self._src_reddit_pullpush(sub)
+            try:
+                posts = await self._src_reddit_pullpush(sub)
+            except Exception as exc:
+                status["reddit/pullpush"] = type(exc).__name__
+                raise
+            fresh = [p for p in posts if p["id"] not in history]
+            status["reddit/pullpush"] = f"ok ({len(fresh)} fresh)" if fresh else "0 fresh"
+            return fresh
         if mode == "arctic":
-            return await self._src_reddit_arctic(sub)
+            try:
+                posts = await self._src_reddit_arctic(sub)
+            except Exception as exc:
+                status["reddit/arctic"] = type(exc).__name__
+                raise
+            fresh = [p for p in posts if p["id"] not in history]
+            status["reddit/arctic"] = f"ok ({len(fresh)} fresh)" if fresh else "0 fresh"
+            return fresh
+
         # auto: Arctic first (proven reliable), PullPush as the backup.
         try:
             posts = await self._src_reddit_arctic(sub)
         except Exception as exc:
             logger.warning("[FumoQoder] arctic failed (%r), trying PullPush", exc)
+            status["reddit/arctic"] = type(exc).__name__
             posts = []
-        if posts:
-            return posts
-        return await self._src_reddit_pullpush(sub)
-
-    @staticmethod
-    def _dapi_parse(payload: Any) -> list:
-        if isinstance(payload, dict):
-            payload = payload.get("post", [])
-        return payload if isinstance(payload, list) else []
+        fresh = [p for p in posts if p["id"] not in history]
+        status["reddit/arctic"] = f"ok ({len(fresh)} fresh)" if fresh else "0 fresh"
+        if fresh:
+            return fresh
+        try:
+            posts = await self._src_reddit_pullpush(sub)
+        except Exception as exc:
+            status["reddit/pullpush"] = type(exc).__name__
+            raise
+        fresh = [p for p in posts if p["id"] not in history]
+        status["reddit/pullpush"] = f"ok ({len(fresh)} fresh)" if fresh else "0 fresh"
+        return fresh
 
     # ---------- fetch ----------
 
@@ -365,24 +440,19 @@ class FumoQoder(loader.Module):
 
     def _active_sources(self) -> list:
         """Boorus plus the optional Reddit source; all are fetched and mixed."""
-        boorus = [self._src_safebooru, self._src_konachan]
-        random.shuffle(boorus)
-        sources = list(boorus)
+        sources = [self._src_safebooru, self._src_konachan]
         if self._get("reddit", True):
             sources.append(self._src_reddit)
         return sources
 
     async def _pick_posts(self, count: int = 1, source: Optional[str] = None) -> list:
-        """Return up to `count` fresh, unseen posts with an added 'ext' field.
-
-        With no explicit source, every active source is fetched concurrently and
-        their posts are pooled and shuffled together, so a plain `.fumotest` mixes
-        Safebooru / Konachan / Reddit instead of draining one source first.
-
-        Raises only when nothing at all could be picked; a partial result is fine.
-        """
+        """Вернуть до count*3 свежих постов, чередуя источники."""
+        count = max(1, int(count))
         history = set(self._get("history", []) or [])
         self._inflight = getattr(self, "_inflight", set())
+        status = getattr(self, "_source_status", None)
+        if status is None:
+            self._source_status = status = {}
         picked, errors = [], []
         sources = [self._source_by_name(source)] if source else self._active_sources()
 
@@ -390,34 +460,64 @@ class FumoQoder(loader.Module):
         results = await asyncio.gather(
             *[self._safe_fetch(src) for src in sources], return_exceptions=True
         )
-        pool = []
+        allowed = ALBUM_OK_EXTS if count > 1 else EXT_MIME
+        ffmpeg = self._ffmpeg()
+        buckets = []
         for src, res in zip(sources, results):
-            name = src.__name__
-            if isinstance(res, Exception):
+            name = src.__name__.replace("_src_", "", 1)
+            if isinstance(res, BaseException):
+                if isinstance(res, asyncio.CancelledError):
+                    raise res
                 errors.append(f"{name}:{type(res).__name__}")
+                status[name] = type(res).__name__
                 logger.warning("[FumoQoder] source %s failed: %r", name, res)
                 continue
-            pool.extend(res)
-        random.shuffle(pool)
+            candidates, seen = [], set()
+            for p in res:
+                if not isinstance(p, dict):
+                    continue
+                ext = self._ext(p.get("url") or "")
+                pid = p.get("id")
+                if not ext or ext not in allowed or not pid:
+                    continue
+                if pid in history or pid in self._inflight or pid in seen:
+                    continue
+                if ext == ".mp4" and not ffmpeg:
+                    continue
+                seen.add(pid)
+                p["ext"] = ext
+                candidates.append(p)
+            random.shuffle(candidates)
+            if candidates:
+                buckets.append(candidates)
+                status[name] = f"ok ({len(candidates)} fresh)"
+            else:
+                status[name] = "0 fresh"
+        random.shuffle(buckets)
 
-        # An album can't contain stickers (.webp) or GIFs, so when picking several
-        # posts only accept album-safe extensions up front — otherwise _send would
-        # drop them afterwards and the album could come out far smaller than asked.
-        allowed = ALBUM_OK_EXTS if count > 1 else EXT_MIME
+        # Reserve extras so _send can replace failed downloads or oversized photos.
+        limit = count * 3
         chosen_ids = set()
-        for p in pool:
-            if len(picked) >= count:
+        index = 0
+        while len(picked) < limit:
+            progressed = False
+            for candidates in buckets:
+                if index >= len(candidates):
+                    continue
+                post = candidates[index]
+                progressed = True
+                pid = post["id"]
+                if pid in chosen_ids:
+                    continue
+                chosen_ids.add(pid)
+                # История обновляется только после успешной отправки в _send.
+                self._inflight.add(pid)
+                picked.append(post)
+                if len(picked) >= limit:
+                    break
+            if not progressed:
                 break
-            ext = self._ext(p["url"])
-            pid = p["id"]
-            if not ext or ext not in allowed or pid in history or pid in chosen_ids or pid in self._inflight:
-                continue
-            p["ext"] = ext
-            chosen_ids.add(pid)
-            # Reserve in memory only; the id is written to the db history in _send
-            # AFTER a successful send, so a failed download/post can be retried.
-            self._inflight.add(pid)
-            picked.append(p)
+            index += 1
         if not picked:
             errors.append("no-fresh")
             raise RuntimeError("all sources failed: " + ", ".join(errors) if errors else "no fumo found")
@@ -547,23 +647,23 @@ class FumoQoder(loader.Module):
         count = max(1, min(MAX_COUNT, int(count or 1)))
         posts = await self._pick_posts(count, source)
         reserved = [p["id"] for p in posts]
-
-        # Albums can't mix photos with stickers (.webp) or GIFs — keep only the
-        # Telegram-safe set for multi-file sends.
-        album = count > 1
-        if album:
-            compatible = [p for p in posts if p["ext"] in ALBUM_OK_EXTS]
-            if compatible:
-                posts = compatible
-                album = len(posts) > 1
-            else:
-                # Nothing album-safe was picked: send a single one (as a document if
-                # it's .webp/oversized) rather than crashing on an invalid media group.
-                posts = posts[:1]
-                album = False
+        files, sent, sizes = [], [], []
 
         try:
-            files, sent, sizes = [], [], []
+            # Albums can't mix photos with stickers (.webp) or GIFs — keep only the
+            # Telegram-safe set for multi-file sends.
+            album = count > 1
+            if album:
+                compatible = [p for p in posts if p["ext"] in ALBUM_OK_EXTS]
+                if compatible:
+                    posts = compatible
+                    album = len(posts) > 1
+                else:
+                    # Nothing album-safe was picked: send a single one (as a document if
+                    # it's .webp/oversized) rather than crashing on an invalid media group.
+                    posts = posts[:1]
+                    album = False
+
             last_err = None
             for post in posts:
                 data = None
@@ -571,7 +671,12 @@ class FumoQoder(loader.Module):
                     # Reddit video: merge the separate DASH audio track back in with
                     # ffmpeg. No ffmpeg (or a failed mux) means we skip it rather than
                     # post a silent video.
-                    data = await self._mux_video(post)
+                    try:
+                        data = await self._mux_video(post)
+                    except Exception as exc:
+                        last_err = exc
+                        logger.warning("[FumoQoder] mux failed for %s: %r", post["id"], exc)
+                        continue
                     if data is None:
                         last_err = RuntimeError("video skipped: ffmpeg missing or mux failed")
                         logger.info("[FumoQoder] skipping video %s: no ffmpeg / mux failed", post["id"])
@@ -591,6 +696,7 @@ class FumoQoder(loader.Module):
                     continue
                 size = len(data)
                 if album and post["ext"] in PHOTO_EXTS and size > MAX_PHOTO_SIZE:
+                    last_err = RuntimeError("photo > 10MB in album")
                     logger.info("[FumoQoder] skipping %s: photo > 10MB in album", post["id"])
                     continue
                 logger.debug("[FumoQoder] RAW POST %r", post)
@@ -599,6 +705,8 @@ class FumoQoder(loader.Module):
                 files.append(file)
                 sent.append(post)
                 sizes.append(size)
+                if len(files) >= count:
+                    break
             if not files:
                 raise RuntimeError(f"download failed: {last_err}")
 
@@ -799,17 +907,13 @@ class FumoQoder(loader.Module):
         """
         if GetScheduledHistoryRequest is None:
             return self._get("sched_pending", 0) or 0
-        try:
-            peer = await self.client.get_input_entity(entity)
-            res = await self.client(GetScheduledHistoryRequest(peer=peer, hash=0))
-            stamps = [
-                m.date.timestamp() for m in getattr(res, "messages", [])
-                if getattr(m, "date", None) is not None
-            ]
-            return max(stamps) if stamps else 0
-        except Exception as exc:
-            logger.warning("[FumoQoder] cannot read scheduled history: %r", exc)
-            return self._get("sched_pending", 0) or 0
+        peer = await self.client.get_input_entity(entity)
+        res = await self.client(GetScheduledHistoryRequest(peer=peer, hash=0))
+        stamps = [
+            m.date.timestamp() for m in getattr(res, "messages", [])
+            if getattr(m, "date", None) is not None
+        ]
+        return max(stamps) if stamps else 0
 
     async def _tick_schedule(self):
         """Keep exactly one post queued in Telegram's Scheduled Messages.
@@ -820,17 +924,17 @@ class FumoQoder(loader.Module):
         server-side even if the userbot is offline in between.
         """
         now = time.time()
-        entity = await self._target()
-        last = await self._last_scheduled_ts(entity)
-        if last > now:
-            # A post is already pending in the queue — just track it.
-            self._set("sched_pending", last)
-            self._next_post = last
-            return
-        fire_at = self._next_fire(last if last else now, now)
-        if fire_at <= now:
-            fire_at = now + self._get("interval", DEFAULT_INTERVAL)
         try:
+            entity = await self._target()
+            last = await self._last_scheduled_ts(entity)
+            if last > now:
+                # A post is already pending in the queue — just track it.
+                self._set("sched_pending", last)
+                self._next_post = last
+                return
+            fire_at = self._next_fire(last if last else now, now)
+            if fire_at <= now:
+                fire_at = now + self._get("interval", DEFAULT_INTERVAL)
             await self._send(entity, schedule=fire_at)
             self._set("sched_pending", fire_at)
             self._next_post = fire_at
@@ -1288,9 +1392,24 @@ class FumoQoder(loader.Module):
         else:
             state = "\U0001F534 disabled"
 
+        reddit_enabled = self._get("reddit", True)
         active = ["safebooru", f"konachan({(self._get('konachan_domain', 'konachan.net') or 'konachan.net').split('.')[-1]})"]
-        if self._get("reddit", True):
+        if reddit_enabled:
             active.append(f"reddit(r/{self._get('subreddit', DEFAULT_SUBREDDIT)})")
+
+        statuses = getattr(self, "_source_status", {})
+        health = [
+            f"{name}: {statuses.get(name, 'not checked')}"
+            for name in ("safebooru", "konachan")
+        ]
+        if reddit_enabled:
+            health.append(f"reddit: {statuses.get('reddit', 'not checked')}")
+            mode = self._reddit_mode()
+            archives = ("arctic", "pullpush") if mode == "auto" else (mode,)
+            for archive in archives:
+                key = f"reddit/{archive}"
+                if key in statuses:
+                    health.append(f"{key}: {statuses[key]}")
 
         await utils.answer(
             message,
@@ -1303,6 +1422,7 @@ class FumoQoder(loader.Module):
             f"<b>Schedule mode:</b> {'on' if self._get('schedule_mode', False) else 'off'}\n"
             f"<b>Post time:</b> <code>{utils.escape_html(self._get('post_time', '') or '—')}</code>\n"
             f"<b>Sources:</b> <code>{utils.escape_html(', '.join(active))}</code>\n"
+            f"<b>Source health:</b> <code>{utils.escape_html(', '.join(health))}</code>\n"
             f"<b>Reddit media:</b> <code>{utils.escape_html(self._get('reddit_media', 'pics'))}</code>\n"
             f"<b>ffmpeg (video sound):</b> <code>{'found' if self._ffmpeg() else 'NOT found — videos skipped'}</code>\n"
             f"<b>Reddit mode:</b> <code>{utils.escape_html(self._reddit_mode())}</code>\n"
