@@ -445,15 +445,20 @@ class FumoQoder(loader.Module):
             sources.append(self._src_reddit)
         return sources
 
-    async def _pick_posts(self, count: int = 1, source: Optional[str] = None) -> list:
-        """Вернуть до count*3 свежих постов, чередуя источники."""
+    async def _pick_posts(self, count: int = 1, source: Optional[str] = None) -> tuple:
+        """Вернуть (slots, reserves_by_src, all_ids).
+
+        slots — count основных кандидатов (round-robin по источникам).
+        reserves_by_src — {src_name: [запасные]} для замены из того же источника.
+        all_ids — set всех зарезервированных id (для освобождения _inflight).
+        """
         count = max(1, int(count))
         history = set(self._get("history", []) or [])
         self._inflight = getattr(self, "_inflight", set())
         status = getattr(self, "_source_status", None)
         if status is None:
             self._source_status = status = {}
-        picked, errors = [], []
+        errors = []
         sources = [self._source_by_name(source)] if source else self._active_sources()
 
         # Fetch all sources in parallel; a failing one is skipped, not fatal.
@@ -462,7 +467,8 @@ class FumoQoder(loader.Module):
         )
         allowed = ALBUM_OK_EXTS if count > 1 else EXT_MIME
         ffmpeg = self._ffmpeg()
-        buckets = []
+        # {src_name: [candidates]} — все отфильтрованные кандидаты по источникам
+        src_pools: dict[str, list] = {}
         for src, res in zip(sources, results):
             name = src.__name__.replace("_src_", "", 1)
             if isinstance(res, BaseException):
@@ -489,39 +495,61 @@ class FumoQoder(loader.Module):
                 candidates.append(p)
             random.shuffle(candidates)
             if candidates:
-                buckets.append(candidates)
+                src_pools[name] = candidates
                 status[name] = f"ok ({len(candidates)} fresh)"
             else:
                 status[name] = "0 fresh"
-        random.shuffle(buckets)
 
-        # Reserve extras so _send can replace failed downloads or oversized photos.
-        limit = count * 3
-        chosen_ids = set()
-        index = 0
-        while len(picked) < limit:
+        if not src_pools:
+            errors.append("no-fresh")
+            raise RuntimeError("all sources failed: " + ", ".join(errors) if errors else "no fumo found")
+
+        # Основные слоты — round-robin, чтобы каждый источник получил свою долю.
+        pool_names = list(src_pools.keys())
+        random.shuffle(pool_names)
+        slots: list[dict] = []
+        # Курсор для каждого пула: сколько из него уже взяли в основные слоты.
+        cursors = {n: 0 for n in pool_names}
+        all_ids: set = set()
+        rr = 0
+        while len(slots) < count:
             progressed = False
-            for candidates in buckets:
-                if index >= len(candidates):
+            for _ in range(len(pool_names)):
+                name = pool_names[rr % len(pool_names)]
+                rr += 1
+                pool = src_pools[name]
+                idx = cursors[name]
+                if idx >= len(pool):
                     continue
-                post = candidates[index]
-                progressed = True
+                post = pool[idx]
+                cursors[name] = idx + 1
                 pid = post["id"]
-                if pid in chosen_ids:
-                    continue
-                chosen_ids.add(pid)
-                # История обновляется только после успешной отправки в _send.
                 self._inflight.add(pid)
-                picked.append(post)
-                if len(picked) >= limit:
+                all_ids.add(pid)
+                slots.append(post)
+                progressed = True
+                if len(slots) >= count:
                     break
             if not progressed:
                 break
-            index += 1
-        if not picked:
+
+        # Резервы по источникам — остатки пулов, которые не попали в основные слоты.
+        reserves_by_src: dict[str, list] = {}
+        reserve_limit = count * 2  # максимум запасных на источник
+        for name, pool in src_pools.items():
+            start = cursors.get(name, 0)
+            extras = pool[start:start + reserve_limit]
+            for p in extras:
+                pid = p["id"]
+                if pid not in all_ids:
+                    self._inflight.add(pid)
+                    all_ids.add(pid)
+                    reserves_by_src.setdefault(name, []).append(p)
+
+        if not slots:
             errors.append("no-fresh")
             raise RuntimeError("all sources failed: " + ", ".join(errors) if errors else "no fumo found")
-        return picked
+        return slots, reserves_by_src, all_ids
 
     async def _safe_fetch(self, src):
         return await src()
@@ -640,13 +668,15 @@ class FumoQoder(loader.Module):
             except OSError:
                 pass
 
+    # Статусы HTTP, которые не имеет смысла ретраить: ресурс мёртв навсегда.
+    _DEAD_STATUSES = frozenset((403, 404, 410))
+
     async def _send(self, entity, source: Optional[str] = None, count: Optional[int] = None,
                     schedule: Optional[float] = None, is_test: bool = False) -> list:
         if count is None:
             count = self._get("count", 1)
         count = max(1, min(MAX_COUNT, int(count or 1)))
-        posts = await self._pick_posts(count, source)
-        reserved = [p["id"] for p in posts]
+        slots, reserves_by_src, all_reserved = await self._pick_posts(count, source)
         files, sent, sizes = [], [], []
 
         try:
@@ -654,57 +684,74 @@ class FumoQoder(loader.Module):
             # Telegram-safe set for multi-file sends.
             album = count > 1
             if album:
-                compatible = [p for p in posts if p["ext"] in ALBUM_OK_EXTS]
+                compatible = [p for p in slots if p["ext"] in ALBUM_OK_EXTS]
                 if compatible:
-                    posts = compatible
-                    album = len(posts) > 1
+                    slots = compatible
+                    album = len(slots) > 1
                 else:
-                    # Nothing album-safe was picked: send a single one (as a document if
-                    # it's .webp/oversized) rather than crashing on an invalid media group.
-                    posts = posts[:1]
+                    slots = slots[:1]
                     album = False
 
             last_err = None
-            for post in posts:
-                data = None
-                if post.get("video_dash") or post.get("video_hls"):
-                    # Reddit video: merge the separate DASH audio track back in with
-                    # ffmpeg. No ffmpeg (or a failed mux) means we skip it rather than
-                    # post a silent video.
-                    try:
-                        data = await self._mux_video(post)
-                    except Exception as exc:
-                        last_err = exc
-                        logger.warning("[FumoQoder] mux failed for %s: %r", post["id"], exc)
-                        continue
-                    if data is None:
-                        last_err = RuntimeError("video skipped: ffmpeg missing or mux failed")
-                        logger.info("[FumoQoder] skipping video %s: no ffmpeg / mux failed", post["id"])
-                        continue
-                else:
-                    # In an album an oversized photo can't be sent at all, so cap the
-                    # download at 10 MB and skip it early instead of pulling 20 MB first.
-                    cap = MAX_PHOTO_SIZE if (album and post["ext"] in PHOTO_EXTS) else MAX_IMAGE_SIZE
-                    for _ in range(3):
+            for slot_post in slots:
+                # Очередь: основной пост, потом запасные из того же источника,
+                # и только в конце — из остальных.
+                src_name = slot_post["src"]
+                candidates = [slot_post]
+                candidates.extend(reserves_by_src.get(src_name, []))
+                for other_src, other_reserves in reserves_by_src.items():
+                    if other_src != src_name:
+                        candidates.extend(other_reserves)
+
+                filled = False
+                for post in candidates:
+                    data = None
+                    if post.get("video_dash") or post.get("video_hls"):
                         try:
-                            data = await self._download(post["url"], max_size=cap)
-                            break
+                            data = await self._mux_video(post)
                         except Exception as exc:
                             last_err = exc
-                            logger.warning("[FumoQoder] download failed for %s: %r", post["url"], exc)
-                if data is None:
-                    continue
-                size = len(data)
-                if album and post["ext"] in PHOTO_EXTS and size > MAX_PHOTO_SIZE:
-                    last_err = RuntimeError("photo > 10MB in album")
-                    logger.info("[FumoQoder] skipping %s: photo > 10MB in album", post["id"])
-                    continue
-                logger.debug("[FumoQoder] RAW POST %r", post)
-                file = BytesIO(data)
-                file.name = f"fumo_{post['id']}{post['ext']}"
-                files.append(file)
-                sent.append(post)
-                sizes.append(size)
+                            logger.warning("[FumoQoder] mux failed for %s: %r", post["id"], exc)
+                            continue
+                        if data is None:
+                            last_err = RuntimeError("video skipped: ffmpeg missing or mux failed")
+                            logger.info("[FumoQoder] skipping video %s: no ffmpeg / mux failed", post["id"])
+                            continue
+                    else:
+                        cap = MAX_PHOTO_SIZE if (album and post["ext"] in PHOTO_EXTS) else MAX_IMAGE_SIZE
+                        for attempt in range(3):
+                            try:
+                                data = await self._download(post["url"], max_size=cap)
+                                break
+                            except aiohttp.ClientResponseError as exc:
+                                last_err = exc
+                                logger.warning("[FumoQoder] download %s: HTTP %s", post["url"], exc.status)
+                                if exc.status in self._DEAD_STATUSES:
+                                    # мёртвая ссылка — ретраить бессмысленно
+                                    break
+                            except Exception as exc:
+                                last_err = exc
+                                logger.warning("[FumoQoder] download failed for %s: %r", post["url"], exc)
+                    if data is None:
+                        continue
+                    size = len(data)
+                    if album and post["ext"] in PHOTO_EXTS and size > MAX_PHOTO_SIZE:
+                        last_err = RuntimeError("photo > 10MB in album")
+                        logger.info("[FumoQoder] skipping %s: photo > 10MB in album", post["id"])
+                        continue
+                    logger.debug("[FumoQoder] RAW POST %r", post)
+                    file = BytesIO(data)
+                    file.name = f"fumo_{post['id']}{post['ext']}"
+                    files.append(file)
+                    sent.append(post)
+                    sizes.append(size)
+                    filled = True
+                    # Убираем использованный пост из всех резервных очередей,
+                    # чтобы другой слот его не взял повторно.
+                    post_id = post["id"]
+                    for rlist in reserves_by_src.values():
+                        rlist[:] = [r for r in rlist if r["id"] != post_id]
+                    break
                 if len(files) >= count:
                     break
             if not files:
@@ -713,38 +760,26 @@ class FumoQoder(loader.Module):
             kwargs = {}
             if len(files) == 1:
                 ext = sent[0]["ext"]
-                # .webp is treated as a sticker (no caption) and an oversized photo
-                # is rejected by UploadPhoto — send both as a document instead.
                 as_doc = ext == ".webp" or (ext in PHOTO_EXTS and sizes[0] > MAX_PHOTO_SIZE)
                 if ext == ".webp":
-                    # Telethon would otherwise guess image/webp from the filename and
-                    # Telegram turns any image/webp upload into a captionless sticker.
                     kwargs["mime_type"] = "application/octet-stream"
                 elif not as_doc:
                     kwargs["mime_type"] = EXT_MIME.get(ext)
                 kwargs["force_document"] = as_doc
             if schedule:
-                # Telegram publishes it server-side at that moment, even if the userbot
-                # is offline — this is the native "Scheduled Messages" feature.
                 kwargs["schedule"] = datetime.fromtimestamp(schedule, timezone.utc)
-            # A manual .fumotest must not advance the channel's #N counter.
             num = None if is_test else int(self._get("post_num", 0) or 0) + 1
             msg = await self.client.send_file(
                 entity, files[0] if len(files) == 1 else files,
                 caption=self._caption(sent, num), **kwargs,
             )
         finally:
-            # Release the in-memory reservation regardless of outcome; only ids we
-            # actually sent get persisted to history below.
-            for pid in reserved:
+            # Освободить все зарезервированные id; в history попадут только отправленные.
+            for pid in all_reserved:
                 self._inflight.discard(pid)
 
-        # Mark the images as seen so a test doesn't keep returning the same ones.
         self._commit_history([p["id"] for p in sent])
         if not is_test:
-            # For a scheduled post, "now" is really its future publish time. A manual
-            # .fumotest must NOT advance the counter, the last-post stamp or the
-            # autopost timer — otherwise testing in one chat delays/renumbers the channel.
             stamp = schedule if schedule else time.time()
             self._set("post_num", num)
             self._set("last_post_ts", stamp)
